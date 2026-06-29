@@ -155,7 +155,7 @@ same statements and read rank values as ordinary `FLOAT64` columns.
 
 ### References
 
-- `design/WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`
+- `design/_archive/WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`
 - `design/adr/0175-native-full-text-search-query-surface-and-ranking.md`
 - `design/adr/0007-trigram-postings-storage-strategy.md`
 - `design/adr/0052-trigram-durability.md`

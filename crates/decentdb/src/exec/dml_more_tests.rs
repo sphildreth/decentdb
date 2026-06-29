@@ -161,13 +161,7 @@ mod tests {
             .execute_prepared_simple_delete(&prepared, &[], 1024)
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
-        assert!(runtime
-            .tables
-            .get("t")
-            .unwrap()
-            .resident_data()
-            .rows
-            .is_empty());
+        assert!(runtime.tables.get("t").unwrap().resident_data().row_count() == 0);
         assert!(runtime
             .paged_mutations
             .get("t")
@@ -411,6 +405,118 @@ mod tests {
             4096,
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn execute_prepared_simple_insert_positional_params_reuses_candidate_buffer() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t3".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Text,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime
+            .tables_mut()
+            .insert(table.name.clone(), TableData::from_rows(vec![]).into());
+        let prepared = crate::exec::dml::PreparedSimpleInsert {
+            table_name: "t3".to_string(),
+            catalog_table_name: Some("t3".to_string()),
+            row_source_dependency_tables: vec![],
+            columns: vec![
+                crate::exec::dml::PreparedInsertColumn {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    auto_increment: false,
+                },
+                crate::exec::dml::PreparedInsertColumn {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Text,
+                    auto_increment: false,
+                },
+            ],
+            primary_auto_row_id_column_index: None,
+            value_sources: vec![],
+            required_columns: vec![],
+            foreign_keys: vec![],
+            unique_indexes: vec![],
+            insert_indexes: vec![],
+            use_generic_validation: false,
+            use_generic_index_updates: false,
+            direct_positional_param_count: None,
+            has_auto_increment: false,
+            compiled_index_state_epoch: runtime.index_state_epoch,
+        };
+        let mut candidate = Vec::with_capacity(prepared.columns.len());
+        let mut params = vec![Value::Int64(1), Value::Text("one".to_string())];
+
+        let affected = runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                &prepared,
+                &mut params,
+                &mut candidate,
+                4096,
+            )
+            .expect("insert first row");
+        assert_eq!(affected, 1);
+        assert!(candidate.is_empty());
+
+        params[0] = Value::Int64(2);
+        params[1] = Value::Text("two".to_string());
+        let affected = runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                &prepared,
+                &mut params,
+                &mut candidate,
+                4096,
+            )
+            .expect("insert second row");
+        assert_eq!(affected, 1);
+        assert!(candidate.is_empty());
+
+        assert_eq!(
+            runtime.tables.get("t3").unwrap().resident_data().rows.len(),
+            2
+        );
     }
 
     #[test]

@@ -1,0 +1,977 @@
+{
+  "argv": [
+    "benchmarks/bench_complex.py",
+    "--users",
+    "1000",
+    "--items",
+    "50",
+    "--orders",
+    "100"
+  ],
+  "comparisons": {
+    "complex": {
+      "aggregate_p50_ms": {
+        "decentdb": 0.027542,
+        "decentdb_vs_sqlite": 4.0905985444824005,
+        "direction": "lower_is_better",
+        "sqlite": 0.006733,
+        "winner": "sqlite"
+      },
+      "aggregate_p95_ms": {
+        "decentdb": 0.045155,
+        "decentdb_vs_sqlite": 0.9162388653288153,
+        "direction": "lower_is_better",
+        "sqlite": 0.049283,
+        "winner": "decentdb"
+      },
+      "catalog_insert_s": {
+        "decentdb": 0.0015566640067845583,
+        "decentdb_vs_sqlite": 1.0740043507497188,
+        "direction": "lower_is_better",
+        "sqlite": 0.001449401956051588,
+        "winner": "sqlite"
+      },
+      "delete_p50_ms": {
+        "decentdb": 0.030036,
+        "decentdb_vs_sqlite": 1.1920466722228837,
+        "direction": "lower_is_better",
+        "sqlite": 0.025197,
+        "winner": "sqlite"
+      },
+      "delete_p95_ms": {
+        "decentdb": 0.038763,
+        "decentdb_vs_sqlite": 1.1276837144353289,
+        "direction": "lower_is_better",
+        "sqlite": 0.034374,
+        "winner": "sqlite"
+      },
+      "history_p50_ms": {
+        "decentdb": 0.007043,
+        "decentdb_vs_sqlite": 1.3415238095238093,
+        "direction": "lower_is_better",
+        "sqlite": 0.00525,
+        "winner": "sqlite"
+      },
+      "history_p95_ms": {
+        "decentdb": 0.008817,
+        "decentdb_vs_sqlite": 0.7632444598337951,
+        "direction": "lower_is_better",
+        "sqlite": 0.011552,
+        "winner": "decentdb"
+      },
+      "join_p50_ms": {
+        "decentdb": 0.049433,
+        "decentdb_vs_sqlite": 1.2657926407702353,
+        "direction": "lower_is_better",
+        "sqlite": 0.039053,
+        "winner": "sqlite"
+      },
+      "join_p95_ms": {
+        "decentdb": 0.059261,
+        "decentdb_vs_sqlite": 1.0701953985625023,
+        "direction": "lower_is_better",
+        "sqlite": 0.055374,
+        "winner": "sqlite"
+      },
+      "orders_insert_rps": {
+        "decentdb": 438410.81795550423,
+        "decentdb_vs_sqlite": 1.2324757207935824,
+        "direction": "higher_is_better",
+        "sqlite": 355715.5817018567,
+        "winner": "decentdb"
+      },
+      "point_lookup_p50_ms": {
+        "decentdb": 0.002184,
+        "decentdb_vs_sqlite": 0.41052631578947374,
+        "direction": "lower_is_better",
+        "sqlite": 0.00532,
+        "winner": "decentdb"
+      },
+      "point_lookup_p95_ms": {
+        "decentdb": 0.002524,
+        "decentdb_vs_sqlite": 0.39610797237915885,
+        "direction": "lower_is_better",
+        "sqlite": 0.006372,
+        "winner": "decentdb"
+      },
+      "range_scan_p50_ms": {
+        "decentdb": 0.01051,
+        "decentdb_vs_sqlite": 1.7750380003377808,
+        "direction": "lower_is_better",
+        "sqlite": 0.005921,
+        "winner": "sqlite"
+      },
+      "range_scan_p95_ms": {
+        "decentdb": 0.018124,
+        "decentdb_vs_sqlite": 0.5525272849216512,
+        "direction": "lower_is_better",
+        "sqlite": 0.032802,
+        "winner": "decentdb"
+      },
+      "report_query_s": {
+        "decentdb": 4.261010326445103e-05,
+        "decentdb_vs_sqlite": 0.2392011857521527,
+        "direction": "lower_is_better",
+        "sqlite": 0.0001781350001692772,
+        "winner": "decentdb"
+      },
+      "table_scan_p50_ms": {
+        "decentdb": 0.002786,
+        "decentdb_vs_sqlite": 0.6497201492537313,
+        "direction": "lower_is_better",
+        "sqlite": 0.004288,
+        "winner": "decentdb"
+      },
+      "table_scan_p95_ms": {
+        "decentdb": 0.003015,
+        "decentdb_vs_sqlite": 0.5844155844155844,
+        "direction": "lower_is_better",
+        "sqlite": 0.005159,
+        "winner": "decentdb"
+      },
+      "update_p50_ms": {
+        "decentdb": 0.003938,
+        "decentdb_vs_sqlite": 0.9183768656716417,
+        "direction": "lower_is_better",
+        "sqlite": 0.004288,
+        "winner": "decentdb"
+      },
+      "update_p95_ms": {
+        "decentdb": 0.108864,
+        "decentdb_vs_sqlite": 16.120835184362505,
+        "direction": "lower_is_better",
+        "sqlite": 0.006753,
+        "winner": "sqlite"
+      }
+    },
+    "movie": {
+      "busiest_people_rows": {
+        "decentdb": 20,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 20,
+        "winner": "tie"
+      },
+      "movie_bulk_load_rps": {
+        "decentdb": 101430.16962848562,
+        "decentdb_vs_sqlite": 0.6640391137069719,
+        "direction": "higher_is_better",
+        "sqlite": 152747.28180130193,
+        "winner": "sqlite"
+      },
+      "movie_bulk_load_s": {
+        "decentdb": 0.4249228819971904,
+        "decentdb_vs_sqlite": 1.5059353874767103,
+        "direction": "lower_is_better",
+        "sqlite": 0.28216541395522654,
+        "winner": "sqlite"
+      },
+      "movie_busiest_people_s": {
+        "decentdb": 0.0003637330373749137,
+        "decentdb_vs_sqlite": 0.187545097630574,
+        "direction": "lower_is_better",
+        "sqlite": 0.0019394430564716458,
+        "winner": "decentdb"
+      },
+      "movie_busiest_people_s_rows": {
+        "decentdb": 20,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 20,
+        "winner": "tie"
+      },
+      "movie_checkpoint_after_mutations_s": {
+        "decentdb": 0.010005995980463922,
+        "decentdb_vs_sqlite": 0.4754901473469907,
+        "direction": "lower_is_better",
+        "sqlite": 0.021043540094979107,
+        "winner": "decentdb"
+      },
+      "movie_checkpoint_s": {
+        "decentdb": 0.03003479994367808,
+        "decentdb_vs_sqlite": 0.6430164744925787,
+        "direction": "lower_is_better",
+        "sqlite": 0.04670922306831926,
+        "winner": "decentdb"
+      },
+      "movie_delete_cascade_rows": {
+        "decentdb": 10,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 10,
+        "winner": "tie"
+      },
+      "movie_delete_cascade_s": {
+        "decentdb": 0.01813970599323511,
+        "decentdb_vs_sqlite": 1.6825089261503965,
+        "direction": "lower_is_better",
+        "sqlite": 0.010781343095004559,
+        "winner": "sqlite"
+      },
+      "movie_final_file_size_bytes": {
+        "decentdb": 7630848,
+        "decentdb_vs_sqlite": 0.8117647058823529,
+        "direction": "lower_is_better",
+        "sqlite": 9400320,
+        "winner": "decentdb"
+      },
+      "movie_point_reads_rows": {
+        "decentdb": 1000,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 1000,
+        "winner": "tie"
+      },
+      "movie_point_reads_s": {
+        "decentdb": 0.008814257918857038,
+        "decentdb_vs_sqlite": 1.306574384802287,
+        "direction": "lower_is_better",
+        "sqlite": 0.006746081984601915,
+        "winner": "sqlite"
+      },
+      "movie_tag_search_s": {
+        "decentdb": 0.0007657390087842941,
+        "decentdb_vs_sqlite": 1.9141507778508855,
+        "direction": "lower_is_better",
+        "sqlite": 0.00040004111360758543,
+        "winner": "sqlite"
+      },
+      "movie_tag_search_s_rows": {
+        "decentdb": 50,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 50,
+        "winner": "tie"
+      },
+      "movie_top_rated_s": {
+        "decentdb": 0.0005770439747720957,
+        "decentdb_vs_sqlite": 0.5054632744567573,
+        "direction": "lower_is_better",
+        "sqlite": 0.0011416140478104353,
+        "winner": "decentdb"
+      },
+      "movie_top_rated_s_rows": {
+        "decentdb": 0,
+        "decentdb_vs_sqlite": null,
+        "direction": "equivalence",
+        "sqlite": 0,
+        "winner": "tie"
+      },
+      "movie_update_batch_rows": {
+        "decentdb": 1000,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 1000,
+        "winner": "tie"
+      },
+      "movie_update_batch_s": {
+        "decentdb": 0.018583809956908226,
+        "decentdb_vs_sqlite": 2.2193707507973484,
+        "direction": "lower_is_better",
+        "sqlite": 0.00837345898617059,
+        "winner": "sqlite"
+      },
+      "movie_vacuum_s": {
+        "decentdb": 0.013662113924510777,
+        "decentdb_vs_sqlite": 0.2274789312877222,
+        "direction": "lower_is_better",
+        "sqlite": 0.060058810049667954,
+        "winner": "decentdb"
+      },
+      "movie_watchlist_s": {
+        "decentdb": 0.00015029299538582563,
+        "decentdb_vs_sqlite": 0.7034509777425176,
+        "direction": "lower_is_better",
+        "sqlite": 0.00021365098655223846,
+        "winner": "decentdb"
+      },
+      "movie_watchlist_s_rows": {
+        "decentdb": 2,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 2,
+        "winner": "tie"
+      },
+      "movies_after": {
+        "decentdb": 1990,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 1990,
+        "winner": "tie"
+      },
+      "movies_before": {
+        "decentdb": 2000,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 2000,
+        "winner": "tie"
+      },
+      "reviews_after": {
+        "decentdb": 19901,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 19901,
+        "winner": "tie"
+      },
+      "reviews_before": {
+        "decentdb": 20000,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 20000,
+        "winner": "tie"
+      },
+      "tag_search_rows": {
+        "decentdb": 50,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 50,
+        "winner": "tie"
+      },
+      "top_rated_rows": {
+        "decentdb": 0,
+        "decentdb_vs_sqlite": null,
+        "direction": "equivalence",
+        "sqlite": 0,
+        "winner": "tie"
+      },
+      "watchlist_rows": {
+        "decentdb": 2,
+        "decentdb_vs_sqlite": 1.0,
+        "direction": "equivalence",
+        "sqlite": 2,
+        "winner": "tie"
+      }
+    },
+    "showdown": {}
+  },
+  "config": {
+    "db_prefix": "bench_complex",
+    "decentdb_options": "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;process_coordination=single_process_unsafe;wal_sync_mode=async_commit:10",
+    "decentdb_stmt_cache_size": 512,
+    "engine": "all",
+    "engine_order": "decentdb-first",
+    "explain_analyze": false,
+    "explain_output_dir": null,
+    "keep_db": false,
+    "movie_watchlist_movie_index": false,
+    "query_mode": "warm",
+    "seed": 1337,
+    "sqlite_cache_mb": 64,
+    "sqlite_pragmas": {
+      "cache_size_kib": -64000,
+      "foreign_keys": "ON",
+      "journal_mode": "WAL",
+      "synchronous": "NORMAL",
+      "temp_store": "MEMORY",
+      "wal_autocheckpoint": 0
+    },
+    "sqlite_profile": "wal_normal",
+    "workload": "both"
+  },
+  "engine_versions": {
+    "decentdb": {
+      "abi_version": 7,
+      "native_library": "/home/steven/src/github/decentdb/target/release/libdecentdb.so",
+      "native_version": "2.15.0",
+      "python_package_version": null
+    },
+    "sqlite": {
+      "python_sqlite_version": null,
+      "sqlite_version": "3.51.2"
+    }
+  },
+  "equivalence": {
+    "complex": {
+      "reason": "complex workload does not capture signatures",
+      "status": "skipped"
+    },
+    "movie": {
+      "checks": {
+        "movie_busiest_people": {
+          "decentdb": {
+            "first_row": [
+              "4e592707e08a1af9337043342b2e01b5",
+              "Benjamin Davis",
+              "1969-03-18",
+              null,
+              26
+            ],
+            "label": "MovieDB busiest people",
+            "last_row": [
+              "aa5bb8d9f92aff58ba612fcf053acc91",
+              "Mia Clark",
+              "1951-08-01",
+              "Secret performer from Promise. Frozen performer from Knight. Secret performer from Echo.",
+              17
+            ],
+            "rows": 20,
+            "sha256": "ac745755dba49709661c22871129a3e69b6b1208c3861028e25d74f85feca16a",
+            "unordered_sha256": "9abc5d248d1be2a51812aa46be369931b57d4a6a60886c26a55d57b774e39500"
+          },
+          "label": "MovieDB busiest people",
+          "sqlite": {
+            "first_row": [
+              "4e592707e08a1af9337043342b2e01b5",
+              "Benjamin Davis",
+              "1969-03-18",
+              null,
+              26
+            ],
+            "label": "MovieDB busiest people",
+            "last_row": [
+              "aa5bb8d9f92aff58ba612fcf053acc91",
+              "Mia Clark",
+              "1951-08-01",
+              "Secret performer from Promise. Frozen performer from Knight. Secret performer from Echo.",
+              17
+            ],
+            "rows": 20,
+            "sha256": "ac745755dba49709661c22871129a3e69b6b1208c3861028e25d74f85feca16a",
+            "unordered_sha256": "9abc5d248d1be2a51812aa46be369931b57d4a6a60886c26a55d57b774e39500"
+          },
+          "status": "ok"
+        },
+        "movie_point_read_first": {
+          "decentdb": {
+            "first_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "label": "MovieDB point read first UUID",
+            "last_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "rows": 1,
+            "sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4",
+            "unordered_sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4"
+          },
+          "label": "MovieDB point read first UUID",
+          "sqlite": {
+            "first_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "label": "MovieDB point read first UUID",
+            "last_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "rows": 1,
+            "sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4",
+            "unordered_sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4"
+          },
+          "status": "ok"
+        },
+        "movie_tag_search": {
+          "decentdb": {
+            "first_row": [
+              "006695056b54504571574716cca42201",
+              "Wicked Knight 01152",
+              2024,
+              "A tale of frozen whisper, brave king, lost dream, shadow knight, dark empire, frozen king.",
+              187053303.5679558,
+              700559010.6447328,
+              "G",
+              89,
+              "2020-08-19T11:07:00"
+            ],
+            "label": "MovieDB search movies by tag",
+            "last_row": [
+              "9e7de7491d48695ce4df1bb7ac7f1942",
+              "Hidden Kingdom 01924",
+              1995,
+              "A tale of golden empire, hidden knight, invisible knight, midnight knight, eternal destiny.",
+              140721820.05038616,
+              663733748.4797281,
+              "G",
+              140,
+              "2022-06-26T22:29:00"
+            ],
+            "rows": 50,
+            "sha256": "29fcbbecb81d59e5edcf8526e613a0c4d3ca2824008225c1fe1307388cfdb382",
+            "unordered_sha256": "a48d68f4819a9aa3cbacecdf8c92622c73e9d0d14d51b91cabafba0e3a8ce24a"
+          },
+          "label": "MovieDB search movies by tag",
+          "sqlite": {
+            "first_row": [
+              "006695056b54504571574716cca42201",
+              "Wicked Knight 01152",
+              2024,
+              "A tale of frozen whisper, brave king, lost dream, shadow knight, dark empire, frozen king.",
+              187053303.5679558,
+              700559010.6447328,
+              "G",
+              89,
+              "2020-08-19T11:07:00"
+            ],
+            "label": "MovieDB search movies by tag",
+            "last_row": [
+              "9e7de7491d48695ce4df1bb7ac7f1942",
+              "Hidden Kingdom 01924",
+              1995,
+              "A tale of golden empire, hidden knight, invisible knight, midnight knight, eternal destiny.",
+              140721820.05038616,
+              663733748.4797281,
+              "G",
+              140,
+              "2022-06-26T22:29:00"
+            ],
+            "rows": 50,
+            "sha256": "29fcbbecb81d59e5edcf8526e613a0c4d3ca2824008225c1fe1307388cfdb382",
+            "unordered_sha256": "a48d68f4819a9aa3cbacecdf8c92622c73e9d0d14d51b91cabafba0e3a8ce24a"
+          },
+          "status": "ok"
+        },
+        "movie_top_rated": {
+          "decentdb": {
+            "first_row": null,
+            "label": "MovieDB top-rated by year",
+            "last_row": null,
+            "rows": 0,
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "unordered_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          },
+          "label": "MovieDB top-rated by year",
+          "sqlite": {
+            "first_row": null,
+            "label": "MovieDB top-rated by year",
+            "last_row": null,
+            "rows": 0,
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "unordered_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          },
+          "status": "ok"
+        },
+        "movie_watchlist": {
+          "decentdb": {
+            "first_row": [
+              "800ecc9de1868a955e23867f8080b40a",
+              "Last Promise 00765",
+              4,
+              6.0
+            ],
+            "label": "MovieDB watchlist query",
+            "last_row": [
+              "787ca94800a996cd1b2017adf83fffde",
+              "Frozen Legend 00127",
+              1,
+              4.75
+            ],
+            "rows": 2,
+            "sha256": "045e36bb80781a41ff320098464efaeb7ca5681ac81d9623fc188c787b6355b3",
+            "unordered_sha256": "73f57841ffc92025bf8df37bc2766cbcf7bf24f97b13fff0d89d61355ec71bec"
+          },
+          "label": "MovieDB watchlist query",
+          "sqlite": {
+            "first_row": [
+              "800ecc9de1868a955e23867f8080b40a",
+              "Last Promise 00765",
+              4,
+              6.0
+            ],
+            "label": "MovieDB watchlist query",
+            "last_row": [
+              "787ca94800a996cd1b2017adf83fffde",
+              "Frozen Legend 00127",
+              1,
+              4.75
+            ],
+            "rows": 2,
+            "sha256": "045e36bb80781a41ff320098464efaeb7ca5681ac81d9623fc188c787b6355b3",
+            "unordered_sha256": "73f57841ffc92025bf8df37bc2766cbcf7bf24f97b13fff0d89d61355ec71bec"
+          },
+          "status": "ok"
+        }
+      },
+      "failures": [],
+      "status": "ok"
+    },
+    "showdown": {
+      "reason": "workload not run",
+      "status": "skipped"
+    }
+  },
+  "generated_at": "2026-06-29T22:35:27.265843+00:00",
+  "python": {
+    "executable": "/usr/bin/python",
+    "version": "3.14.6"
+  },
+  "results": {
+    "complex": {
+      "decentdb": {
+        "aggregate_p50_ms": 0.027542,
+        "aggregate_p95_ms": 0.045155,
+        "catalog_insert_s": 0.0015566640067845583,
+        "delete_p50_ms": 0.030036,
+        "delete_p95_ms": 0.038763,
+        "history_p50_ms": 0.007043,
+        "history_p95_ms": 0.008817,
+        "join_p50_ms": 0.049433,
+        "join_p95_ms": 0.059261,
+        "orders_insert_rps": 438410.81795550423,
+        "point_lookup_p50_ms": 0.002184,
+        "point_lookup_p95_ms": 0.002524,
+        "range_scan_p50_ms": 0.01051,
+        "range_scan_p95_ms": 0.018124,
+        "report_query_s": 4.261010326445103e-05,
+        "table_scan_p50_ms": 0.002786,
+        "table_scan_p95_ms": 0.003015,
+        "update_p50_ms": 0.003938,
+        "update_p95_ms": 0.108864
+      },
+      "sqlite": {
+        "aggregate_p50_ms": 0.006733,
+        "aggregate_p95_ms": 0.049283,
+        "catalog_insert_s": 0.001449401956051588,
+        "delete_p50_ms": 0.025197,
+        "delete_p95_ms": 0.034374,
+        "history_p50_ms": 0.00525,
+        "history_p95_ms": 0.011552,
+        "join_p50_ms": 0.039053,
+        "join_p95_ms": 0.055374,
+        "orders_insert_rps": 355715.5817018567,
+        "point_lookup_p50_ms": 0.00532,
+        "point_lookup_p95_ms": 0.006372,
+        "range_scan_p50_ms": 0.005921,
+        "range_scan_p95_ms": 0.032802,
+        "report_query_s": 0.0001781350001692772,
+        "table_scan_p50_ms": 0.004288,
+        "table_scan_p95_ms": 0.005159,
+        "update_p50_ms": 0.004288,
+        "update_p95_ms": 0.006753
+      }
+    },
+    "movie": {
+      "decentdb": {
+        "_checks": {
+          "movie_busiest_people": {
+            "first_row": [
+              "4e592707e08a1af9337043342b2e01b5",
+              "Benjamin Davis",
+              "1969-03-18",
+              null,
+              26
+            ],
+            "label": "MovieDB busiest people",
+            "last_row": [
+              "aa5bb8d9f92aff58ba612fcf053acc91",
+              "Mia Clark",
+              "1951-08-01",
+              "Secret performer from Promise. Frozen performer from Knight. Secret performer from Echo.",
+              17
+            ],
+            "rows": 20,
+            "sha256": "ac745755dba49709661c22871129a3e69b6b1208c3861028e25d74f85feca16a",
+            "unordered_sha256": "9abc5d248d1be2a51812aa46be369931b57d4a6a60886c26a55d57b774e39500"
+          },
+          "movie_point_read_first": {
+            "first_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "label": "MovieDB point read first UUID",
+            "last_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "rows": 1,
+            "sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4",
+            "unordered_sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4"
+          },
+          "movie_tag_search": {
+            "first_row": [
+              "006695056b54504571574716cca42201",
+              "Wicked Knight 01152",
+              2024,
+              "A tale of frozen whisper, brave king, lost dream, shadow knight, dark empire, frozen king.",
+              187053303.5679558,
+              700559010.6447328,
+              "G",
+              89,
+              "2020-08-19T11:07:00"
+            ],
+            "label": "MovieDB search movies by tag",
+            "last_row": [
+              "9e7de7491d48695ce4df1bb7ac7f1942",
+              "Hidden Kingdom 01924",
+              1995,
+              "A tale of golden empire, hidden knight, invisible knight, midnight knight, eternal destiny.",
+              140721820.05038616,
+              663733748.4797281,
+              "G",
+              140,
+              "2022-06-26T22:29:00"
+            ],
+            "rows": 50,
+            "sha256": "29fcbbecb81d59e5edcf8526e613a0c4d3ca2824008225c1fe1307388cfdb382",
+            "unordered_sha256": "a48d68f4819a9aa3cbacecdf8c92622c73e9d0d14d51b91cabafba0e3a8ce24a"
+          },
+          "movie_top_rated": {
+            "first_row": null,
+            "label": "MovieDB top-rated by year",
+            "last_row": null,
+            "rows": 0,
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "unordered_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          },
+          "movie_watchlist": {
+            "first_row": [
+              "800ecc9de1868a955e23867f8080b40a",
+              "Last Promise 00765",
+              4,
+              6.0
+            ],
+            "label": "MovieDB watchlist query",
+            "last_row": [
+              "787ca94800a996cd1b2017adf83fffde",
+              "Frozen Legend 00127",
+              1,
+              4.75
+            ],
+            "rows": 2,
+            "sha256": "045e36bb80781a41ff320098464efaeb7ca5681ac81d9623fc188c787b6355b3",
+            "unordered_sha256": "73f57841ffc92025bf8df37bc2766cbcf7bf24f97b13fff0d89d61355ec71bec"
+          }
+        },
+        "_metadata": {
+          "db_path": "bench_complex_movie_decentdb.ddb",
+          "engine": "decentdb",
+          "profile": {
+            "options": "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;process_coordination=single_process_unsafe;wal_sync_mode=async_commit:10",
+            "stmt_cache_size": 512
+          },
+          "query_mode": "warm",
+          "schema_variants": {
+            "watchlist_movie_index": false
+          }
+        },
+        "busiest_people_rows": 20,
+        "movie_bulk_load_rps": 101430.16962848562,
+        "movie_bulk_load_s": 0.4249228819971904,
+        "movie_busiest_people_s": 0.0003637330373749137,
+        "movie_busiest_people_s_rows": 20,
+        "movie_checkpoint_after_mutations_s": 0.010005995980463922,
+        "movie_checkpoint_s": 0.03003479994367808,
+        "movie_delete_cascade_rows": 10,
+        "movie_delete_cascade_s": 0.01813970599323511,
+        "movie_final_file_size_bytes": 7630848,
+        "movie_point_reads_rows": 1000,
+        "movie_point_reads_s": 0.008814257918857038,
+        "movie_tag_search_s": 0.0007657390087842941,
+        "movie_tag_search_s_rows": 50,
+        "movie_top_rated_s": 0.0005770439747720957,
+        "movie_top_rated_s_rows": 0,
+        "movie_update_batch_rows": 1000,
+        "movie_update_batch_s": 0.018583809956908226,
+        "movie_vacuum_s": 0.013662113924510777,
+        "movie_watchlist_s": 0.00015029299538582563,
+        "movie_watchlist_s_rows": 2,
+        "movies_after": 1990,
+        "movies_before": 2000,
+        "reviews_after": 19901,
+        "reviews_before": 20000,
+        "tag_search_rows": 50,
+        "top_rated_rows": 0,
+        "watchlist_rows": 2
+      },
+      "sqlite": {
+        "_checks": {
+          "movie_busiest_people": {
+            "first_row": [
+              "4e592707e08a1af9337043342b2e01b5",
+              "Benjamin Davis",
+              "1969-03-18",
+              null,
+              26
+            ],
+            "label": "MovieDB busiest people",
+            "last_row": [
+              "aa5bb8d9f92aff58ba612fcf053acc91",
+              "Mia Clark",
+              "1951-08-01",
+              "Secret performer from Promise. Frozen performer from Knight. Secret performer from Echo.",
+              17
+            ],
+            "rows": 20,
+            "sha256": "ac745755dba49709661c22871129a3e69b6b1208c3861028e25d74f85feca16a",
+            "unordered_sha256": "9abc5d248d1be2a51812aa46be369931b57d4a6a60886c26a55d57b774e39500"
+          },
+          "movie_point_read_first": {
+            "first_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "label": "MovieDB point read first UUID",
+            "last_row": [
+              "485f0f46215fff48d26258c8a9007a2f",
+              "Hidden Garden 00001",
+              2000,
+              "A tale of golden voyage, frozen odyssey, broken queen.",
+              151669904.36114195,
+              900271508.5951332,
+              "G",
+              152,
+              "2022-05-24T04:02:00"
+            ],
+            "rows": 1,
+            "sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4",
+            "unordered_sha256": "6fa0c0fac7b1a02ad0d06126ffe2161160f874b203791ba4a69dd452339174d4"
+          },
+          "movie_tag_search": {
+            "first_row": [
+              "006695056b54504571574716cca42201",
+              "Wicked Knight 01152",
+              2024,
+              "A tale of frozen whisper, brave king, lost dream, shadow knight, dark empire, frozen king.",
+              187053303.5679558,
+              700559010.6447328,
+              "G",
+              89,
+              "2020-08-19T11:07:00"
+            ],
+            "label": "MovieDB search movies by tag",
+            "last_row": [
+              "9e7de7491d48695ce4df1bb7ac7f1942",
+              "Hidden Kingdom 01924",
+              1995,
+              "A tale of golden empire, hidden knight, invisible knight, midnight knight, eternal destiny.",
+              140721820.05038616,
+              663733748.4797281,
+              "G",
+              140,
+              "2022-06-26T22:29:00"
+            ],
+            "rows": 50,
+            "sha256": "29fcbbecb81d59e5edcf8526e613a0c4d3ca2824008225c1fe1307388cfdb382",
+            "unordered_sha256": "a48d68f4819a9aa3cbacecdf8c92622c73e9d0d14d51b91cabafba0e3a8ce24a"
+          },
+          "movie_top_rated": {
+            "first_row": null,
+            "label": "MovieDB top-rated by year",
+            "last_row": null,
+            "rows": 0,
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "unordered_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          },
+          "movie_watchlist": {
+            "first_row": [
+              "800ecc9de1868a955e23867f8080b40a",
+              "Last Promise 00765",
+              4,
+              6.0
+            ],
+            "label": "MovieDB watchlist query",
+            "last_row": [
+              "787ca94800a996cd1b2017adf83fffde",
+              "Frozen Legend 00127",
+              1,
+              4.75
+            ],
+            "rows": 2,
+            "sha256": "045e36bb80781a41ff320098464efaeb7ca5681ac81d9623fc188c787b6355b3",
+            "unordered_sha256": "73f57841ffc92025bf8df37bc2766cbcf7bf24f97b13fff0d89d61355ec71bec"
+          }
+        },
+        "_metadata": {
+          "db_path": "bench_complex_movie_sqlite.db",
+          "engine": "sqlite",
+          "profile": {
+            "cache_mb": 64,
+            "pragmas": {
+              "cache_size_kib": -64000,
+              "foreign_keys": "ON",
+              "journal_mode": "WAL",
+              "synchronous": "NORMAL",
+              "temp_store": "MEMORY",
+              "wal_autocheckpoint": 0
+            },
+            "profile": "wal_normal"
+          },
+          "query_mode": "warm",
+          "schema_variants": {
+            "watchlist_movie_index": false
+          }
+        },
+        "busiest_people_rows": 20,
+        "movie_bulk_load_rps": 152747.28180130193,
+        "movie_bulk_load_s": 0.28216541395522654,
+        "movie_busiest_people_s": 0.0019394430564716458,
+        "movie_busiest_people_s_rows": 20,
+        "movie_checkpoint_after_mutations_s": 0.021043540094979107,
+        "movie_checkpoint_s": 0.04670922306831926,
+        "movie_delete_cascade_rows": 10,
+        "movie_delete_cascade_s": 0.010781343095004559,
+        "movie_final_file_size_bytes": 9400320,
+        "movie_point_reads_rows": 1000,
+        "movie_point_reads_s": 0.006746081984601915,
+        "movie_tag_search_s": 0.00040004111360758543,
+        "movie_tag_search_s_rows": 50,
+        "movie_top_rated_s": 0.0011416140478104353,
+        "movie_top_rated_s_rows": 0,
+        "movie_update_batch_rows": 1000,
+        "movie_update_batch_s": 0.00837345898617059,
+        "movie_vacuum_s": 0.060058810049667954,
+        "movie_watchlist_s": 0.00021365098655223846,
+        "movie_watchlist_s_rows": 2,
+        "movies_after": 1990,
+        "movies_before": 2000,
+        "reviews_after": 19901,
+        "reviews_before": 20000,
+        "tag_search_rows": 50,
+        "top_rated_rows": 0,
+        "watchlist_rows": 2
+      }
+    },
+    "showdown": {}
+  }
+}

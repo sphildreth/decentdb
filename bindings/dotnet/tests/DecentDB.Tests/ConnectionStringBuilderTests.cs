@@ -21,6 +21,7 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         var builder = new DecentDBConnectionStringBuilder();
         Assert.Empty(builder.ConnectionString);
         Assert.Empty(builder.DataSource);
+        Assert.Null(builder.PerformanceProfile);
         Assert.Null(builder.CacheSize);
         Assert.Null(builder.ProcessCoordination);
         Assert.Null(builder.ProcessCoordinationTimeoutMs);
@@ -32,15 +33,35 @@ public sealed class ConnectionStringBuilderTests : IDisposable
     [Fact]
     public void Constructor_WithConnectionString_ParsesValues()
     {
-        var builder = new DecentDBConnectionStringBuilder($"Data Source={_dbPath};Cache Size=64MB;Process Coordination=required;Process Coordination Timeout Ms=250;Logging=True;LogLevel=Info;Command Timeout=60");
+        var builder = new DecentDBConnectionStringBuilder($"Data Source={_dbPath};Performance Profile=embedded_fast;Cache Size=64MB;Process Coordination=required;Process Coordination Timeout Ms=250;Logging=True;LogLevel=Info;Command Timeout=60");
 
         Assert.Equal(_dbPath, builder.DataSource);
+        Assert.Equal("embedded_fast", builder.PerformanceProfile);
         Assert.Equal("64MB", builder.CacheSize);
         Assert.Equal("required", builder.ProcessCoordination);
         Assert.Equal(250, builder.ProcessCoordinationTimeoutMs);
         Assert.True(builder.Logging);
         Assert.Equal("Info", builder.LogLevel);
         Assert.Equal(60, builder.CommandTimeout);
+    }
+
+    [Fact]
+    public void PerformanceProfile_SetAndGet_RoundTrips()
+    {
+        var builder = new DecentDBConnectionStringBuilder();
+        builder.PerformanceProfile = "embedded_fast";
+        Assert.Equal("embedded_fast", builder.PerformanceProfile);
+
+        builder.PerformanceProfile = null;
+        Assert.Null(builder.PerformanceProfile);
+        Assert.DoesNotContain("Performance Profile", builder.ConnectionString);
+    }
+
+    [Fact]
+    public void PerformanceProfile_ProfileAlias_Parses()
+    {
+        var builder = new DecentDBConnectionStringBuilder($"Data Source={_dbPath};Profile=tuned_durable");
+        Assert.Equal("tuned_durable", builder.PerformanceProfile);
     }
 
     [Fact]
@@ -125,6 +146,7 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         var builder = new DecentDBConnectionStringBuilder
         {
             DataSource = _dbPath,
+            PerformanceProfile = "embedded_fast",
             CacheSize = "128MB",
             ProcessCoordination = "single_process_unsafe",
             ProcessCoordinationTimeoutMs = 125,
@@ -135,6 +157,7 @@ public sealed class ConnectionStringBuilderTests : IDisposable
 
         var rebuilt = new DecentDBConnectionStringBuilder(builder.ConnectionString);
         Assert.Equal(_dbPath, rebuilt.DataSource);
+        Assert.Equal("embedded_fast", rebuilt.PerformanceProfile);
         Assert.Equal("128MB", rebuilt.CacheSize);
         Assert.Equal("single_process_unsafe", rebuilt.ProcessCoordination);
         Assert.Equal(125, rebuilt.ProcessCoordinationTimeoutMs);
@@ -149,6 +172,7 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         var builder = new DecentDBConnectionStringBuilder
         {
             DataSource = _dbPath,
+            PerformanceProfile = "embedded_fast",
             CommandTimeout = 45
         };
 

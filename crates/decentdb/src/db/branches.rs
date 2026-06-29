@@ -631,7 +631,7 @@ pub(super) fn render_runtime_dump(
     }
     for (table_name, table_data) in runtime.temp_table_data.iter() {
         if let Some(table) = runtime.temp_tables.get(table_name) {
-            for row in &table_data.rows {
+            for row in table_data.visible_rows() {
                 lines.push(render_insert(table, &row.values));
             }
         }

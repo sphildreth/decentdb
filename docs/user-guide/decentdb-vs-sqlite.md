@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **SQLite** for embedded database workloads. Both are single-file, embedded relational databases with ACID transactions, but they make different design trade-offs.
 
-> **Versions compared:** DecentDB 2.0.0 vs SQLite 3.45+ (as of 2024).
+> **Versions compared:** DecentDB 2.15.0 workspace behavior vs the SQLite 3.51.x baseline used by the DecentDB comparison harness.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a per-feature support grid, and [SQL Reference](sql-reference.md) for DecentDB's full SQL surface.
 
@@ -11,8 +11,8 @@ This document helps developers decide between **DecentDB** and **SQLite** for em
 | Dimension | DecentDB | SQLite |
 |-----------|----------|--------|
 | **Design priority** | Durability-first, then performance | Portability-first, then breadth |
-| **Concurrency model** | One writer, many concurrent reader threads (single process) | One writer, many readers (process-safe, file-locking) |
-| **Default durability** | WAL + fsync-on-commit, always | WAL or rollback journal, configurable via PRAGMA |
+| **Concurrency model** | One writer, many readers; native on-disk databases coordinate local OS processes when supported | One writer, many readers (process-safe, file-locking) |
+| **Default durability** | WAL + fsync-on-commit by default; open-time sync modes can relax durability timing | WAL or rollback journal, configurable via PRAGMA |
 | **Crash safety testing** | Built-in fault-injection hooks (FaultyVFS, WAL failpoints) | Relies on external testing |
 | **Extension ecosystem** | Sandboxed Lua packages; no arbitrary native `.load` | Rich (loadable extensions, virtual tables, FTS5, JSON1, etc.) |
 | **SQL breadth** | Deliberate Postgres-like subset | Very broad, plus extensions |
@@ -26,7 +26,11 @@ This document helps developers decide between **DecentDB** and **SQLite** for em
 
 ### 1. You need guaranteed durability without tuning
 
-DecentDB fsyncs on every commit by default. There is no `PRAGMA synchronous` to misconfigure. If your application cannot tolerate data loss on power failure and you don't want to reason about journal modes or sync levels, DecentDB makes the safe thing the default.
+DecentDB fsyncs on every commit by default. It accepts a safe SQLite-style
+`PRAGMA synchronous` compatibility probe, but it does not let SQL downgrade
+durability at runtime. If your application cannot tolerate data loss on power
+failure and you do not want to reason about journal modes or sync levels,
+DecentDB makes the safe thing the default.
 
 ```sql
 -- DecentDB: every COMMIT is durable. No PRAGMA needed.
@@ -48,14 +52,23 @@ DecentDB ships with FaultyVFS and WAL failpoint hooks that let you deterministic
 
 ### 3. Your workload is OLTP with concurrent readers
 
-DecentDB is designed for one writer with many concurrent reader threads in a single process. Readers get lock-free snapshot isolation -- they never block the writer and never block each other. SQLite's concurrency model relies on file-level locking, which is process-safe but introduces contention under heavy concurrent read workloads within the same process.
+DecentDB is designed for one writer with many concurrent readers. Readers get
+snapshot isolation: they do not block the writer and do not block each other.
+For local native database files, the default `process_coordination=auto` mode
+uses WAL locks, reader slots, and a rebuildable coordination sidecar to
+coordinate multiple OS processes when the VFS supports the required locks.
+SQLite's model is more broadly deployed across tools and platforms, but it also
+relies on file-level locking that can introduce contention under some
+concurrent workloads.
 
 ```rust
-// DecentDB: readers and writer share one Database handle.
+use decentdb::{Db, DbConfig};
+
+// DecentDB: readers and writer share one Db handle.
 // Readers get snapshots; the writer holds the commit lock.
-let db = Database::open("app.ddb")?;
-// Multiple reader threads can execute concurrently
-// without any locking protocol on the application side.
+let db = Db::open("app.ddb", DbConfig::default())?;
+// Multiple readers can execute concurrently without an
+// application-owned locking protocol.
 ```
 
 ### 4. You need `INSERT ... RETURNING` or `UPDATE ... RETURNING`
@@ -81,13 +94,16 @@ SELECT last_insert_rowid();  -- only gives the id, not the full row
 
 ### 5. You need `TRUNCATE TABLE`
 
-DecentDB supports `TRUNCATE TABLE` for fast bulk deletion. Unlike `DELETE FROM`, `TRUNCATE`:
+DecentDB supports `TRUNCATE TABLE` for fast bulk deletion. Unlike ordinary
+`DELETE FROM`, `TRUNCATE`:
 - Does not scan rows individually
 - Does not fire `DELETE` triggers
-- Resets auto-increment counters
-- Is minimally logged (faster on large tables)
+- Supports `RESTART IDENTITY` and `CONTINUE IDENTITY`
+- Participates in transaction rollback
 
-SQLite requires `DELETE FROM table;` which scans row-by-row and fires triggers.
+SQLite uses `DELETE FROM table;` syntax. It can optimize some simple full-table
+deletes, but it does not expose `TRUNCATE TABLE` syntax or DecentDB's identity
+options.
 
 ```sql
 -- DecentDB
@@ -177,7 +193,11 @@ SELECT department, STRING_AGG(name, ', ' ORDER BY name) FROM employees GROUP BY 
 
 ### 1. You need a battle-tested, decades-stable file format
 
-SQLite is one of the most tested pieces of software ever written. Its file format has been stable for over 20 years. If you need to write a `.sqlite` file today and read it in 2040, SQLite is the safe bet. DecentDB is pre-1.0 with an evolving on-disk format.
+SQLite is one of the most tested pieces of software ever written. Its file
+format has been stable for over 20 years. If you need to write a `.sqlite` file
+today and read it in 2040 with the widest possible tooling compatibility,
+SQLite is the safe bet. DecentDB has a stable file format baseline from 2.0.0,
+but it does not yet have SQLite's decades-long compatibility record.
 
 ### 2. You need broad SQL coverage or arbitrary native extensions
 
@@ -186,7 +206,7 @@ SQLite's SQL surface is far wider than DecentDB's, and its extension ecosystem
 the embedded space.
 
 ```sql
--- SQLite: FTS5 full-text search (no equivalent in DecentDB)
+-- SQLite: FTS5 full-text search and virtual tables
 CREATE VIRTUAL TABLE docs USING fts5(title, body);
 INSERT INTO docs (title, body) VALUES ('Guide', 'How to use the database');
 SELECT * FROM docs WHERE docs MATCH 'database';
@@ -195,14 +215,18 @@ SELECT * FROM docs WHERE docs MATCH 'database';
 .load ./my_extension
 ```
 
-DecentDB supports sandboxed Lua extension packages for scalar functions,
-table-valued functions, aggregates, and query-time collations. It does not
-support arbitrary native extensions, SQLite virtual-table modules, or
-SQLite-compatible `.load`.
+DecentDB supports native full-text and trigram indexes plus sandboxed Lua
+extension packages for scalar functions, table-valued functions, aggregates,
+and query-time collations. It does not support arbitrary native extensions,
+SQLite virtual-table modules, or SQLite-compatible `.load`.
 
-### 3. You need cross-process access
+### 3. You need the broadest cross-process file-sharing ecosystem
 
-SQLite uses file-level locking to allow multiple processes to safely share one database file. DecentDB is single-process. If you have multiple processes (e.g., separate worker processes, CLI tools, and a web server) that need to read/write the same database, SQLite is the right choice.
+SQLite uses mature file-level locking to allow multiple processes and a wide
+range of external tools to safely share one database file. DecentDB now has
+native local cross-process WAL coordination for supported VFSes, but SQLite is
+still the more proven choice when independent tools and processes must open the
+same file across many platforms and filesystems.
 
 ```
 # SQLite: multiple processes can share the file
@@ -258,7 +282,12 @@ SQLite compiles to a single C file (`sqlite3.c`) with no external dependencies. 
 
 ### 9. You need `PRAGMA` configuration
 
-SQLite offers dozens of PRAGMAs for tuning cache size, page size, journal mode, locking mode, foreign key enforcement, and more. DecentDB exposes a small subset (`page_size`, `cache_size`, `integrity_check`, `database_list`, `table_info`) and intentionally limits configurability to reduce misconfiguration risk.
+SQLite offers dozens of PRAGMAs for tuning cache size, page size, journal mode,
+locking mode, foreign key enforcement, and more. DecentDB exposes a practical
+compatibility subset for safe probes, schema discovery, application metadata,
+queued-write timeout defaults, WAL checkpointing, and plan-cache flushes.
+Assignments are accepted only when they match DecentDB's actual behavior or set
+DecentDB-owned metadata.
 
 ```sql
 -- SQLite: extensive runtime tuning
@@ -271,15 +300,16 @@ PRAGMA busy_timeout = 5000;
 
 If your application depends on these tuning knobs, SQLite is the right tool.
 
-### 10. You need `INTERSECT ALL` or `EXCEPT ALL` (multiset operations)
+### 10. You need SQLite's broader legacy compatibility surface
 
-DecentDB does not support `INTERSECT ALL` or `EXCEPT ALL` (as noted in the [SQL Reference](sql-reference.md#set-operations)). SQLite does.
+DecentDB supports multiset set operations such as `INTERSECT ALL` and
+`EXCEPT ALL`, but SQLite still has a much broader long-tail compatibility
+surface: more PRAGMAs, virtual tables, loadable native extensions, `ATTACH`
+workflows, and decades of third-party tool assumptions.
 
 ```sql
--- SQLite: multiset difference (preserves duplicate counts)
+-- Both DecentDB and SQLite: multiset difference (preserves duplicate counts)
 SELECT item_id FROM inventory EXCEPT ALL SELECT item_id FROM sold;
-
--- DecentDB: must rewrite as a grouped query
 ```
 
 ## Side-by-Side SQL Examples
@@ -345,8 +375,8 @@ FROM employees;
 | Need Postgres-like SQL to reduce dialect drift | **DecentDB** |
 | Need crash-injection testing hooks | **DecentDB** |
 | Decades-stable file format, maximum compatibility | **SQLite** |
-| Need arbitrary native loadable extensions, FTS5, R-Tree, virtual tables | **SQLite** |
-| Multiple processes sharing one database file | **SQLite** |
+| Need arbitrary native loadable extensions, SQLite FTS5/R-Tree virtual tables | **SQLite** |
+| Broadest mature cross-process file sharing and tool ecosystem | **SQLite** |
 | Embedded on exotic platforms (microcontrollers, etc.) | **SQLite** |
 | Need extensive `PRAGMA` runtime tuning | **SQLite** |
 | Need window frame clauses (`ROWS BETWEEN`) | **SQLite** |

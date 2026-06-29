@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-13
 **Status:** Accepted
-**Related spec:** [`../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
+**Related spec:** [`../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
 **Companion ADRs:** [0190](./0190-query-plan-cache-scope-key-and-lifecycle.md), [0191](./0191-query-plan-cache-memory-accounting-and-eviction.md), [0192](./0192-query-plan-cache-security-generation-and-tde.md)
 
 ## Decision
@@ -259,7 +259,7 @@ None of these events is in Phase 1.
 
 ## References
 
-- `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` §7,
+- `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` §7,
   §10, §11, §13
 - `design/adr/0190-query-plan-cache-scope-key-and-lifecycle.md`
 - `design/adr/0191-query-plan-cache-memory-accounting-and-eviction.md`

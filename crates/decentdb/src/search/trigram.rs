@@ -5,8 +5,6 @@
 //! - design/adr/0008-trigram-pattern-length-guardrails.md
 //! - design/adr/0052-trigram-durability.md
 
-use std::collections::BTreeSet;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuardrailDecision {
     TooShort,
@@ -22,24 +20,51 @@ pub(crate) fn normalize(input: &str) -> String {
 
 #[must_use]
 pub(crate) fn pattern_char_len(input: &str) -> usize {
+    if input.is_ascii() {
+        return input.len();
+    }
     normalize(input).chars().count()
 }
 
 #[must_use]
 pub(crate) fn unique_tokens(input: &str) -> Vec<u32> {
+    if input.is_ascii() {
+        return unique_ascii_tokens(input.as_bytes());
+    }
+
     let normalized = normalize(input);
-    let chars = normalized.chars().count();
-    if chars < 3 {
+    if normalized.chars().nth(2).is_none() {
         return Vec::new();
     }
 
     let bytes = normalized.into_bytes();
-    bytes
-        .windows(3)
-        .map(|window| pack_trigram([window[0], window[1], window[2]]))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let mut tokens = Vec::with_capacity(bytes.len().saturating_sub(2));
+    tokens.extend(
+        bytes
+            .windows(3)
+            .map(|window| pack_trigram([window[0], window[1], window[2]])),
+    );
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn unique_ascii_tokens(bytes: &[u8]) -> Vec<u32> {
+    if bytes.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut tokens = Vec::with_capacity(bytes.len().saturating_sub(2));
+    tokens.extend(bytes.windows(3).map(|window| {
+        pack_trigram([
+            window[0].to_ascii_uppercase(),
+            window[1].to_ascii_uppercase(),
+            window[2].to_ascii_uppercase(),
+        ])
+    }));
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
 }
 
 #[must_use]
@@ -59,7 +84,7 @@ pub(crate) fn decide_guardrails(
 
 #[must_use]
 pub(crate) fn like_required_tokens(pattern: &str) -> Vec<u32> {
-    let mut tokens = BTreeSet::new();
+    let mut tokens = Vec::new();
     let mut literal = String::new();
     for ch in pattern.chars() {
         if matches!(ch, '%' | '_') {
@@ -70,7 +95,9 @@ pub(crate) fn like_required_tokens(pattern: &str) -> Vec<u32> {
         }
     }
     collect_literal_tokens(&literal, &mut tokens);
-    tokens.into_iter().collect()
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
 }
 
 #[must_use]
@@ -88,7 +115,7 @@ pub(crate) fn like_required_char_len(pattern: &str) -> usize {
     longest.max(current)
 }
 
-fn collect_literal_tokens(literal: &str, tokens: &mut BTreeSet<u32>) {
+fn collect_literal_tokens(literal: &str, tokens: &mut Vec<u32>) {
     tokens.extend(unique_tokens(literal));
 }
 

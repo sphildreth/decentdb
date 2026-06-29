@@ -124,9 +124,9 @@ SELECT * FROM users WHERE id = 1
 ### Write Flow
 
 1. **Begin Transaction**: Acquire write lock
-2. **Modify Pages**: Write to page cache
-3. **Log Changes**: Append to WAL
-4. **Commit**: Write commit marker, fsync WAL
+2. **Modify State**: Update page cache or the relational runtime working copy
+3. **Log Changes**: Append page/full-state frames to WAL
+4. **Commit**: Write commit marker, then sync according to `WalSyncMode`
 5. **Optional Checkpoint**: Copy pages to main file
 
 ### Read Flow
@@ -198,9 +198,9 @@ Frame types:
 ### Page Cache
 
 - Fixed-size pool of page buffers
-- LRU eviction policy
+- Clean, unpinned pages can be evicted when the cache needs room
 - Pin/unpin for active pages
-- Write-through for dirty pages
+- Dirty pages are persisted through WAL commits and checkpointed later
 
 ### Sort Buffers
 

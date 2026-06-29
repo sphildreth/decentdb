@@ -21,7 +21,12 @@ The connection string accepts the following keys:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `Data Source` | string | *required* | Path to the database file (e.g., `/tmp/mydb.ddb`). |
+| `Performance Profile` | string | engine default | Named native profile: `default`, `low_memory`, `balanced`, `embedded_fast`, or `tuned_durable`. Explicit low-level options override profile values. |
 | `Cache Size` | string | engine default | SQLite-style cache size: integer (pages) or with unit (`64MB`, `1GB`). |
+| `Retain Paged Row Sources After Commit` | bool | engine default | Keep paged row sources resident after commits on this handle for hot read/write workloads. |
+| `Paged Row Storage` | bool | engine default | Enable the paged row storage format; `embedded_fast` sets this to `False` for cheaper repeated small writes. |
+| `Persistent PK Index` | bool | engine default | Enable the persistent primary-key locator index. Benchmark before enabling globally because it adds write-time and file-size overhead. |
+| `WAL Auto Checkpoint` | int | engine default | WAL auto-checkpoint page threshold; `embedded_fast` sets this to `0` so bulk loads are not interrupted mid-flight. |
 | `Process Coordination` | string | `auto` | Cross-process WAL coordination mode: `auto`, `required`, or `single_process_unsafe`. |
 | `Process Coordination Timeout Ms` | int | `30000` | Bounded wait for cross-process coordination locks. |
 | `Logging` | bool | `false` | When `true`, fires `SqlExecuting` and `SqlExecuted` events on the connection. |
@@ -30,6 +35,26 @@ The connection string accepts the following keys:
 | `Pooling` | bool | `true` | Currently consumed by `DecentDB.MicroOrm` only; controls whether a single open connection is reused across operations. ADO.NET ignores this key. |
 
 Bare paths (e.g., `"/tmp/mydb.ddb"`) are also accepted by `DecentDBConnection`'s constructor and are automatically prefixed with `Data Source=`.
+
+For single-process embedded applications with a hot working set, start with:
+
+```csharp
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/app.ddb",
+    PerformanceProfile = "embedded_fast",
+    CacheSize = "64MB",
+    ProcessCoordination = "single_process_unsafe", // only for one-process apps
+};
+```
+
+When reusing native prepared statements directly, reset and clear bindings before
+each repeated execution unless you use a `Rebind*Execute` or `ExecuteBatch*`
+helper:
+
+```csharp
+stmt.Reset().ClearBindings().BindInt64(1, id).StepRowsAffected();
+```
 
 ## Cleanup helper
 

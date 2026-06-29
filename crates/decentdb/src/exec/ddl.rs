@@ -292,7 +292,7 @@ impl EngineRuntime {
         &mut self,
         statement: &CreateIndexStatement,
         _page_size: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let (index_qualifier, index_object) =
             super::compat_schema_qualified_name(&statement.index_name);
         if index_qualifier == Some(super::CompatSchemaQualifier::Temp) {
@@ -303,7 +303,7 @@ impl EngineRuntime {
         let index_name = index_object.to_string();
         if self.catalog.contains_object(&index_name) {
             if statement.if_not_exists && self.catalog.indexes.contains_key(&index_name) {
-                return Ok(());
+                return Ok(None);
             }
             return Err(DbError::sql(format!(
                 "object {} already exists",
@@ -545,7 +545,7 @@ impl EngineRuntime {
         }
 
         self.insert_index_schema(IndexSchema {
-            name: index_name,
+            name: index_name.clone(),
             table_name: table_name.clone(),
             kind,
             unique: statement.unique,
@@ -596,7 +596,7 @@ impl EngineRuntime {
         }
 
         self.bump_schema_cookie();
-        Ok(())
+        Ok(Some(index_name))
     }
 
     pub(super) fn execute_drop_table(
@@ -745,7 +745,7 @@ impl EngineRuntime {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
             let data = entry.resident_data_mut();
-            data.rows.clear();
+            data.clear_rows();
 
             if restart_identity {
                 let table = self.catalog_mut().tables.get_mut(target).ok_or_else(|| {
@@ -888,15 +888,15 @@ impl EngineRuntime {
                         Value::Null
                     };
                     let fill_value = super::cast_value(fill_value, column.column_type)?;
-                    let has_rows = !self
+                    let has_rows = self
                         .tables
                         .get(table_name)
                         .ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?
                         .resident_data()
-                        .rows
-                        .is_empty();
+                        .row_count()
+                        > 0;
                     if !column.nullable && matches!(fill_value, Value::Null) && has_rows {
                         return Err(DbError::constraint(format!(
                             "cannot add NOT NULL column {} without a non-NULL default",
@@ -907,9 +907,10 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut entry.resident_data_mut().rows {
+                        entry.resident_data_mut().mutate_visible_rows(|row| {
                             row.values.push(fill_value.clone());
-                        }
+                            Ok(())
+                        })?;
                     }
                     table.columns.push(column);
                 }
@@ -958,9 +959,10 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut entry.resident_data_mut().rows {
+                        entry.resident_data_mut().mutate_visible_rows(|row| {
                             row.values.remove(index);
-                        }
+                            Ok(())
+                        })?;
                     }
                 }
                 AlterTableAction::RenameColumn { old_name, new_name } => {
@@ -1044,10 +1046,11 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut entry.resident_data_mut().rows {
+                        entry.resident_data_mut().mutate_visible_rows(|row| {
                             row.values[index] =
                                 super::cast_value(row.values[index].clone(), *new_type)?;
-                        }
+                            Ok(())
+                        })?;
                     }
                     table.columns[index].column_type = *new_type;
                 }
@@ -1143,15 +1146,14 @@ impl EngineRuntime {
                     probe.checks.push(candidate.clone());
                     probe
                 };
-                for row in &self
+                let table_data = self
                     .tables
                     .get(&table_name)
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
-                    .resident_data()
-                    .rows
-                {
+                    .resident_data();
+                for row in table_data.visible_rows() {
                     let expr = parse_expression_sql(&candidate.expression_sql)?;
                     let dataset = table_row_dataset(&probe_table, &row.values, &probe_table.name);
                     if let Value::Bool(false) = self.eval_expr(

@@ -122,7 +122,7 @@ dead reader from a merely old reader.
 
 ### References
 
-- `design/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
+- `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
 - `design/adr/0018-checkpointing-reader-count-mechanism.md`
 - `design/adr/0019-wal-retention-for-active-readers.md`
 - `design/adr/0117-shared-wal-registry.md`

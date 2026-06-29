@@ -1,7 +1,7 @@
 # DecentDB Review Implementation Plan
 
 **Date:** 2026-06-18  
-**Source review:** `design/2026-06-18_REVIEW.md`  
+**Source review:** `design/_archive/2026-06-18_REVIEW.md`  
 **Benchmark reference:** `benchmarks/rust-baseline/README.md`
 
 This document converts the review findings into a phased implementation plan.

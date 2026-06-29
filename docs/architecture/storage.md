@@ -210,7 +210,7 @@ The pager maintains an in-memory cache of recently used pages.
 
 **Dirty Tracking:**
 - Modified pages marked "dirty"
-- Written to WAL immediately
+- Written to the WAL at commit
 - Written to main file at checkpoint
 
 **Eviction:**
@@ -221,8 +221,11 @@ The pager maintains an in-memory cache of recently used pages.
 ### Cache Configuration
 
 ```rust
-# Default: 1024 pages = 4MB
-let db = openDb("my.ddb", cachePages = 4096)  # 16MB
+use decentdb::{Db, DbConfig};
+
+let mut config = DbConfig::balanced(); // 16 MiB cache
+config.cache_size_mb = 64;
+let db = Db::open_or_create("my.ddb", config)?;
 ```
 
 **Sizing Guidelines:**
@@ -315,7 +318,7 @@ decentdb info --db=my.ddb
 1. **Choose appropriate page size**
    - 4KB for most workloads
    - 8KB if many large rows
-   - 2KB for memory-constrained
+   - 16KB for larger sequential workloads
 
 2. **Size cache appropriately**
    - Monitor hit rate

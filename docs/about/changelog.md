@@ -5,9 +5,122 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.15.0] - [UNRELEASED]
 
-## [2.14.0] - [2026-06-20]
+### Added
+
+- Added named database profile configuration across the C ABI and .NET
+  connection-string surfaces, including profile documentation for C/C++,
+  .NET, and general configuration users.
+- Added UUID handling for prepared statements, runtime indexes, and Python
+  result decoding paths, with API coverage and SQL regression tests.
+- Added `scripts/benchmark_runner.py`, expanded complex/movie workload
+  benchmark coverage, and checked in the latest rust-baseline benchmark
+  result artifacts.
+- Added ADR 0200 and format-14 resident table delete tombstones, including the
+  v13-to-v14 migration parser path and DELETE_BATCH design documentation.
+- Added a `DecentDB vs Turso Database` user-guide comparison that distinguishes
+  Turso Database, libSQL, and Turso Cloud while positioning DecentDB's local
+  durability, branch, sync, policy, and SQL tradeoffs.
+- Added detailed `DecentDB vs libSQL`, `DecentDB vs PGlite`,
+  `DecentDB vs H2`, `DecentDB vs LiteDB`, and `DecentDB vs Firebird Embedded`
+  comparison guides, and expanded the comparison overview/navigation so users
+  can evaluate DecentDB against more embedded database alternatives.
+
+### Changed
+
+- Improved SQL execution fast paths for residual predicates, filtered
+  projections, indexed range/order queries, grouped and distinct aggregates,
+  left-join aggregate lookups, and set-operation workloads.
+- Enhanced full-text search scoring, ranking, document deletion handling, and
+  movie-query coverage.
+- Aligned WAL sync benchmarking behavior with SQLite semantics and documented
+  the benchmark-driven performance work in the design notes.
+- Accelerated resident-storage cascade deletes with logical `TableData`
+  tombstones, tombstone-aware runtime index overlays, sparse resident overflow
+  patching, and CRC32C byte-patch updates. The MovieDB scratch cascade-delete
+  metric now beats SQLite in the benchmark runner.
+- Accelerated Showdown bulk deletes on resident tables by avoiding redundant
+  SQL parser work, deleting runtime index entries by row id, applying logical
+  full-text/trigram delete overlays, and patching resident overflow payloads
+  in place.
+- Removed the DecentDB native-defaults Showdown run from
+  `scripts/benchmark_runner.py` comparison profiles so SQLite gap rankings
+  compare like-for-like benchmark configurations.
+- Made the Showdown search-index benchmark compare full-text index setup
+  against SQLite FTS5 setup by removing the DecentDB-only trigram build from
+  that timed step and enabling matching SQLite FTS prefix indexes.
+- Accelerated runtime full-text/trigram search index builds with bulk full-text
+  construction, lower-allocation ASCII token handling, vector-backed full-text
+  postings, and flatter trigram postings.
+- Accelerated Showdown read-query metrics by routing top-level BM25 full-text
+  `ORDER BY ... LIMIT` queries through the existing top-k full-text fast path
+  and adding strict fast paths for simple `RANK`/`DENSE_RANK`, `ROW_NUMBER`/
+  `LAG`, and rolling `AVG` window query shapes.
+- Improved Showdown DML/query hot paths with arithmetic `UPDATE ... RETURNING`
+  fast paths, cheaper row-id range matching, incremental runtime B-tree row-id
+  moves, resident in-transaction update/revert dirty-state cleanup, no-op
+  row-id UPSERT checks, paged-manifest chunk metadata reuse, a strict
+  integer-series recursive CTE fast path, and a direct literal substring
+  `LIKE` projection path.
+- Archived the completed metric-improvement tracker and folded the remaining
+  diagnostic rust-baseline view/fixed-overhead gaps into
+  `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`.
+- Reprioritized `design/FUTURE_WINS.md` around the next adoption-critical
+  backlog: core read/query performance, cross-binding cursor parity,
+  Postgres-backed local-first sync, migration workflow, Doctor/advisors, JSONB,
+  hybrid search, and packaging/ORM adoption work.
+- Improved deferred SQL view execution for paged row storage by caching parsed
+  view queries, pruning decoded base-table columns for view filter/LIMIT paths,
+  streaming indexed view joins without materializing intermediate row vectors,
+  trimming proven join columns from projected deferred rows, lowering the
+  small-scale deferred-view LIMIT fast-path threshold, bounding grouped Top-N
+  postprocessing, exposing expanded-view pushdown metadata in `EXPLAIN`, and
+  reducing inactive faulty-VFS wrapper overhead.
+- Trimmed row-id alias join keys from deferred SQL view projected reads so a
+  three-table inner-join view chain no longer decodes the join key column when
+  it equals the previous row's stored row id. The linear and generic deferred
+  view walkers now synthesize the join key from the row id directly, shrinking
+  per-table projections for `v_artist_songs`-style view shapes. This is a
+  general optimization, not a schema or view-name specific shortcut.
+- Fixed a planner index-detection gap where explicit `JOIN ... ON` syntax never
+  recognized usable join indexes, so cost-based `IndexedJoin` is now selected
+  for explicit inner equi-joins when a useful B-tree index exists (previously
+  such joins always fell back to `HashJoin`). `EXPLAIN` now surfaces the chosen
+  `IndexedJoin` operator with estimates for these shapes.
+- Added planner `EXPLAIN` regression tests for indexed-join selection,
+  hash-join selection without a useful index, and estimated rows/cost surfacing.
+- Completed the WIN01 read/query performance closeout: public
+  `embedded_compare` guardrails now pass for balanced, low-memory, and tuned
+  durable DecentDB profiles; rust-baseline full/huge peak RSS drops by more
+  than 25%; and the full/huge view-query gates exceed 2x improvement without
+  weakening WAL sync or durability semantics.
+- Accelerated the public prepared-insert and read hot paths with
+  transaction-local next-row-id caching, fewer redundant catalog writes,
+  append-only unique-index tombstone-cleanup avoidance, resident prepared
+  point/range reads, direct projected row-id/range result construction, and
+  narrow `SmallVec` query rows.
+- Updated the Future Wins roadmap so WIN01 is recorded as delivered context
+  instead of active backlog, leaving cross-binding cursor/row-view parity as
+  the next top-priority performance-adjacent roadmap item.
+
+
+### Fixed
+
+- Prevented paged-row snapshot reads from mixing cached main-db pages with
+  WAL-pinned snapshots under rapid same-process open/close churn, and made
+  open-time paged-storage backfill abandon stale writes when another writer
+  advances the WAL first.
+- Preserved non-updated wide-row columns during arithmetic updates.
+- Improved checkpoint and runtime-index refresh behavior used by prepared
+  statements and benchmark-heavy read paths.
+- Simplified resident read checks by removing stale `SingleProcessUnsafe`
+  gating from the relevant read-path logic.
+- Kept tombstone-aware runtime indexes from returning stale rows after
+  delete/update/reinsert sequences while preserving resident checkpoint and
+  compaction fallbacks.
+
+## [2.14.0] - [2026-06-19]
 
 ### Added
 
@@ -194,9 +307,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added regression tests for indexed seek performance on checkpointed/paged
   tables with 300K+ rows, verifying bounded lookup time after checkpoint and
   reopen.
-- Added `design/METRIC_IMPROVEMENTS_PLAN.md` to track DecentDB's current
-  benchmark standing against SQLite and the priority order for closing or
-  exceeding each public-facing metric.
+- Added the now-archived `design/_archive/METRIC_IMPROVEMENTS_PLAN.md` to track
+  DecentDB's benchmark standing against SQLite and the priority order for
+  closing or exceeding each public-facing metric.
 - Added `benchmarks/rust-baseline --benchmark`, which runs `smoke`, `medium`,
   `full`, and `huge` scales in order for the selected engine/profile and then
   generates the HTML report.

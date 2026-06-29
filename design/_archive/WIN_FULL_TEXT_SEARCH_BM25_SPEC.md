@@ -3,7 +3,7 @@
 **Date:** 2026-05-26
 **Status:** Implemented; retained as design and acceptance reference
 **Future Version:** vNext
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine developers, SQL planner/executor maintainers, storage
 maintainers, binding maintainers, documentation authors, benchmark maintainers,
@@ -11,8 +11,8 @@ coding agents
 
 **Governing ADRs:**
 
-- [`adr/0175-native-full-text-search-query-surface-and-ranking.md`](adr/0175-native-full-text-search-query-surface-and-ranking.md)
-- [`adr/0176-full-text-search-storage-durability-and-binding-contract.md`](adr/0176-full-text-search-storage-durability-and-binding-contract.md)
+- [`adr/0175-native-full-text-search-query-surface-and-ranking.md`](../adr/0175-native-full-text-search-query-surface-and-ranking.md)
+- [`adr/0176-full-text-search-storage-durability-and-binding-contract.md`](../adr/0176-full-text-search-storage-durability-and-binding-contract.md)
 
 **Implementation status, 2026-05-26:** The engine implements `USING fulltext`
 indexes, persisted analyzer config, `fulltext_match`, `bm25`, phrase/prefix
@@ -23,14 +23,14 @@ rather than reopening this roadmap win.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`docs/design/spec.md`](../docs/design/spec.md)
-- [`adr/0007-trigram-postings-storage-strategy.md`](adr/0007-trigram-postings-storage-strategy.md)
-- [`adr/0008-trigram-pattern-length-guardrails.md`](adr/0008-trigram-pattern-length-guardrails.md)
-- [`adr/0052-trigram-durability.md`](adr/0052-trigram-durability.md)
-- [`adr/0063-trigram-postings-paging-format.md`](adr/0063-trigram-postings-paging-format.md)
-- [`adr/0112-cost-based-optimizer-with-stats.md`](adr/0112-cost-based-optimizer-with-stats.md)
-- [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
+- [`docs/design/spec.md`](../../docs/design/spec.md)
+- [`adr/0007-trigram-postings-storage-strategy.md`](../adr/0007-trigram-postings-storage-strategy.md)
+- [`adr/0008-trigram-pattern-length-guardrails.md`](../adr/0008-trigram-pattern-length-guardrails.md)
+- [`adr/0052-trigram-durability.md`](../adr/0052-trigram-durability.md)
+- [`adr/0063-trigram-postings-paging-format.md`](../adr/0063-trigram-postings-paging-format.md)
+- [`adr/0112-cost-based-optimizer-with-stats.md`](../adr/0112-cost-based-optimizer-with-stats.md)
+- [`STABLE_TOOLING_METADATA_CONTRACT.md`](../STABLE_TOOLING_METADATA_CONTRACT.md)
 
 ---
 

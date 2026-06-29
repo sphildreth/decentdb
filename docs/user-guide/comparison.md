@@ -1,25 +1,30 @@
-# Comparison: DecentDB vs SQLite vs DuckDB
+# Comparison Overview
 
-This page summarizes high-level feature differences between **DecentDB**, **SQLite**, and **DuckDB**.
+This page summarizes high-level feature differences between **DecentDB**,
+**SQLite**, and **DuckDB**, then points to deeper comparison guides for other
+embedded databases that developers may consider instead of DecentDB.
 
-## Versions (as of 2026-05-21)
+## Versions (as of 2026-06-28)
 
 This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB's current work branch is **v2.6.0 [unreleased]**. This document describes the current feature set and constraints; details may change
+DecentDB's current workspace version is **v2.15.0**. This document describes the current feature set and constraints; details may change
 as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
 - **Priority #1:** durable ACID writes (WAL-based)
 - **Priority #2:** fast reads
-- **Concurrency model:** single process, **one writer**, many concurrent reader threads
+- **Concurrency model:** **one writer**, many concurrent readers, with local
+  native cross-process WAL coordination when the VFS supports it
 - **SQL goal:** a practical, Postgres-like subset for common application queries
 
 SQLite and DuckDB are used as behavioral baselines for many SQL features, but DecentDB does **not** aim to be a drop-in replacement for either.
 
-> **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a concise per-feature support grid comparing DecentDB, SQLite, and DuckDB.
+> **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a concise
+> per-feature support grid comparing DecentDB, SQLite, and DuckDB. For
+> product-specific decision guides, see the comparison pages listed below.
 
 ## Quick summary
 
@@ -27,7 +32,7 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 |---|---|---|---|
 | Primary focus | OLTP-style embedded DB, durability-first | Embedded general-purpose DB | Embedded analytics (OLAP) |
 | Durability model | WAL-based, fsync-on-commit by default | WAL or rollback journal, configurable | Depends on storage mode; optimized for analytics workflows |
-| Concurrency | Single writer, many readers (threads, same process) | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
+| Concurrency | Single writer, many readers; local native cross-process WAL coordination when supported | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
 | Extensibility | Sandboxed Lua packages for scalar functions, table-valued functions, aggregates, and query-time collations; no arbitrary native loading | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
 | Local-first sync | Built-in durable change journal, batch exchange, scoped peers, conflict workflows, doctor/retention tooling, CLI, and .NET SDK | Not built in; usually application middleware or third-party replication layers | Not built in; not a local-first replication focus |
@@ -41,6 +46,30 @@ Notes:
 What “extensions” means here:
 - The ability to add new SQL features without modifying the database core (e.g., new scalar/aggregate functions, new table-like modules such as SQLite virtual tables, or optional subsystems like full-text search).
 - DecentDB's extension answer is a sandboxed Lua package model with manifest-declared SQL objects and explicit content-hash trust. It is not SQLite `.load`, DuckDB native extensions, or host-language callbacks.
+
+## Detailed Comparison Pages
+
+These pages are decision guides, not scorecards. They focus on fit, tradeoffs,
+and migration implications.
+
+- [DecentDB vs SQLite](decentdb-vs-sqlite.md) - the baseline embedded SQL
+  comparison.
+- [DecentDB vs libSQL](decentdb-vs-libsql.md) - the production-ready SQLite
+  fork maintained by Turso.
+- [DecentDB vs Turso Database](decentdb-vs-tursodatabase.md) - the newer Rust
+  SQLite-compatible rewrite.
+- [DecentDB vs PGlite](decentdb-vs-pglite.md) - WASM Postgres for JavaScript,
+  browser, and local-first web workloads.
+- [DecentDB vs DuckDB](decentdb-vs-duckdb.md) - embedded OLTP vs embedded
+  OLAP.
+- [DecentDB vs H2](decentdb-vs-h2.md) - Java/JDBC embedded and in-memory SQL.
+- [DecentDB vs Firebird Embedded](decentdb-vs-firebird-embedded.md) - embedded
+  Firebird SQL and PSQL workflows.
+- [DecentDB vs LiteDB](decentdb-vs-litedb.md) - .NET embedded document
+  storage.
+- [DecentDB vs RocksDB](decentdb-vs-rocksdb.md), [LMDB](decentdb-vs-lmdb.md),
+  [LevelDB](decentdb-vs-leveldb.md), and [sled](decentdb-vs-sled.md) -
+  key-value storage-engine alternatives.
 
 ## Local-first sync
 
@@ -81,14 +110,14 @@ DecentDB's current baseline includes:
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, `INSERT ... ON CONFLICT`
 - Joins: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN`
 - Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, `GROUP BY`, `HAVING`, `DISTINCT`, `DISTINCT ON`
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG` (with `DISTINCT` modifier)
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG`, `STDDEV`, `VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARRAY_AGG`, `MEDIAN`, `PERCENTILE_CONT`, `PERCENTILE_DISC` (with supported `DISTINCT` and aggregate `ORDER BY` forms)
 - Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`
 - CTEs: `WITH ... AS` (recursive and non-recursive)
 - Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
 - Math functions: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`
 - String functions: `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
-- Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
+- Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`, `DATE_TRUNC()`, `DATE_PART()`, `DATE_DIFF()`, `LAST_DAY()`, `NEXT_DAY()`, `MAKE_DATE()`, `MAKE_TIMESTAMP()`, `TO_TIMESTAMP()`, `AGE()`, and timestamp/date `INTERVAL` arithmetic
 - JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`
 - Table-valued functions: `json_each()`, `json_tree()`, `generate_series()`, and SQLite-compatible `pragma_*()` introspection helpers
 - Compatibility catalog views: `sqlite_schema` / `sqlite_master`, temp schema aliases, and minimal `information_schema.schemata`, `information_schema.tables`, and `information_schema.columns`
@@ -122,14 +151,14 @@ DecentDB has implemented many previously planned baseline features, including:
 - Broader `ALTER TABLE` (`ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`)
 - Trigger subsets (`AFTER` row triggers on tables, `INSTEAD OF` row triggers on views)
 - Window functions (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`)
-- Date/time functions (`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`)
+- Date/time functions (`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`, `DATE_TRUNC()`, `DATE_PART()`, `DATE_DIFF()`, `LAST_DAY()`, `NEXT_DAY()`, `MAKE_DATE()`, `MAKE_TIMESTAMP()`, `TO_TIMESTAMP()`, `AGE()`, and timestamp/date `INTERVAL` arithmetic)
 - Math functions (`SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`)
 - String functions (`LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`, `INSTR`)
 - JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`, `json_each()`, `json_tree()`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 - Join types (`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, `NATURAL`)
-- `DISTINCT ON`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`)
+- `DISTINCT ON`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`, plus supported forms for statistical and collection aggregates)
 - `DEFAULT` and generated columns (STORED + VIRTUAL)
 - `CREATE TEMP TABLE` / `CREATE TEMP VIEW` (session-scoped)
 - `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
@@ -155,7 +184,7 @@ SQLite and DuckDB both offer larger built-in ecosystems of types and functions. 
 |---|---|---|---|
 | B-tree secondary indexes | Yes | Yes | Yes |
 | Fast substring search for `LIKE '%pattern%'` | Yes, via trigram index on configured columns | Usually via FTS extension or full scans | Often via functions/extensions; not a primary focus |
-| Advanced index options (partial/expression/multi-column, etc.) | Supported with v0 limits (multi-column BTREE; partial `col IS NOT NULL`; narrow deterministic single-expression BTREE) | Many are available | Many are available |
+| Advanced index options (partial/expression/multi-column, etc.) | Supported with limits (multi-column BTREE; single-column BTREE partial predicates; narrow deterministic single-expression BTREE; covering `INCLUDE`) | Many are available | Many are available |
 
 DecentDB emphasizes predictable behavior, durability, and correctness testing rather than broad operational surface area.
 
@@ -175,7 +204,7 @@ are accepted only as no-ops or for DecentDB-owned metadata.
 | `PRAGMA journal_mode` | Supported as a WAL-only compatibility probe. `PRAGMA journal_mode = WAL` succeeds and returns `wal`; rollback/off/delete modes are rejected. |
 | `PRAGMA foreign_keys` | Supported and returns `1`. `ON` is a no-op; disabling foreign keys is rejected. |
 | `PRAGMA synchronous` | Supported as a compatibility probe. Assignments succeed only when they match the open-time WAL sync mode; use bulk-load durability options for ingestion tradeoffs. |
-| `PRAGMA cache_size` | Query is supported. Changing cache size requires reopen: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)`. |
+| `PRAGMA cache_size` | Query is supported. Changing cache size requires reopen: CLI `--cachePages`/`--cacheMb`, Rust `DbConfig.cache_size_mb`, or binding open options such as `cache_size=64MB`. |
 | `PRAGMA page_size` | Query is supported. Changing page size requires reopening with matching `DbConfig.page_size`. |
 | `PRAGMA table_info(t)` / `table_xinfo(t)` | Supported, including generated-column visibility through `hidden` in `table_xinfo`. |
 | `PRAGMA table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list` | Supported for SQLite-style schema browsers and ORMs. |

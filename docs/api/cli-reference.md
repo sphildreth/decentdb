@@ -191,7 +191,7 @@ and `head_id`.
 ### branch
 
 Manage branch metadata and branch state. Branch creation is metadata-only after
-the source state is checkpointed for durability.
+the source state is checkpointed into a stable branch base.
 
 ```bash
 decentdb branch create --db=<path> --name=<branch> [--from=<main|branch|snapshot|head>] [--format=<json|table>]
@@ -458,7 +458,7 @@ Supported options:
 Inspect or reset the connection-local plan cache. The plan cache is
 **enabled by default** and reduces redundant parse, resolve, and
 planner work for repeated prepared statements within a `Db` handle.
-See `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+See `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
 ADR 0190-0194.
 
 ```bash

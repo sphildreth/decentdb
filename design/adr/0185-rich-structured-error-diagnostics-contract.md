@@ -156,7 +156,7 @@ open options, and Doctor handoff.
 
 ### Consequences
 
-- `design/WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md` becomes
+- `design/_archive/WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md` becomes
   the implementation source for phases, field semantics, subcode catalog, and
   acceptance tests.
 - `docs/api/error-codes.md` must be rewritten around broad category plus
@@ -173,7 +173,7 @@ open options, and Doctor handoff.
 
 ### References
 
-- `design/WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`
+- `design/_archive/WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`
 - `design/FUTURE_WINS.md`
 - `design/adr/0010-error-handling-strategy.md`
 - `design/adr/0118-rust-ffi-panic-safety.md`

@@ -4,7 +4,8 @@
 mod tests {
     use super::super::*;
     use crate::record::value::Value;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     #[test]
     fn map_get_ci_and_mut() {
@@ -23,11 +24,11 @@ mod tests {
     #[test]
     fn tabledata_row_index_and_by_id() {
         let mut td = TableData::default();
-        td.rows.push(StoredRow {
+        td.push_row(StoredRow {
             row_id: 1,
             values: vec![],
         });
-        td.rows.push(StoredRow {
+        td.push_row(StoredRow {
             row_id: 3,
             values: vec![],
         });
@@ -37,11 +38,11 @@ mod tests {
 
         // binary_search path: non-zero offset
         let mut td2 = TableData::default();
-        td2.rows.push(StoredRow {
+        td2.push_row(StoredRow {
             row_id: 5,
             values: vec![],
         });
-        td2.rows.push(StoredRow {
+        td2.push_row(StoredRow {
             row_id: 10,
             values: vec![],
         });
@@ -71,7 +72,7 @@ mod tests {
         let mut keys_map: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
         let key = vec![1u8, 2, 3];
         keys_map.insert(key.clone(), 7);
-        let r = RuntimeBtreeKeys::UniqueEncoded(keys_map);
+        let r = RuntimeBtreeKeys::UniqueEncoded(Arc::new(keys_map), BTreeSet::new());
         assert_eq!(
             r.row_ids_for_key(&RuntimeBtreeKey::Encoded(key.clone())),
             vec![7]
@@ -79,7 +80,7 @@ mod tests {
         assert!(r.contains_any(&RuntimeBtreeKey::Encoded(key.clone())));
 
         // insert duplicate -> error
-        let mut r2 = RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new());
+        let mut r2 = RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new());
         r2.insert_row_id(RuntimeBtreeKey::Encoded(vec![9]), 1)
             .unwrap();
         assert!(r2
@@ -87,7 +88,7 @@ mod tests {
             .is_err());
 
         // type mismatch -> error
-        let mut r3 = RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new());
+        let mut r3 = RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new());
         assert!(r3.insert_row_id(RuntimeBtreeKey::Int64(1), 1).is_err());
     }
 
@@ -95,7 +96,7 @@ mod tests {
     fn remove_row_id_unique_and_nonunique_behaviour() {
         let mut keys_map: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
         keys_map.insert(vec![1], 99);
-        let mut rt = RuntimeBtreeKeys::UniqueEncoded(keys_map);
+        let mut rt = RuntimeBtreeKeys::UniqueEncoded(Arc::new(keys_map), BTreeSet::new());
         // mismatch
         assert!(rt
             .remove_row_id(&RuntimeBtreeKey::Encoded(vec![1]), 1)
@@ -107,7 +108,7 @@ mod tests {
 
         let mut keys2: BTreeMap<Vec<u8>, Vec<i64>> = BTreeMap::new();
         keys2.insert(vec![2], vec![1, 2]);
-        let mut rt2 = RuntimeBtreeKeys::NonUniqueEncoded(keys2);
+        let mut rt2 = RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(keys2), BTreeSet::new());
         rt2.remove_row_id(&RuntimeBtreeKey::Encoded(vec![2]), 1)
             .unwrap();
         assert!(rt2.contains_any(&RuntimeBtreeKey::Encoded(vec![2])));
@@ -120,7 +121,7 @@ mod tests {
     fn unique_int64_row_ids_for_key_and_value() {
         let mut m: Int64Map<i64> = Int64Map::default();
         m.insert(9, 33);
-        let rt = RuntimeBtreeKeys::UniqueInt64(m);
+        let rt = RuntimeBtreeKeys::UniqueInt64(Arc::new(m), BTreeSet::new());
         assert_eq!(rt.row_ids_for_key(&RuntimeBtreeKey::Int64(9)), vec![33]);
         assert_eq!(rt.row_ids_for_value(&Value::Int64(9)).unwrap(), vec![33]);
     }

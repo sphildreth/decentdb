@@ -136,6 +136,51 @@ whitespace, commas, or semicolons:
 - `ddb_db_open_with_options`
 - `ddb_db_open_or_create_with_options`
 
+Named durable profiles are available through `profile`. Explicit options in the
+same string override the selected profile:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "profile=embedded_fast;cache_size=64MB",
+          &db),
+      "open tuned embedded db");
+```
+
+Available profiles are `default`, `low_memory`, `balanced`, `embedded_fast`, and
+`tuned_durable`. `embedded_fast` is the recommended opt-in starting point for
+single-process embedded applications with a hot working set and repeated small
+writes; it keeps durable WAL sync enabled.
+
+Common open-option keys:
+
+| Key | Values / notes |
+|---|---|
+| `profile` / `performance_profile` | `default`, `low_memory`, `balanced`, `embedded_fast`, `tuned_durable` |
+| `cache_size` / `cache_size_mb` | integer page count, `<n>MB`, `<n>M`, `<n>GB`, or `<n>G` |
+| `retain_paged_row_sources_after_commit` | boolean |
+| `paged_row_storage` | boolean |
+| `persistent_pk_index` | boolean |
+| `wal_autocheckpoint` | page threshold; `0` disables page and byte auto-checkpoint triggers |
+| `wal_checkpoint_threshold_pages` | page-version threshold |
+| `wal_checkpoint_threshold_bytes` | byte threshold |
+| `wal_sync_mode` / `synchronous` | `full`, `normal`, or `async_commit:<milliseconds>` |
+| `process_coordination` | `auto`, `required`, or `single_process_unsafe` |
+| `process_coordination_timeout_ms` | unsigned integer milliseconds |
+| `write_queue_enabled` | boolean advisory for high-level bindings |
+| `write_queue_capacity` | queued-write capacity |
+| `write_queue_default_timeout_ms` | `0` means no configured default timeout |
+| `write_queue_strict_group_commit` / `write_queue_group_commit` | boolean |
+| `write_queue_max_batch` | maximum ready requests per executor pass |
+| `write_queue_max_group_delay_us` | optional group-commit collection delay |
+| `plan_cache_enabled` | boolean |
+| `plan_cache_max_bytes` | connection-local plan cache budget |
+| `encryption_key_hex` / `tde_key_hex` | hex key bytes |
+| `encryption_key` / `tde_key` | UTF-8 key bytes |
+| `allow_extension` | `name@sha256:<hash>` or `name@sha256:<hash>@<key_id>@<public_key>` |
+| `allow_unsigned_extensions` | development-only boolean |
+
 TDE can be enabled with `encryption_key_hex` or `encryption_key`:
 
 ```c
@@ -568,6 +613,12 @@ Maintenance helpers:
 - `ddb_db_checkpoint`
 - `ddb_db_save_as`
 - `ddb_evict_shared_wal`
+
+`ddb_db_checkpoint` folds committed WAL frames into the database file and can
+truncate the WAL when no active readers require retained versions. Under the
+default full WAL sync mode, commit acknowledgement is already the durability
+barrier; checkpointing is for WAL size, recovery time, and snapshot/export
+workflows.
 
 ## Local-First Sync JSON Bridge
 

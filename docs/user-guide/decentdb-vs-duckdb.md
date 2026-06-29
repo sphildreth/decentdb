@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **DuckDB** for embedded database workloads. Both are embeddable, but they target fundamentally different use cases.
 
-> **Versions compared:** DecentDB 2.0.0 vs DuckDB 1.x (as of 2024).
+> **Versions compared:** DecentDB 2.15.0 workspace behavior vs DuckDB 1.4.x.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a per-feature support grid, and [SQL Reference](sql-reference.md) for DecentDB's full SQL surface.
 
@@ -10,7 +10,7 @@ This document helps developers decide between **DecentDB** and **DuckDB** for em
 
 DecentDB and DuckDB are not direct competitors. They share the "embedded database" label but optimize for opposite ends of the workload spectrum:
 
-- **DecentDB** is an OLTP engine: durability-first, one writer, many concurrent reader threads, optimized for point lookups, small transactions, and application state.
+- **DecentDB** is an OLTP engine: durability-first, one writer, many concurrent readers, optimized for point lookups, small transactions, and application state.
 - **DuckDB** is an OLAP engine: throughput-first, parallel columnar execution, optimized for scans, aggregations, joins over large datasets, and analytics.
 
 Choosing between them is less about feature checklists and more about what your application *does*.
@@ -21,8 +21,8 @@ Choosing between them is less about feature checklists and more about what your 
 |-----------|----------|--------|
 | **Design priority** | Durability, then read performance | Analytical throughput, then flexibility |
 | **Query engine** | Row-oriented, B-tree index seeks | Columnar, vectorized, parallel |
-| **Concurrency model** | One writer, many concurrent reader threads (single process) | Single-connection writes; parallel within one query |
-| **Default durability** | WAL + fsync-on-commit, always | Configurable; optimized for bulk analytics workflows |
+| **Concurrency model** | One writer, many readers; local native cross-process WAL coordination when supported | Single-connection writes; parallel within one query |
+| **Default durability** | WAL + fsync-on-commit by default; open-time sync modes can relax durability timing | Configurable; optimized for bulk analytics workflows |
 | **Crash safety testing** | Built-in FaultyVFS + WAL failpoint hooks | Not a first-class testing surface |
 | **Extension ecosystem** | Sandboxed Lua packages; no arbitrary native loading | Rich (install extensions, UDFs) |
 | **External data access** | Single `.ddb` file | Parquet, CSV, JSON, Iceberg, S3/GCS/Azure, HTTP |
@@ -48,7 +48,10 @@ INSERT INTO orders (user_id, total) VALUES ($1, $2) RETURNING id;
 
 ### 2. You need guaranteed durability by default
 
-DecentDB fsyncs on every commit. There is no configuration knob to disable it. If your application stores data that must survive power loss, kernel panics, or process crashes, DecentDB makes the safe thing the default.
+DecentDB fsyncs on every commit by default. SQL cannot downgrade durability at
+runtime through a PRAGMA; open-time sync modes are an explicit deployment
+choice. If your application stores data that must survive power loss, kernel
+panics, or process crashes, DecentDB makes the safe thing the default.
 
 ```sql
 -- DecentDB: every COMMIT is durable. No settings to tune.
@@ -60,9 +63,11 @@ COMMIT;  -- fsync'd before returning to caller
 
 DuckDB's durability model depends on the storage mode and configuration. It is designed for analytics workflows where re-running a pipeline on failure is acceptable.
 
-### 3. You need full foreign key support including CASCADE
+### 3. You need foreign key actions including CASCADE and SET NULL
 
-Both databases enforce foreign key constraints on INSERT and UPDATE. However, DecentDB supports `ON DELETE CASCADE`, `ON DELETE SET NULL`, and `ON DELETE SET DEFAULT`. DuckDB currently does not support cascading operations.
+Both databases enforce foreign key constraints on INSERT and UPDATE. However,
+DecentDB supports `ON DELETE` / `ON UPDATE` actions including `CASCADE` and
+`SET NULL`. DuckDB currently does not support cascading operations.
 
 ```sql
 -- DecentDB: full FK support including CASCADE
@@ -83,7 +88,9 @@ CREATE TABLE orders (
 INSERT INTO orders (user_id) VALUES (999);  -- ERROR: FK violation (enforced!)
 ```
 
-If you need cascading deletes or set-null behavior, DecentDB provides it. With DuckDB, you must implement cascade logic in application code.
+If you need cascading deletes, cascading updates, or set-null behavior,
+DecentDB provides it. With DuckDB, you must implement that logic in application
+code.
 
 ### 4. You need triggers
 
@@ -165,9 +172,13 @@ Note: Both databases support `GROUP_CONCAT` (DuckDB has it as an alias for `STRI
 
 
 
-### 9. You need a single-process, multi-threaded reader architecture
+### 9. You need many concurrent OLTP readers
 
-DecentDB is designed for one process with multiple concurrent reader threads that get lock-free snapshot isolation. DuckDB executes queries in parallel within a single connection but is not designed for many concurrent connections issuing queries simultaneously.
+DecentDB is designed for many concurrent readers under snapshot isolation.
+Native local files can also coordinate multiple OS processes when supported.
+DuckDB executes queries in parallel within a single connection but is not
+designed for many concurrent OLTP connections issuing small queries
+simultaneously.
 
 ```
 DecentDB model:
@@ -254,11 +265,17 @@ FROM line_items
 GROUP BY category;
 ```
 
-DecentDB executes queries on a single core per query. You get concurrency through multiple reader threads running different queries, not parallelism within one query.
+DecentDB executes queries on a single core per query. You get concurrency
+through multiple readers running different queries, not parallelism within one
+query.
 
 ### 5. You need a rich type system for analytics
 
-DuckDB supports types that DecentDB does not: `LIST`, `STRUCT`, `MAP`, `ARRAY`, `INTERVAL`, `HUGEINT` (128-bit integer), `BIT`, `ENUM`, `UNION`, `TIME`, `TIMETZ`, and more.
+DuckDB supports analytics-oriented types that DecentDB does not, including
+`LIST`, `STRUCT`, `MAP`, fixed-length `ARRAY`, `HUGEINT` (128-bit integer),
+`BIT`, `UNION`, `TIMETZ`, and more. DecentDB does support core application
+types such as `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`, `ENUM`,
+`UUID`, `DECIMAL`, IP/network, MAC, and spatial types.
 
 ```sql
 -- DuckDB: nested and complex types

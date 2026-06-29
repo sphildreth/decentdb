@@ -107,16 +107,61 @@ impl AnalyzerConfig {
     }
 
     pub(crate) fn analyze(&self, text: &str) -> Vec<String> {
-        let mut text = if self.case_folded {
-            text.to_lowercase()
-        } else {
-            text.to_string()
-        };
-        text = remove_diacritics(text, self.diacritics);
-        tokenize_text(&text)
-            .into_iter()
-            .filter(|token| !is_stopword(token, &self.stopwords))
-            .collect()
+        let mut tokens = Vec::new();
+        self.for_each_token(text, |token| tokens.push(token));
+        tokens
+    }
+
+    pub(crate) fn for_each_token<F>(&self, text: &str, mut emit: F)
+    where
+        F: FnMut(String),
+    {
+        if text.is_ascii() {
+            self.for_each_ascii_token(text.as_bytes(), &mut emit);
+            return;
+        }
+
+        let mut token = String::new();
+        for character in text.chars() {
+            if self.case_folded {
+                for lowered in character.to_lowercase() {
+                    collect_token_character(
+                        normalize_token_character(lowered, self.diacritics),
+                        &mut token,
+                        &mut emit,
+                        &self.stopwords,
+                    );
+                }
+            } else {
+                collect_token_character(
+                    normalize_token_character(character, self.diacritics),
+                    &mut token,
+                    &mut emit,
+                    &self.stopwords,
+                );
+            }
+        }
+        flush_token(&mut token, &mut emit, &self.stopwords);
+    }
+
+    fn for_each_ascii_token<F>(&self, bytes: &[u8], emit: &mut F)
+    where
+        F: FnMut(String),
+    {
+        let mut token = String::new();
+        for &byte in bytes {
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                let normalized = if self.case_folded {
+                    byte.to_ascii_lowercase()
+                } else {
+                    byte
+                };
+                token.push(char::from(normalized));
+            } else {
+                flush_token(&mut token, emit, &self.stopwords);
+            }
+        }
+        flush_token(&mut token, emit, &self.stopwords);
     }
 
     pub(crate) fn to_json(&self) -> Result<Vec<u8>, AnalyzerConfigError> {
@@ -239,6 +284,13 @@ fn remove_diacritics(text: String, diacritics: AnalyzerDiacritics) -> String {
     }
 }
 
+fn normalize_token_character(character: char, diacritics: AnalyzerDiacritics) -> char {
+    match diacritics {
+        AnalyzerDiacritics::Preserve => character,
+        AnalyzerDiacritics::Remove => remove_latin_diacritic(character),
+    }
+}
+
 fn remove_latin_diacritic(character: char) -> char {
     match character {
         'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
@@ -297,6 +349,35 @@ fn tokenize_text(text: &str) -> Vec<String> {
 
 fn is_token_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
+}
+
+fn collect_token_character<F>(
+    character: char,
+    token: &mut String,
+    emit: &mut F,
+    stopwords: &AnalyzerStopwords,
+) where
+    F: FnMut(String),
+{
+    if is_token_character(character) {
+        token.push(character);
+    } else {
+        flush_token(token, emit, stopwords);
+    }
+}
+
+fn flush_token<F>(token: &mut String, emit: &mut F, stopwords: &AnalyzerStopwords)
+where
+    F: FnMut(String),
+{
+    if token.is_empty() {
+        return;
+    }
+    if !is_stopword(token, stopwords) {
+        emit(std::mem::take(token));
+    } else {
+        token.clear();
+    }
 }
 
 pub(crate) fn analyze_text(config: &AnalyzerConfig, text: &str) -> Vec<String> {

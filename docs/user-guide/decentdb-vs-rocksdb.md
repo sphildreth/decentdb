@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **RocksDB** for embedded storage workloads. These two systems operate at different abstraction levels, so the choice is less about features and more about what you want to build *on top* of your storage layer.
 
-> **Versions compared:** DecentDB 2.0.0 vs RocksDB 9.x (as of 2024).
+> **Versions compared:** DecentDB 2.15.x vs RocksDB 9.x.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for DecentDB's full SQL surface, and [DecentDB vs SQLite](decentdb-vs-sqlite.md) for the comparison with SQLite.
 
@@ -23,12 +23,12 @@ Systems like CockroachDB, TiKV, Pebble, and YugabyteDB use RocksDB (or its deriv
 | **Data model** | Tables, rows, columns, types | Arbitrary key-value byte pairs |
 | **Query language** | SQL | None (get/put/scan/delete API) |
 | **Indexing** | B-tree secondary indexes, trigram, expression, covering | Single sorted key-space; secondary indexes must be built manually |
-| **Durability** | WAL + fsync-on-commit, always | WAL + configurable sync policies |
+| **Durability** | WAL + full sync on commit by default; relaxed open-time modes are explicit | WAL + configurable sync policies |
 | **Architecture** | B-tree | LSM-tree (Log-Structured Merge-tree) |
 | **Write path** | In-place page updates | Append-only memtable, background compaction |
-| **Concurrency** | One writer, many concurrent reader threads | Single-process; thread-safe concurrent access |
+| **Concurrency** | One writer, many readers; local native cross-process WAL coordination when supported | Single-process; thread-safe concurrent access |
 | **Transactions** | Full ACID (SQL-level) | ACID at key-value level (`WriteBatch`, optimistic/pessimistic txn) |
-| **Compaction** | None (B-tree manages space in-place) | Background compaction is central to the design |
+| **Compaction** | No LSM compaction; checkpointing and index rebuilds are separate maintenance work | Background compaction is central to the design |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | C++, C, Java, Go, Python, and many others |
 | **License** | MIT or Apache-2.0 | Apache-2.0 or GPLv2 |
 | **Binary size** | ~2-3 MB | ~5-10 MB |
@@ -186,7 +186,10 @@ With RocksDB, you would iterate over keys with a prefix scan, aggregate in appli
 
 ### 6. You need guaranteed fsync-on-commit durability by default
 
-DecentDB fsyncs on every commit with no opt-out. RocksDB's `sync` option on `WriteOptions` defaults to `false` -- you must explicitly enable it for durability, and even then the WAL sync behavior is configurable.
+DecentDB uses full WAL sync on every commit by default; relaxed sync modes are
+explicit open-time deployment choices. RocksDB's `sync` option on
+`WriteOptions` defaults to `false` -- you must explicitly enable it for
+durability, and even then the WAL sync behavior is configurable.
 
 ```sql
 -- DecentDB: always durable
@@ -204,7 +207,9 @@ db->Put(options, key, value);
 
 ### 7. You need predictable read latency without compaction interference
 
-RocksDB background compaction causes periodic I/O spikes that can affect read latency. DecentDB's B-tree has no background compaction -- read latency is consistent.
+RocksDB background compaction causes periodic I/O spikes that can affect read
+latency. DecentDB's B-tree has no LSM-style background compaction; checkpoint
+I/O is separate maintenance work that can be scheduled and tuned.
 
 This matters for latency-sensitive applications (API backends, real-time systems) where a p99 spike from compaction is unacceptable.
 
@@ -306,9 +311,13 @@ UPDATE counters SET value = value + 1 WHERE key = 'page_views';
 
 Both work, but RocksDB's merge operator avoids the read-modify-write round-trip for simple operations.
 
-### 8. You need cross-process access to the same data
+### 8. You need RocksDB-style shared raw storage
 
-RocksDB can be opened by multiple processes simultaneously (with appropriate locking). DecentDB is single-process.
+RocksDB is a raw key-value engine with its own locking and operational model.
+DecentDB now coordinates local native processes for supported database files,
+but it does not expose a RocksDB-style shared raw key-value API. If separate
+processes need to manipulate the same low-level key spaces directly, RocksDB is
+the better fit.
 
 ## Side-by-Side Examples
 

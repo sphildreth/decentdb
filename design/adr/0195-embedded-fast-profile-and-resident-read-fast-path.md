@@ -15,7 +15,7 @@ after each autocommit write commit whenever
 
 A fair side-by-side comparison against SQLite
 (`decentdb-vs-sqlite` harness, see
-`design/2026-06-PERF_TESTING_RESULTS.md`) measured autocommit write and
+`design/_archive/2026-06-PERF_TESTING_RESULTS.md`) measured autocommit write and
 non-fast-path read throughput at medium scale (500 users / 100 projects /
 10,000 issues / ~46,670 comments) using the default `balanced()` profile:
 
@@ -126,7 +126,7 @@ public API is removed or renamed.
   autocommit `update`, generic aggregate executor, per-page `save_as` copy,
   per-statement DDL parse/commit for `cold_start`) are not closed by this
   ADR; they are root-caused and tracked in the §6 change log of
-  `design/2026-06-PERF_TESTING_RESULTS.md` as follow-on planner/storage work.
+  `design/_archive/2026-06-PERF_TESTING_RESULTS.md` as follow-on planner/storage work.
 
 ### Compatibility
 
@@ -137,7 +137,7 @@ no C ABI change.
 
 ## References
 
-- `design/2026-06-PERF_TESTING_RESULTS.md` — the comparison that surfaced
+- `design/_archive/2026-06-PERF_TESTING_RESULTS.md` — the comparison that surfaced
   the cliff and the measured before/after.
 - ADR 0143 — On-Disk Row-Scan Executor (deferred materialization).
 - ADR 0145 — Paged Table Row Source.

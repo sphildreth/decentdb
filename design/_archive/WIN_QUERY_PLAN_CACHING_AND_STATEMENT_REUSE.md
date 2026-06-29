@@ -3,7 +3,7 @@
 **Date:** 2026-06-13
 **Status:** DONE
 **Delivered Version:** 2.13.0
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Future Win SPEC
 **Audience:** Core engine maintainers, planner and executor maintainers, WAL and
 storage maintainers, C ABI maintainers, binding maintainers, WASM/browser
@@ -24,35 +24,35 @@ ADRs record (cache key, eviction policy, security generation, C ABI
 surface) are the answers to the previously-open "ADR-required
 decisions" list and are referenced by name throughout this spec.
 
-- [ADR 0190](./adr/0190-query-plan-cache-scope-key-and-lifecycle.md): Scope,
+- [ADR 0190](../adr/0190-query-plan-cache-scope-key-and-lifecycle.md): Scope,
   cache key, invalidation surface, lifecycle, and binding contract for the
   connection-local plan cache.
-- [ADR 0191](./adr/0191-query-plan-cache-memory-accounting-and-eviction.md):
+- [ADR 0191](../adr/0191-query-plan-cache-memory-accounting-and-eviction.md):
   Memory accounting, hard limits, LRU eviction, and default size for the
   connection-local plan cache.
-- [ADR 0192](./adr/0192-query-plan-cache-security-generation-and-tde.md):
+- [ADR 0192](../adr/0192-query-plan-cache-security-generation-and-tde.md):
   Security/audit generation counter, policy/mask invalidation, TDE interaction,
   and the audit-context-as-observable-but-not-cache-key decision.
-- [ADR 0193](./adr/0193-query-plan-cache-c-abi-surface-and-binding-contract.md):
+- [ADR 0193](../adr/0193-query-plan-cache-c-abi-surface-and-binding-contract.md):
   C ABI open options, default-on vs default-off, the additive-vs-version-bump
   call, and binding responsibilities.
-- [ADR 0194](./adr/0194-query-plan-cache-prepared-plan-reuse.md):
+- [ADR 0194](../adr/0194-query-plan-cache-prepared-plan-reuse.md):
   Phase 1B prepared-plan bundle reuse for `PreparedSimple*` and simple DML
   plans.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 - [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md)
-- [`adr/0184-default-fast-planner-and-runtime-contract.md`](adr/0184-default-fast-planner-and-runtime-contract.md)
-- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](adr/0162-engine-owned-write-queue-strict-group-commit.md)
-- [`adr/0163-operational-sys-metrics.md`](adr/0163-operational-sys-metrics.md)
-- [`adr/0177-cross-process-coordination-sidecar-and-locking.md`](adr/0177-cross-process-coordination-sidecar-and-locking.md)
-- [`adr/0174-local-data-security-tde-policies-masking-audit-context.md`](adr/0174-local-data-security-tde-policies-masking-audit-context.md)
-- [`BENCHMARKING_GUIDE.md`](BENCHMARKING_GUIDE.md)
-- [`docs/user-guide/performance.md`](../docs/user-guide/performance.md)
-- [`docs/api/configuration.md`](../docs/api/configuration.md)
-- [`include/decentdb.h`](../include/decentdb.h)
+- [`adr/0184-default-fast-planner-and-runtime-contract.md`](../adr/0184-default-fast-planner-and-runtime-contract.md)
+- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](../adr/0162-engine-owned-write-queue-strict-group-commit.md)
+- [`adr/0163-operational-sys-metrics.md`](../adr/0163-operational-sys-metrics.md)
+- [`adr/0177-cross-process-coordination-sidecar-and-locking.md`](../adr/0177-cross-process-coordination-sidecar-and-locking.md)
+- [`adr/0174-local-data-security-tde-policies-masking-audit-context.md`](../adr/0174-local-data-security-tde-policies-masking-audit-context.md)
+- [`BENCHMARKING_GUIDE.md`](../BENCHMARKING_GUIDE.md)
+- [`docs/user-guide/performance.md`](../../docs/user-guide/performance.md)
+- [`docs/api/configuration.md`](../../docs/api/configuration.md)
+- [`include/decentdb.h`](../../include/decentdb.h)
 
 ---
 

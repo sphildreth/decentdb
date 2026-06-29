@@ -2,7 +2,9 @@
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
-> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+> Note: This repo is past the initial milestone. This document describes the
+> current Rust-native 2.x implementation baseline and still preserves some
+> phased roadmap context from the original planning document.
 
 ## 1. Overview
 This document defines the baseline engineering design for DecentDB:
@@ -12,27 +14,28 @@ This document defines the baseline engineering design for DecentDB:
 - Storage: **paged file + B+Trees**, with **trigram inverted index** for search
 - **Mandatory Overflow Pages** for BLOB/Large TEXT support
 
-Current scope (0.x, pre-1.0): single process, multi-threaded readers, single writer.
+Current scope: one writer with many concurrent readers, optimized for embedded
+single-process use and coordinated across local native OS processes when the
+selected VFS supports the required locks.
 
 ---
 
 ## 2. Module architecture
 ### 2.1 Engine modules (Rust)
 1. **vfs/**
-  - OS file I/O abstraction: open/read/write/fsync/lock (intra-process lock only)
+  - OS file I/O abstraction: open/read/write/fsync/lock
    - “Faulty VFS” hooks for tests (partial writes, dropped fsync, crash points)
 
 2. **pager/**
    - Fixed-size page manager (default page size: 4096 bytes, configurable at DB creation)
      - 4KB aligns with typical SSD block sizes and OS page sizes
      - Larger pages (8KB, 16KB) reduce internal fragmentation for wide rows
-     - Smaller pages (2KB) reduce memory pressure for cache-constrained environments
    - Page cache (pin/unpin, dirty tracking, eviction)
    - Page allocation + freelist
 
 3. **wal/**
    - WAL file append and recovery
-   - Frame checksums, commit markers
+   - Fixed-size frame payloads, commit markers, checkpoint frames, and page-delta frames
    - WAL index (in-memory map pageId -> latest frame offset for fast reads)
 
 4. **btree/**
@@ -149,13 +152,12 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 
 ## 4. Transactions, durability, and recovery (WAL-only)
 ### 4.1 WAL frame format (0.x baseline)
-Each frame appends:
-- `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
-- `page_id` (u32, valid for page frames)
-- `payload_size` (u32)
-- payload (page image or commit metadata)
-- `frame_checksum` (u64, CRC-32C of header + payload)
-- `lsn` (u64 monotonically increasing)
+The WAL begins with a fixed-size header containing the WAL magic, header
+version, page size, and durable logical end offset. Each frame then appends:
+- `frame_type` (u8): 0=page, 1=commit, 2=checkpoint, 3=page_delta
+- `page_id` (u32, valid for page and page_delta frames)
+- fixed-size payload determined by `frame_type`
+- reserved trailer (u64)
 
 **Frame Types:**
 - **PAGE (0)**: Contains modified page data
@@ -167,14 +169,18 @@ Each frame appends:
 - **CHECKPOINT (2)**: Checkpoint completion marker
   - `page_id`: 0 (unused)
   - `payload`: checkpoint_lsn (u64)
+- **PAGE_DELTA (3)**: Delta-encoded page update
+  - `page_id`: ID of the page
+  - `payload`: fixed-size delta payload
 
 Commit rule:
 - A transaction is committed when a COMMIT frame is durably written.
 - Default durability: `fsync(wal)` on commit.
 
 **Torn Write Detection:**
-- Frame header includes `payload_size` for validation
-- Recovery ignores incomplete frames (checksum mismatch or size truncation)
+- Frame type determines the fixed payload size for validation.
+- Recovery ignores frames beyond the durable logical WAL end and treats
+  malformed frames inside that range as corruption.
 
 ### 4.2 Snapshot reads
 On read transaction start:
@@ -236,14 +242,14 @@ See ADR-0017 for detailed design.
 ### 4.5 Crash recovery
 On open:
 - scan WAL from last checkpoint
-- validate frame checksums
+- validate frame types, payload sizes, and the durable logical WAL end
 - apply frames up to last commit boundary into walIndex view
 - DB becomes readable immediately using WAL overlay
 - optional: perform checkpoint soon after open
 
 ---
 
-## 5. Concurrency model (single process)
+## 5. Concurrency model
 ### 5.1 Writer
 - Exactly one active writer transaction at a time
 - Recommended: a single “writer thread” owning write txn state (actor pattern)
@@ -641,27 +647,34 @@ Status: partially implemented in the current engine.
 ### 16.1 Configuration options (current)
 
 Database-level configuration (set at open time):
-- `page_size`: fixed at 4096 bytes (opening any other size currently returns `ERR_CORRUPTION`)
-- `cachePages` / `cacheMb`: page cache capacity (CLI: `--cachePages` / `--cacheMb`; Rust: `openDb(..., cachePages = ...)`)
+- `page_size`: 4096, 8192, or 16384 bytes at database creation
+- `cache_size_mb`: page cache capacity in Rust `DbConfig`
+- `--cachePages` / `--cacheMb`: CLI cache capacity overrides
+- C ABI / binding option strings: `cache_size=64MB`, `cache_size_mb=64`, or
+  named profiles such as `profile=embedded_fast`
 
 ### 16.2 Runtime configuration (current)
 
-- Checkpoint/reader management can be changed via `setCheckpointConfig(wal, ...)` (defaults are set in `openDb`).
-- Durability for normal transactions is fsync-on-commit and is not currently configurable via SQL; for ingestion tradeoffs use bulk load durability modes.
+- Checkpoint thresholds are configured at open via
+  `DbConfig::wal_checkpoint_threshold_pages` and
+  `DbConfig::wal_checkpoint_threshold_bytes`.
+- Normal SQL transactions use full WAL sync by default. `WalSyncMode::Normal`
+  and `WalSyncMode::AsyncCommit { interval_ms }` are explicit open-time
+  durability tradeoffs; SQL PRAGMAs do not downgrade durability at runtime.
+- For CLI ingestion tradeoffs, use bulk load durability modes.
 
 ### 16.3 Configuration API (current)
 
 ```rust
-import decentdb/engine
-import decentdb/wal/wal
+use decentdb::{Db, DbConfig, WalSyncMode};
 
-let db = openDb("dbfile", cachePages = 4096).value
-setCheckpointConfig(db.wal,
-  everyBytes = 64 * 1024 * 1024,
-  everyMs = 0,
-  readerWarnMs = 60 * 1000,
-  readerTimeoutMs = 300 * 1000,
-  forceTruncateOnTimeout = true)
+let mut config = DbConfig::embedded_fast();
+config.cache_size_mb = 64;
+config.wal_checkpoint_threshold_bytes = 64 * 1024 * 1024;
+config.wal_checkpoint_threshold_pages = 4096;
+config.wal_sync_mode = WalSyncMode::Full;
+
+let db = Db::open_or_create("dbfile", config)?;
 ```
 
 ---

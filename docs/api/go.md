@@ -21,6 +21,7 @@ The Go package:
 - registers the `decentdb` driver with Go's `database/sql`
 - accepts plain file paths, `file:/...` DSNs, and `:memory:`
 - supports DSN mode parameter: `?mode=create|open|open_or_create`
+- supports raw native open options with `?options=<url-encoded key=value list>`
 - exposes a direct `OpenDirect()` path for DecentDB-specific helpers
 
 ### Type support
@@ -74,6 +75,18 @@ db, err := sql.Open(
     "file:/tmp/app.ddb?write_queue_enabled=true&write_queue_capacity=128&write_queue_default_timeout_ms=1000",
 )
 ```
+
+For other native open options, pass an encoded `options` value:
+
+```go
+db, err := sql.Open(
+    "decentdb",
+    "file:/tmp/app.ddb?options=profile%3Dembedded_fast%3Bcache_size%3D64MB",
+)
+```
+
+The DSN also accepts `write_queue_group_commit` as the native compatibility
+alias for strict group commit.
 
 For direct use:
 

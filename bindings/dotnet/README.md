@@ -43,7 +43,7 @@ This directory contains the official .NET bindings for DecentDB:
 All three bindings accept bare paths (e.g., `"/tmp/mydb.ddb"`) and full connection strings. The canonical form is:
 
 ```
-Data Source=/path/to/db.ddb;Pooling=true;Cache Size=64MB;Logging=false;Command Timeout=30
+Data Source=/path/to/db.ddb;Performance Profile=embedded_fast;Pooling=true;Cache Size=64MB;Logging=false;Command Timeout=30
 ```
 
 Supported keys:
@@ -51,6 +51,7 @@ Supported keys:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `Data Source` | string | *required* | Path to the database file. |
+| `Performance Profile` | string | engine default | Named native profile: `default`, `low_memory`, `balanced`, `embedded_fast`, or `tuned_durable`. Explicit low-level options override profile values. |
 | `Cache Size` | string | engine default | Cache size: integer (pages) or with unit (`64MB`). |
 | `Retain Paged Row Sources After Commit` | bool | engine default | Keep paged row sources resident after commits on this handle for hot read workloads. |
 | `Paged Row Storage` | bool | engine default | Enable the paged row storage format; set `False` for the tuned resident-read profile used by benchmarks. |
@@ -68,6 +69,15 @@ Supported keys:
 | `LogLevel` | enum | `Debug` | Minimum log severity. |
 | `Command Timeout` | int | `30` | Command timeout in seconds. |
 | `Pooling` | bool | `true` | Consumed by MicroOrm only; ADO.NET ignores this key. |
+
+For single-process embedded apps with a hot working set, use
+`Performance Profile=embedded_fast` as the starting point. It keeps durable WAL
+sync enabled while raising the cache, retaining hot row sources after commits,
+using the cheaper repeated-write row-source layout, and disabling size-triggered
+auto-checkpoints. Add `Process Coordination=single_process_unsafe` only when one
+OS process will open the database file. `Persistent PK Index=True` has workload
+specific write-time and file-size costs, so benchmark it before enabling it
+globally.
 
 The `DecentDBConnection.DeleteDatabaseFiles(path)` helper deletes the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) safely.
 

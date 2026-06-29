@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Delivered
 **Delivered Version:** 2.8.0
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine maintainers, planner and executor maintainers, WAL and
 storage maintainers, binding maintainers, benchmark maintainers, documentation
@@ -14,7 +14,7 @@ here lands in the same release.
 
 **Governing ADRs:**
 
-- [`adr/0184-default-fast-planner-and-runtime-contract.md`](adr/0184-default-fast-planner-and-runtime-contract.md)
+- [`adr/0184-default-fast-planner-and-runtime-contract.md`](../adr/0184-default-fast-planner-and-runtime-contract.md)
 
 **Required follow-up ADRs before implementation:**
 
@@ -64,19 +64,19 @@ here lands in the same release.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`BENCHMARKING_GUIDE.md`](BENCHMARKING_GUIDE.md)
-- [`PRD.md`](PRD.md)
-- [`SPEC.md`](SPEC.md)
-- [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md)
-- [`adr/0131-legacy-format-migrations.md`](adr/0131-legacy-format-migrations.md)
-- [`adr/0143-on-disk-row-scan-executor.md`](adr/0143-on-disk-row-scan-executor.md)
-- [`adr/0144-persistent-primary-key-index.md`](adr/0144-persistent-primary-key-index.md)
-- [`adr/0145-paged-table-row-source.md`](adr/0145-paged-table-row-source.md)
-- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](adr/0162-engine-owned-write-queue-strict-group-commit.md)
-- [`adr/0163-operational-sys-metrics.md`](adr/0163-operational-sys-metrics.md)
-- [`docs/user-guide/performance.md`](../docs/user-guide/performance.md)
-- [`docs/api/configuration.md`](../docs/api/configuration.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
+- [`BENCHMARKING_GUIDE.md`](../BENCHMARKING_GUIDE.md)
+- [`PRD.md`](../PRD.md)
+- [`SPEC.md`](../SPEC.md)
+- [`TESTING_STRATEGY.md`](../TESTING_STRATEGY.md)
+- [`adr/0131-legacy-format-migrations.md`](../adr/0131-legacy-format-migrations.md)
+- [`adr/0143-on-disk-row-scan-executor.md`](../adr/0143-on-disk-row-scan-executor.md)
+- [`adr/0144-persistent-primary-key-index.md`](../adr/0144-persistent-primary-key-index.md)
+- [`adr/0145-paged-table-row-source.md`](../adr/0145-paged-table-row-source.md)
+- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](../adr/0162-engine-owned-write-queue-strict-group-commit.md)
+- [`adr/0163-operational-sys-metrics.md`](../adr/0163-operational-sys-metrics.md)
+- [`docs/user-guide/performance.md`](../../docs/user-guide/performance.md)
+- [`docs/api/configuration.md`](../../docs/api/configuration.md)
 - [`data/bench_summary.json`](../data/bench_summary.json) as the current
   release benchmark snapshot. Section 4 captures the baseline values this spec
   references; the JSON file may change as new benchmark runs are accepted.

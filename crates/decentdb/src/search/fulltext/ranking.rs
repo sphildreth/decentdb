@@ -33,6 +33,17 @@ pub(crate) fn bm25_score(
     doc_stats: &Bm25DocumentStats,
     terms: &[Bm25TermStats],
 ) -> f64 {
+    bm25_score_iter(context, doc_stats, terms.iter().copied())
+}
+
+pub(crate) fn bm25_score_iter<I>(
+    context: &Bm25Context,
+    doc_stats: &Bm25DocumentStats,
+    terms: I,
+) -> f64
+where
+    I: IntoIterator<Item = Bm25TermStats>,
+{
     if context.corpus_size <= 0.0 || context.avg_doc_len <= 0.0 || doc_stats.doc_len <= 0.0 {
         return 0.0;
     }
@@ -55,7 +66,7 @@ pub(crate) fn bm25_score(
 
 #[cfg(test)]
 mod tests {
-    use super::{bm25_score, Bm25Context, Bm25DocumentStats, Bm25TermStats};
+    use super::{bm25_score, bm25_score_iter, Bm25Context, Bm25DocumentStats, Bm25TermStats};
 
     #[test]
     fn bm25_score_zero_when_context_or_doc_missing() {
@@ -120,5 +131,28 @@ mod tests {
         };
         let score = bm25_score(&context, &doc, &[first, second]);
         assert!(score > 0.0);
+    }
+
+    #[test]
+    fn bm25_score_iter_matches_slice_api() {
+        let context = Bm25Context {
+            corpus_size: 100.0,
+            avg_doc_len: 20.0,
+            ..Bm25Context::default()
+        };
+        let doc = Bm25DocumentStats { doc_len: 18.0 };
+        let terms = [
+            Bm25TermStats {
+                term_freq: 4.0,
+                doc_freq: 2.0,
+            },
+            Bm25TermStats {
+                term_freq: 1.0,
+                doc_freq: 10.0,
+            },
+        ];
+        let slice_score = bm25_score(&context, &doc, &terms);
+        let iter_score = bm25_score_iter(&context, &doc, terms);
+        assert!((slice_score - iter_score).abs() < f64::EPSILON);
     }
 }

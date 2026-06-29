@@ -4499,6 +4499,7 @@ pub(super) fn cast_value(value: Value, target_type: crate::catalog::ColumnType) 
         },
         crate::catalog::ColumnType::Uuid => match value {
             Value::Uuid(value) => Ok(Value::Uuid(value)),
+            Value::Text(value) => parse_uuid_text(&value).map(Value::Uuid),
             Value::Blob(value) if value.len() == 16 => {
                 let mut uuid = [0u8; 16];
                 uuid.copy_from_slice(&value);

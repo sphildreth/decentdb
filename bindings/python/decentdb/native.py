@@ -427,8 +427,12 @@ def load_library():
     if hasattr(_lib, "ddb_stmt_execute_batch_typed"):
         _lib.ddb_stmt_execute_batch_typed.argtypes = [
             c_void_p,
-            c_char_p,
             c_size_t,
+            c_char_p,
+            POINTER(c_int64),
+            POINTER(c_double),
+            POINTER(c_char_p),
+            POINTER(c_size_t),
             POINTER(c_uint64),
         ]
         _lib.ddb_stmt_execute_batch_typed.restype = c_uint32

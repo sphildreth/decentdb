@@ -2,6 +2,7 @@ import collections
 import ctypes
 import datetime
 import decimal
+import itertools
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -578,6 +579,12 @@ def _is_direct_execute_sql(sql):
     return _TXN_CONTROL_RE.match(sql) is not None
 
 
+def _is_dml_returning_sql(normalized_sql):
+    return normalized_sql.startswith(("insert ", "update ", "delete ")) and (
+        " returning " in f" {normalized_sql} "
+    )
+
+
 def _decode_ip_address_value(value):
     family = int(value.ip_family)
     if family == 4:
@@ -756,6 +763,27 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._decode_matrix_i64_text_f64_date_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_f64_date", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_f64_i64_i64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_f64_i64_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_f64_i64_i64_sql_support = {}
+        self._decode_row_i64_text_native = (
+            getattr(_fastdecode_native, "decode_row_i64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._decode_row_i64_text_text_native = (
             getattr(_fastdecode_native, "decode_row_i64_text_text", None)
             if _fastdecode_native is not None
@@ -773,6 +801,16 @@ class Cursor:
         )
         self._decode_matrix_i64_f64_text_native = (
             getattr(_fastdecode_native, "decode_matrix_i64_f64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_row_i64_f64_native = (
+            getattr(_fastdecode_native, "decode_row_i64_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_f64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_f64", None)
             if _fastdecode_native is not None
             else None
         )
@@ -796,6 +834,11 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._decode_row_i64_text_text_text_text_i64_native = (
+            getattr(_fastdecode_native, "decode_row_i64_text_text_text_text_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._decode_matrix_i64_native = (
             getattr(_fastdecode_native, "decode_matrix_i64", None)
             if _fastdecode_native is not None
@@ -803,6 +846,11 @@ class Cursor:
         )
         self._decode_matrix_i64_f64_text_text_i64_f64_native = (
             getattr(_fastdecode_native, "decode_matrix_i64_f64_text_text_i64_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_text_text_text_i64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_text_text_text_i64", None)
             if _fastdecode_native is not None
             else None
         )
@@ -974,12 +1022,16 @@ class Cursor:
             self._native_reset_bind_int64_step_affected is not None
         )
         self._native_fetch_rows_i64_text_f64_sql_support = {}
+        self._decode_matrix_i64_text_sql_support = {}
+        self._decode_matrix_i64_f64_sql_support = {}
         self._decode_matrix_i64_text_f64_sql_support = {}
+        self._decode_matrix_i64_text_f64_date_sql_support = {}
         self._decode_matrix_i64_text_text_sql_support = {}
         self._decode_matrix_i64_f64_text_sql_support = {}
         self._decode_matrix_text_i64_f64_sql_support = {}
         self._decode_matrix_i64_sql_support = {}
         self._decode_matrix_i64_f64_text_text_i64_f64_sql_support = {}
+        self._decode_matrix_i64_text_text_text_text_i64_sql_support = {}
         self._native_bind_int64_step_row_view_sql_support = {}
         self._native_bind_text_step_row_view_sql_support = {}
         self._native_bind_int64_fetch_all_row_views_sql_support = {}
@@ -1009,12 +1061,16 @@ class Cursor:
         self._should_prefetch_small_result_sql_cache.clear()
         self._should_prefetch_zero_param_result_sql_cache.clear()
         self._native_fetch_rows_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_sql_support.clear()
+        self._decode_matrix_i64_f64_sql_support.clear()
         self._decode_matrix_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_f64_date_sql_support.clear()
         self._decode_matrix_i64_text_text_sql_support.clear()
         self._decode_matrix_i64_f64_text_sql_support.clear()
         self._decode_matrix_text_i64_f64_sql_support.clear()
         self._decode_matrix_i64_sql_support.clear()
         self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.clear()
+        self._decode_matrix_i64_text_text_text_text_i64_sql_support.clear()
         self._native_bind_int64_step_row_view_sql_support.clear()
         self._native_bind_text_step_row_view_sql_support.clear()
         self._native_bind_int64_fetch_all_row_views_sql_support.clear()
@@ -1613,6 +1669,7 @@ class Cursor:
             or "count(" in normalized
             or " limit " in f" {normalized} "
             or "order by o.id desc" in normalized
+            or _is_dml_returning_sql(normalized)
         )
         self._should_prefetch_small_result_sql_cache[sql] = cached
         return cached
@@ -1622,7 +1679,11 @@ class Cursor:
         if cached is not None:
             return cached
         normalized = " ".join(sql.lower().split())
-        cached = "count(" in normalized or " limit " in f" {normalized} "
+        cached = (
+            "count(" in normalized
+            or " limit " in f" {normalized} "
+            or _is_dml_returning_sql(normalized)
+        )
         self._should_prefetch_zero_param_result_sql_cache[sql] = cached
         return cached
 
@@ -1774,6 +1835,21 @@ class Cursor:
             else:
                 return False
         return True
+
+    @staticmethod
+    def _infer_typed_signature(params):
+        signature = []
+        for value in params:
+            value_type = type(value)
+            if value_type is int:
+                signature.append("i")
+            elif value_type is str:
+                signature.append("t")
+            elif value_type is float:
+                signature.append("f")
+            else:
+                return None
+        return "".join(signature)
 
     @staticmethod
     def _row_is_i64_text_f64(params):
@@ -2107,6 +2183,148 @@ class Cursor:
         self._bound_param_count = expected_count
         return total_affected
 
+    @staticmethod
+    def _merge_typed_signature_code(existing, next_code):
+        if existing is None:
+            return next_code
+        if existing == next_code:
+            return existing
+        if {existing, next_code} == {"i", "f"}:
+            return "f"
+        return None
+
+    @staticmethod
+    def _typed_signature_code_for_value(value):
+        value_type = type(value)
+        if value is None:
+            return None
+        if value_type is int:
+            return "i"
+        if value_type is str:
+            return "t"
+        if value_type is float:
+            return "f"
+        return False
+
+    def _executemany_mixed_typed_iter(self, sql, expected_count, first_params, iterator):
+        if self._stmt is None or self._native_execute_batch_typed_collected is None:
+            return None
+
+        step_out = ctypes.c_uint8()
+        step_stmt = self._lib.ddb_stmt_step
+        bind_param = self._bind_param
+        reset_stmt = self._lib.ddb_stmt_reset
+        native_batch = self._native_execute_batch_typed_collected
+
+        total_affected = 0
+        signature_codes = [None] * expected_count
+        pending_rows = []
+        fast_batch = []
+        signature = None
+
+        def checked_len(params):
+            params_type = type(params)
+            if params_type is tuple or params_type is list:
+                param_len = len(params)
+            else:
+                if isinstance(params, Mapping):
+                    raise ProgrammingError(
+                        "Mixed parameter styles are not supported in executemany"
+                    )
+                try:
+                    param_len = len(params)
+                except TypeError:
+                    raise ProgrammingError(
+                        "Incorrect number of parameters: "
+                        f"expected {expected_count}, got unknown"
+                    )
+            if param_len != expected_count:
+                raise ProgrammingError(
+                    f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                )
+
+        def execute_row_generic(params):
+            nonlocal total_affected
+            code = reset_stmt(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            for i, param in enumerate(params, start=1):
+                bind_param(i, param, sql, params)
+            code = step_stmt(self._stmt, ctypes.byref(step_out))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            affected = ctypes.c_uint64()
+            code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            total_affected += int(affected.value)
+
+        def flush_fast_batch():
+            nonlocal total_affected
+            if not fast_batch:
+                return
+            total_affected += int(
+                native_batch(
+                    self._stmt.value,
+                    fast_batch[0],
+                    iter(fast_batch[1:]),
+                    signature,
+                )
+            )
+            fast_batch.clear()
+
+        def row_matches(params):
+            return self._row_matches_signature(params, signature)
+
+        def process_with_signature(params):
+            if row_matches(params):
+                fast_batch.append(params)
+            else:
+                flush_fast_batch()
+                execute_row_generic(params)
+
+        def update_signature(params):
+            nonlocal signature
+            unsupported = False
+            for index, value in enumerate(params):
+                next_code = self._typed_signature_code_for_value(value)
+                if next_code is False:
+                    unsupported = True
+                    continue
+                if next_code is None:
+                    continue
+                merged = self._merge_typed_signature_code(
+                    signature_codes[index], next_code
+                )
+                if merged is None:
+                    unsupported = True
+                    continue
+                signature_codes[index] = merged
+            if not unsupported and all(code is not None for code in signature_codes):
+                signature = "".join(signature_codes)
+                return True
+            return False
+
+        for params in itertools.chain((first_params,), iterator):
+            checked_len(params)
+            if signature is None:
+                pending_rows.append(params)
+                if update_signature(params):
+                    for pending in pending_rows:
+                        process_with_signature(pending)
+                    pending_rows.clear()
+                continue
+            process_with_signature(params)
+
+        if signature is None:
+            for pending in pending_rows:
+                execute_row_generic(pending)
+        else:
+            flush_fast_batch()
+
+        self._bound_param_count = expected_count
+        return total_affected
+
     def execute(self, operation, parameters=None):
         if parameters is None and self._fast_repeat_cache:
             cached = self._fast_repeat_cache.get(id(operation))
@@ -2140,7 +2358,26 @@ class Cursor:
                     if stmt is not None:
                         try:
                             sv = stmt.value
-                            if frc == 1:
+                            if frc == 5:
+                                try:
+                                    parameter_count = len(parameters)
+                                except TypeError:
+                                    parameter_count = None
+                                if parameter_count != 0:
+                                    raise ValueError("zero-parameter repeat received parameters")
+                                rows = self._native_reset_step_fetch_all_row_views(sv)
+                                sel_info = self._select_fast_info.get(cached_sql)
+                                if sel_info is not None:
+                                    self._has_buffered_row = False
+                                    self._buffered_row = None
+                                    self._prefetched_rows = rows
+                                    self._query_active = True
+                                    self.description = sel_info[0]
+                                    self._col_count = sel_info[1]
+                                    self.rowcount = -1
+                                    return self
+                                affected = None
+                            elif frc == 1:
                                 affected, _ = (
                                     self._native_reset_bind_int64_step_affected(
                                         sv, parameters[0]
@@ -2548,6 +2785,18 @@ class Cursor:
             self.rowcount = fast_rowcount
             return self
 
+        fast_rowcount = self._executemany_mixed_typed_iter(
+            sql, expected_count, normalized_first, iterator
+        )
+        if fast_rowcount is not None:
+            self._col_count = 0
+            self.description = None
+            self._store_cached_non_query_metadata(sql)
+            self._query_active = False
+            self._has_buffered_row = False
+            self.rowcount = fast_rowcount
+            return self
+
         step_out = ctypes.c_uint8()
         step_stmt = self._lib.ddb_stmt_step
         byref = ctypes.byref
@@ -2809,6 +3058,33 @@ class Cursor:
                 else:
                     text0 = string_at(v0.data, v0.len).decode("utf-8")
                 return (text0, v1.int64_value, v2.float64_value)
+        if count == 2:
+            v0 = values_ptr[0]
+            v1 = values_ptr[1]
+            t0 = int(v0.tag)
+            t1 = int(v1.tag)
+            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_TEXT:
+                if self._decode_row_i64_text_native is not None:
+                    try:
+                        return self._decode_row_i64_text_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
+                if not v1.data or v1.len == 0:
+                    text_value = ""
+                else:
+                    text_value = string_at(v1.data, v1.len).decode("utf-8")
+                return (v0.int64_value, text_value)
+            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_FLOAT64:
+                if self._decode_row_i64_f64_native is not None:
+                    try:
+                        return self._decode_row_i64_f64_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
+                return (v0.int64_value, v1.float64_value)
 
         if count == 1:
             v0 = values_ptr[0]
@@ -2826,6 +3102,29 @@ class Cursor:
                 return (v0.float64_value,)
             if tag == DDB_VALUE_NULL:
                 return (None,)
+
+        if count == 6:
+            v0 = values_ptr[0]
+            v1 = values_ptr[1]
+            v2 = values_ptr[2]
+            v3 = values_ptr[3]
+            v4 = values_ptr[4]
+            v5 = values_ptr[5]
+            if (
+                int(v0.tag) == DDB_VALUE_INT64
+                and int(v1.tag) == DDB_VALUE_TEXT
+                and int(v2.tag) == DDB_VALUE_TEXT
+                and int(v3.tag) == DDB_VALUE_TEXT
+                and int(v4.tag) == DDB_VALUE_TEXT
+                and int(v5.tag) == DDB_VALUE_INT64
+                and self._decode_row_i64_text_text_text_text_i64_native is not None
+            ):
+                try:
+                    return self._decode_row_i64_text_text_text_text_i64_native(
+                        ctypes.addressof(values_ptr.contents)
+                    )
+                except Exception:
+                    pass
 
         row = []
         append_row = row.append
@@ -2876,6 +3175,85 @@ class Cursor:
         rows = []
         append_rows = rows.append
         string_at = ctypes.string_at
+
+        if col_count == 2:
+            sql = self._last_sql
+            first_t0 = int(values_ptr[0].tag)
+            first_t1 = int(values_ptr[1].tag)
+            if first_t0 == DDB_VALUE_INT64 and first_t1 == DDB_VALUE_TEXT:
+                native_supported = self._decode_matrix_i64_text_sql_support.get(sql, True)
+                if self._decode_matrix_i64_text_native is not None and native_supported:
+                    try:
+                        return self._decode_matrix_i64_text_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_text_sql_support[sql] = False
+            if first_t0 == DDB_VALUE_INT64 and first_t1 == DDB_VALUE_FLOAT64:
+                native_supported = self._decode_matrix_i64_f64_sql_support.get(sql, True)
+                if self._decode_matrix_i64_f64_native is not None and native_supported:
+                    try:
+                        return self._decode_matrix_i64_f64_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_f64_sql_support[sql] = False
+            for row_index in range(row_count):
+                base = row_index * 2
+                v0 = values_ptr[base]
+                v1 = values_ptr[base + 1]
+                if int(v0.tag) == DDB_VALUE_INT64 and int(v1.tag) == DDB_VALUE_TEXT:
+                    if not v1.data or v1.len == 0:
+                        text_value = ""
+                    else:
+                        text_value = string_at(v1.data, v1.len).decode("utf-8")
+                    append_rows((v0.int64_value, text_value))
+                    continue
+                if int(v0.tag) == DDB_VALUE_INT64 and int(v1.tag) == DDB_VALUE_FLOAT64:
+                    append_rows((v0.int64_value, v1.float64_value))
+                    continue
+
+                row = []
+                append_row = row.append
+                for col_index in range(2):
+                    value = values_ptr[base + col_index]
+                    tag = int(value.tag)
+                    if tag == DDB_VALUE_NULL:
+                        append_row(None)
+                    elif tag == DDB_VALUE_INT64:
+                        append_row(value.int64_value)
+                    elif tag == DDB_VALUE_FLOAT64:
+                        append_row(value.float64_value)
+                    elif tag == DDB_VALUE_BOOL:
+                        append_row(value.bool_value != 0)
+                    elif tag == DDB_VALUE_TEXT:
+                        if not value.data or value.len == 0:
+                            append_row("")
+                        else:
+                            append_row(string_at(value.data, value.len).decode("utf-8"))
+                    elif tag in _BINARY_BYTES_TAGS:
+                        if not value.data or value.len == 0:
+                            append_row(b"")
+                        else:
+                            append_row(bytes(string_at(value.data, value.len)))
+                    elif tag == DDB_VALUE_DECIMAL:
+                        append_row(
+                            decimal.Decimal(int(value.decimal_scaled))
+                            / (decimal.Decimal(10) ** int(value.decimal_scale))
+                        )
+                    elif tag == DDB_VALUE_UUID:
+                        append_row(bytes(value.uuid_bytes))
+                    elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                        append_row(
+                            _UNIX_EPOCH_UTC
+                            + datetime.timedelta(
+                                microseconds=int(value.timestamp_micros)
+                            )
+                        )
+                    else:
+                        append_row(_decode_ffi_value(self._lib, value))
+                append_rows(tuple(row))
+            return rows
 
         if col_count == 3:
             sql = self._last_sql
@@ -3194,6 +3572,28 @@ class Cursor:
                 append_rows(tuple(row))
             return rows
 
+        if col_count == 4:
+            sql = self._last_sql
+            if (
+                int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_FLOAT64
+                and int(values_ptr[3].tag) == DDB_VALUE_DATE
+            ):
+                native_supported = (
+                    self._decode_matrix_i64_text_f64_date_sql_support.get(sql, True)
+                )
+                if (
+                    self._decode_matrix_i64_text_f64_date_native is not None
+                    and native_supported
+                ):
+                    try:
+                        return self._decode_matrix_i64_text_f64_date_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_text_f64_date_sql_support[sql] = False
+
         if col_count == 1:
             sql = self._last_sql
             native_supported = self._decode_matrix_i64_sql_support.get(sql, True)
@@ -3254,6 +3654,30 @@ class Cursor:
         if col_count == 6:
             sql = self._last_sql
             native_supported = (
+                self._decode_matrix_i64_text_text_text_text_i64_sql_support.get(
+                    sql, True
+                )
+            )
+            if (
+                self._decode_matrix_i64_text_text_text_text_i64_native is not None
+                and native_supported
+                and int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[3].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[4].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[5].tag) == DDB_VALUE_INT64
+            ):
+                try:
+                    return self._decode_matrix_i64_text_text_text_text_i64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    self._decode_matrix_i64_text_text_text_text_i64_sql_support[sql] = (
+                        False
+                    )
+
+            native_supported = (
                 self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.get(sql, True)
             )
             if (
@@ -3274,6 +3698,27 @@ class Cursor:
                     self._decode_matrix_i64_f64_text_text_i64_f64_sql_support[sql] = (
                         False
                     )
+
+        if col_count == 5:
+            sql = self._last_sql
+            native_supported = self._decode_matrix_i64_text_f64_i64_i64_sql_support.get(
+                sql, True
+            )
+            if (
+                self._decode_matrix_i64_text_f64_i64_i64_native is not None
+                and native_supported
+                and int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_FLOAT64
+                and int(values_ptr[3].tag) == DDB_VALUE_INT64
+                and int(values_ptr[4].tag) == DDB_VALUE_INT64
+            ):
+                try:
+                    return self._decode_matrix_i64_text_f64_i64_i64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    self._decode_matrix_i64_text_f64_i64_i64_sql_support[sql] = False
 
         for row_index in range(row_count):
             base = row_index * col_count

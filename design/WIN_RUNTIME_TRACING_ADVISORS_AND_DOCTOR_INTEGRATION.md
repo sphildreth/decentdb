@@ -57,14 +57,14 @@ It depends on these shipped design inputs:
   for stable read-only operational `sys.*` metrics.
 - [`adr/0185-rich-structured-error-diagnostics-contract.md`](adr/0185-rich-structured-error-diagnostics-contract.md)
   for structured diagnostics, redaction, and Doctor handoff expectations.
-- [`WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`](WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md)
+- [`WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`](_archive/WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md)
   for implemented structured error payload behavior and the "diagnostics are
   cheap handoffs, not live tracing" boundary.
 - [`docs/api/sql-functions.md`](../docs/api/sql-functions.md) for the current
   operational inspection SQL surface.
 - [`docs/user-guide/doctor.md`](../docs/user-guide/doctor.md) for Doctor CLI
   behavior, categories, fix behavior, and JSON output shape.
-- [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md)
+- [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md)
   for write/process coordination context that lock-wait tracing must classify.
 - [`adr/0184-default-fast-planner-and-runtime-contract.md`](adr/0184-default-fast-planner-and-runtime-contract.md)
   for the default-fast expectation that runtime diagnostics must not undermine.

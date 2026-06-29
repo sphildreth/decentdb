@@ -1,6 +1,9 @@
 # Transactions
 
-DecentDB supports ACID transactions with full durability guarantees.
+DecentDB supports ACID transactions. The default open configuration is
+durability-first: successful commits are synced through the WAL before the
+command returns. Open-time WAL sync modes can intentionally relax that timing;
+those modes do not change transaction atomicity or isolation.
 
 ## Transaction Basics
 
@@ -20,7 +23,8 @@ DecentDB is a single-writer engine, so `BEGIN`, `BEGIN IMMEDIATE`, and `BEGIN EX
 COMMIT;
 ```
 
-All changes are persisted to disk.
+Under the default synchronous WAL mode, all changes are persisted to disk before
+`COMMIT` returns.
 
 ### Rolling Back
 
@@ -71,7 +75,8 @@ DecentDB uses **Snapshot Isolation**:
 
 ### Durability
 
-Committed transactions survive crashes:
+With the default WAL sync mode, committed transactions survive crashes after
+`COMMIT` returns:
 
 ```bash
 # Transaction is committed with fsync
@@ -100,13 +105,15 @@ commit. Direct explicit transactions remain the right API for long-lived
 
 By default, DecentDB commits are durable: a successful `COMMIT` is persisted via the WAL before the command returns.
 
-For bulk ingestion you can trade durability for throughput using `bulk-load --durability=<full|deferred|none>`:
+Applications can choose a different WAL sync mode at database open time. For
+example, async commit acknowledges a commit before the covering fsync and trades
+a bounded post-crash durability window for lower write latency. That is a
+deployment choice, not a SQL `PRAGMA` runtime downgrade.
 
-- `full`: fsync each batch (safest, slowest)
-- `deferred` (default): fsync every `--syncInterval` batches
-- `none`: no fsync (fastest; unsafe on crash/power loss)
-
-This setting applies to `bulk-load`; regular SQL writes use the default durable commit behavior.
+For bulk ingestion, prefer `bulk-load` or one explicit transaction instead of
+per-row autocommit. The bulk-load command accepts `--batchSize`,
+`--syncInterval`, `--disableIndexes`, and `--noCheckpoint`; WAL sync durability
+still follows the database handle's open-time `WalSyncMode`.
 
 ## Savepoints
 
@@ -235,8 +242,8 @@ decentdb info --db=my.ddb
 ## Limitations
 
 - No distributed transactions
-- Single writer only. Queue-backed write APIs are planned, but current
-  releases still require callers to use the existing direct write surfaces.
+- Single writer only. Use direct explicit transactions for long-lived
+  `BEGIN`/`COMMIT` workflows; queued writes are for self-contained SQL work.
 - Foreign keys enforced at statement time, not commit time
 - Savepoints are only supported within explicit `BEGIN`/`COMMIT` blocks
 - Multi-statement `exec` strings are bound against the starting schema (DDL in the same string doesn't affect later statements)

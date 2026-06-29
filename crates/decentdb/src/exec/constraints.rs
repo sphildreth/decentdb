@@ -738,7 +738,7 @@ fn materialize_constraint_row(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use super::*;
     use crate::catalog::{ColumnSchema, ForeignKeyAction, ForeignKeyConstraint, IndexColumn};
@@ -960,7 +960,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: super::super::RuntimeBtreeKeys::UniqueEncoded(entries),
+                keys: super::super::RuntimeBtreeKeys::UniqueEncoded(
+                    Arc::new(entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );

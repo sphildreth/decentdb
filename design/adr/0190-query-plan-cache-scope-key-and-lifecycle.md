@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-13
 **Status:** Accepted
-**Related spec:** [`../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
+**Related spec:** [`../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
 **Companion ADRs:** [0191](./0191-query-plan-cache-memory-accounting-and-eviction.md), [0192](./0192-query-plan-cache-security-generation-and-tde.md), [0193](./0193-query-plan-cache-c-abi-surface-and-binding-contract.md)
 
 ## Decision
@@ -235,7 +235,7 @@ changeset apply follows the same path as local DDL.
 
 ## References
 
-- `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`
+- `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`
 - `design/FUTURE_WINS.md`
 - `design/adr/0184-default-fast-planner-and-runtime-contract.md`
 - `design/adr/0162-engine-owned-write-queue-strict-group-commit.md`

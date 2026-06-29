@@ -1,7 +1,7 @@
 //! Cross-process WAL coordination sidecar.
 //!
 //! Implements the first native-file slice of
-//! `design/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`.
+//! `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

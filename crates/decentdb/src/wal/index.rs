@@ -243,6 +243,53 @@ impl WalIndex {
         scanned_pages
     }
 
+    pub(crate) fn demote_high_page_ids_resident_bytes(&mut self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let mut page_ids = self.pages.keys().copied().collect::<Vec<_>>();
+        page_ids.sort_unstable_by(|left, right| right.cmp(left));
+        let mut demoted = 0usize;
+        let mut freed = 0usize;
+        for page_id in page_ids {
+            let Some(versions) = self.pages.get_mut(&page_id) else {
+                continue;
+            };
+            for version in versions.iter_mut() {
+                let Some((wal_offset, frame_len, encoding, payload_len)) = (match &version.payload {
+                    WalVersionPayload::Resident {
+                        data,
+                        wal_offset,
+                        frame_len,
+                        encoding,
+                    } => Some((*wal_offset, *frame_len, *encoding, data.len())),
+                    WalVersionPayload::OnDisk { .. } => None,
+                }) else {
+                    continue;
+                };
+                version.payload = WalVersionPayload::OnDisk {
+                    wal_offset,
+                    frame_len,
+                    encoding,
+                };
+                demoted += 1;
+                freed = freed.saturating_add(payload_len);
+                if freed >= target_bytes {
+                    self.dirty_since_demote.clear();
+                    self.dirty_since_demote.shrink_to_fit();
+                    self.dirty_since_demote_set.clear();
+                    self.dirty_since_demote_set.shrink_to_fit();
+                    return demoted;
+                }
+            }
+        }
+        self.dirty_since_demote.clear();
+        self.dirty_since_demote.shrink_to_fit();
+        self.dirty_since_demote_set.clear();
+        self.dirty_since_demote_set.shrink_to_fit();
+        demoted
+    }
+
     #[must_use]
     pub(crate) fn version_count(&self) -> usize {
         self.pages.values().map(SmallVec::len).sum()

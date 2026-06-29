@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::error::{DbError, Result};
 use crate::record::compression::{decompress, maybe_compress, CompressionMode};
-use crate::storage::checksum::crc32c_extend;
+use crate::storage::checksum::{crc32c_extend, crc32c_patch_bytes};
 use crate::storage::page::{PageId, PageStore};
 
 type ChainPages = Vec<(PageId, Arc<[u8]>)>;
@@ -59,6 +59,14 @@ impl OverflowPointer {
 pub(crate) struct OverflowTailInfo {
     pub(crate) page_id: PageId,
     pub(crate) chunk_len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverflowBytePatch<'a> {
+    /// Byte offset in the uncompressed overflow payload.
+    pub(crate) offset: usize,
+    /// Replacement bytes for the given range.
+    pub(crate) bytes: &'a [u8],
 }
 
 pub(crate) fn write_overflow<S: PageStore>(
@@ -366,6 +374,229 @@ pub(crate) fn rewrite_overflow_cached_with_dirty_byte_ranges<S: PageStore>(
         },
         OverflowChainCache { page_ids },
         tail,
+    ))
+}
+
+/// Like [`rewrite_overflow_cached`] but applies sparse in-place byte patches
+/// directly into the existing overflow pages without materializing the full
+/// logical payload.
+///
+/// This is intended for resident-table delete-paths where each patch is a small
+/// replacement (for example, a 4-byte tombstone flag write). It updates the
+/// whole-payload checksum from the previous checksum and the changed bytes.
+pub(crate) fn rewrite_overflow_cached_with_sparse_byte_patches<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    previous_checksum: u32,
+    cached_page_ids: &[PageId],
+    patches: &[OverflowBytePatch<'_>],
+) -> Result<(OverflowPointer, OverflowChainCache, OverflowTailInfo, u32)> {
+    if previous.is_compressed() {
+        return Err(DbError::internal(
+            "sparse byte patches do not support compressed overflow payloads",
+        ));
+    }
+    if previous.head_page_id == 0 {
+        if previous.logical_len == 0 {
+            return Ok((
+                previous,
+                OverflowChainCache {
+                    page_ids: cached_page_ids.to_vec(),
+                },
+                OverflowTailInfo::default(),
+                previous_checksum,
+            ));
+        }
+        return Err(DbError::internal(
+            "cannot patch a non-empty overflow payload without page chain",
+        ));
+    }
+
+    let page_size = store.page_size() as usize;
+    if page_size <= OVERFLOW_HEADER_SIZE {
+        return Err(DbError::internal("page size too small for overflow pages"));
+    }
+    let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
+
+    let logical_len = previous.logical_len as usize;
+    for patch in patches {
+        if patch.bytes.is_empty() {
+            continue;
+        }
+        let end = patch.offset.checked_add(patch.bytes.len()).ok_or_else(|| {
+            DbError::constraint("overflow byte patch offset + length overflows usize")
+        })?;
+        if end > logical_len || patch.offset > logical_len {
+            return Err(DbError::constraint(
+                "overflow byte patch exceeds logical payload length",
+            ));
+        }
+    }
+
+    if logical_len == 0 {
+        return Err(DbError::internal(
+            "overflow logical length is zero for non-empty payload chain",
+        ));
+    }
+    let needed_pages = logical_len.div_ceil(chunk_capacity);
+    if needed_pages == 0 {
+        return Ok((
+            previous,
+            OverflowChainCache {
+                page_ids: cached_page_ids.to_vec(),
+            },
+            OverflowTailInfo::default(),
+            previous_checksum,
+        ));
+    }
+    if cached_page_ids.len() < needed_pages {
+        return Err(DbError::internal(
+            "overflow chain cache is shorter than payload",
+        ));
+    }
+    if cached_page_ids.first().copied() != Some(previous.head_page_id) {
+        return Err(DbError::internal(
+            "overflow chain cache head does not match pointer",
+        ));
+    }
+
+    let mut ranges = patches
+        .iter()
+        .filter_map(|patch| {
+            if patch.bytes.is_empty() {
+                None
+            } else {
+                Some((patch.offset, patch.offset + patch.bytes.len()))
+            }
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.0);
+    for window in ranges.windows(2) {
+        if window[0].1 > window[1].0 {
+            return Err(DbError::constraint("overflow byte patches overlap"));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct PagePatchSegment<'a> {
+        page_index: usize,
+        logical_offset: usize,
+        local_offset: usize,
+        bytes: &'a [u8],
+    }
+
+    let mut segments = Vec::new();
+    for patch in patches {
+        if patch.bytes.is_empty() {
+            continue;
+        }
+        let patch_end = patch.offset + patch.bytes.len();
+        let mut segment_start = patch.offset;
+        while segment_start < patch_end {
+            let page_index = segment_start / chunk_capacity;
+            let page_payload_offset = page_index.saturating_mul(chunk_capacity);
+            let page_payload_end = page_payload_offset.saturating_add(chunk_capacity);
+            let segment_end = patch_end.min(page_payload_end).min(logical_len);
+            if segment_start >= segment_end {
+                return Err(DbError::constraint(
+                    "overflow byte patch segment did not advance",
+                ));
+            }
+            let patch_start = segment_start.saturating_sub(patch.offset);
+            let segment_len = segment_end.saturating_sub(segment_start);
+            let bytes = patch
+                .bytes
+                .get(patch_start..patch_start.saturating_add(segment_len))
+                .ok_or_else(|| {
+                    DbError::internal("overflow byte patch slice did not fit in source bytes")
+                })?;
+            segments.push(PagePatchSegment {
+                page_index,
+                logical_offset: segment_start,
+                local_offset: segment_start.saturating_sub(page_payload_offset),
+                bytes,
+            });
+            segment_start = segment_end;
+        }
+    }
+    segments.sort_unstable_by_key(|segment| (segment.page_index, segment.local_offset));
+
+    let page_ids = cached_page_ids[..needed_pages].to_vec();
+    let mut checksum = previous_checksum;
+    let mut segment_index = 0usize;
+    while segment_index < segments.len() {
+        let page_index = segments[segment_index].page_index;
+        let page_id = *page_ids
+            .get(page_index)
+            .ok_or_else(|| DbError::internal("overflow patch page index is out of range"))?;
+        let page_payload_offset = page_index.saturating_mul(chunk_capacity);
+        let logical_page_len = page_index
+            .saturating_add(1)
+            .saturating_mul(chunk_capacity)
+            .min(logical_len);
+        let expected_len = logical_page_len.saturating_sub(page_payload_offset);
+        let existing = store.read_page(page_id)?;
+        if existing.len() != page_size {
+            return Err(DbError::corruption("overflow page size mismatch"));
+        }
+        let existing_chunk_len =
+            u32::from_le_bytes(existing[4..8].try_into().expect("header chunk len")) as usize;
+        if existing_chunk_len != expected_len {
+            return Err(DbError::corruption(
+                "overflow chain payload chunk length does not match logical length",
+            ));
+        }
+        if OVERFLOW_HEADER_SIZE.saturating_add(existing_chunk_len) > existing.len() {
+            return Err(DbError::corruption(
+                "overflow chunk length exceeds page payload",
+            ));
+        }
+
+        let mut page_buf = existing.as_ref().to_vec();
+        let mut changed = false;
+        while segment_index < segments.len() && segments[segment_index].page_index == page_index {
+            let segment = segments[segment_index];
+            let page_range_start = OVERFLOW_HEADER_SIZE.saturating_add(segment.local_offset);
+            let page_range_end = page_range_start.saturating_add(segment.bytes.len());
+            if page_range_end > OVERFLOW_HEADER_SIZE + existing_chunk_len {
+                return Err(DbError::constraint(
+                    "overflow byte patch exceeds page payload length",
+                ));
+            }
+            let old_bytes = page_buf[page_range_start..page_range_end].to_vec();
+            if old_bytes != segment.bytes {
+                checksum = crc32c_patch_bytes(
+                    checksum,
+                    logical_len,
+                    segment.logical_offset,
+                    &old_bytes,
+                    segment.bytes,
+                )
+                .ok_or_else(|| DbError::internal("overflow checksum patch failed"))?;
+                page_buf[page_range_start..page_range_end].copy_from_slice(segment.bytes);
+                changed = true;
+            }
+            segment_index += 1;
+        }
+        if changed {
+            store.write_page_owned(page_id, page_buf)?;
+        }
+    }
+
+    let last_page_id = page_ids[page_ids.len() - 1];
+    let last_chunk_len = logical_len.saturating_sub((needed_pages - 1) * chunk_capacity);
+    Ok((
+        OverflowPointer {
+            head_page_id: page_ids[0],
+            logical_len: previous.logical_len,
+            flags: previous.flags,
+        },
+        OverflowChainCache { page_ids },
+        OverflowTailInfo {
+            page_id: last_page_id,
+            chunk_len: last_chunk_len,
+        },
+        checksum,
     ))
 }
 
@@ -994,12 +1225,14 @@ fn write_chain_pages<S: PageStore>(
 #[cfg(test)]
 mod tests {
     use crate::record::compression::CompressionMode;
+    use crate::storage::checksum::crc32c_parts;
     use crate::storage::page::{InMemoryPageStore, PageStore};
 
     use super::{
         append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
         read_overflow, read_overflow_prefix, rewrite_overflow,
-        rewrite_overflow_cached_with_dirty_byte_range, write_overflow,
+        rewrite_overflow_cached_with_dirty_byte_range,
+        rewrite_overflow_cached_with_sparse_byte_patches, write_overflow, OverflowBytePatch,
     };
 
     #[test]
@@ -1121,6 +1354,100 @@ mod tests {
             read_overflow(&store, rewritten).expect("read rewritten"),
             grown
         );
+    }
+
+    #[test]
+    fn rewrite_overflow_cached_with_sparse_byte_patches_updates_selected_ranges() {
+        let mut store = InMemoryPageStore::new(32);
+        let payload: Vec<u8> = (0_u8..80_u8).collect();
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let cache = build_overflow_chain_cache(&store, pointer.head_page_id).expect("build cache");
+
+        let mut expected = payload.clone();
+        let patches = [
+            OverflowBytePatch {
+                offset: 2,
+                bytes: &[9, 8, 7, 6, 5],
+            },
+            OverflowBytePatch {
+                offset: 21,
+                bytes: b"resident-delete",
+            },
+        ];
+        expected[2..7].copy_from_slice(&[9, 8, 7, 6, 5]);
+        expected[21..36].copy_from_slice(b"resident-delete");
+
+        let (updated, new_cache, tail, checksum) =
+            rewrite_overflow_cached_with_sparse_byte_patches(
+                &mut store,
+                pointer,
+                crc32c_parts(&[payload.as_slice()]),
+                &cache.page_ids,
+                &patches,
+            )
+            .expect("patch");
+
+        assert_eq!(updated.head_page_id, pointer.head_page_id);
+        assert_eq!(updated.logical_len, pointer.logical_len);
+        let decoded = read_overflow(&store, updated).expect("read");
+        assert_eq!(decoded, expected);
+        assert_eq!(crc32c_parts(&[decoded.as_slice()]), checksum);
+        assert_eq!(new_cache.page_ids, cache.page_ids);
+        assert_eq!(
+            tail.page_id,
+            cache.page_ids.last().copied().expect("cache has pages")
+        );
+        assert_eq!(tail.chunk_len, 8);
+    }
+
+    #[test]
+    fn rewrite_overflow_cached_with_sparse_byte_patches_no_op_for_empty_patches() {
+        let mut store = InMemoryPageStore::new(32);
+        let payload = (0_u8..60_u8).collect::<Vec<_>>();
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let cache = build_overflow_chain_cache(&store, pointer.head_page_id).expect("build cache");
+
+        let (updated, new_cache, tail, checksum) =
+            rewrite_overflow_cached_with_sparse_byte_patches(
+                &mut store,
+                pointer,
+                crc32c_parts(&[payload.as_slice()]),
+                &cache.page_ids,
+                &[],
+            )
+            .expect("patch");
+
+        let decoded = read_overflow(&store, updated).expect("read");
+        assert_eq!(decoded, payload);
+        assert_eq!(crc32c_parts(&[payload.as_slice()]), checksum);
+        assert_eq!(updated.head_page_id, pointer.head_page_id);
+        assert_eq!(updated.logical_len, pointer.logical_len);
+        assert_eq!(new_cache.page_ids, cache.page_ids);
+        assert_eq!(
+            tail.page_id,
+            cache.page_ids.last().copied().expect("cache has pages")
+        );
+        assert_eq!(tail.chunk_len, 12);
+    }
+
+    #[test]
+    fn rewrite_overflow_cached_with_sparse_byte_patches_rejects_oob_offset() {
+        let mut store = InMemoryPageStore::new(32);
+        let payload = vec![0_u8; 40];
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let cache = build_overflow_chain_cache(&store, pointer.head_page_id).expect("build cache");
+        let patch = OverflowBytePatch {
+            offset: payload.len(),
+            bytes: &[1],
+        };
+        assert!(rewrite_overflow_cached_with_sparse_byte_patches(
+            &mut store,
+            pointer,
+            crc32c_parts(&[payload.as_slice()]),
+            &cache.page_ids,
+            &[patch]
+        )
+        .is_err());
     }
 
     // ── Compression mode tests ──────────────────────────────────────

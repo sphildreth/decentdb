@@ -2883,6 +2883,86 @@ fn parse_create_index_if_not_exists() {
 }
 
 #[test]
+fn create_index_if_not_exists_does_not_change_existing_metadata() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx ON t(id)").unwrap();
+
+    let index_count_before = db.list_indexes().unwrap().len();
+    let names_before = {
+        let indexes = db.list_indexes().unwrap();
+        indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(id)")
+        .unwrap();
+
+    let index_count_after = db.list_indexes().unwrap().len();
+    let names_after = {
+        let indexes = db.list_indexes().unwrap();
+        indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(index_count_before, index_count_after);
+    assert_eq!(names_before, names_after);
+}
+
+#[test]
+fn create_index_rebuilds_only_new_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_existing ON t(id)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    db.execute("CREATE INDEX idx_new ON t(val)").unwrap();
+
+    let indexes = db.list_indexes().unwrap();
+    assert!(
+        indexes.iter().any(|index| index.name == "idx_existing"),
+        "existing index should remain present"
+    );
+    assert!(
+        indexes.iter().any(|index| index.name == "idx_new"),
+        "new index should be present"
+    );
+}
+
+#[test]
+fn create_index_if_not_exists_does_not_change_existing_freshness() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx ON t(id)").unwrap();
+    db.execute("CREATE INDEX idx_new ON t(val)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    let indexes_before = db.list_indexes().unwrap();
+    let idx_existing_fresh_before = indexes_before
+        .iter()
+        .find(|index| index.name == "idx")
+        .expect("idx should exist")
+        .fresh;
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(id)")
+        .unwrap();
+
+    let indexes_after = db.list_indexes().unwrap();
+    let idx_existing_fresh_after = indexes_after
+        .iter()
+        .find(|index| index.name == "idx")
+        .expect("idx should still exist")
+        .fresh;
+    assert_eq!(idx_existing_fresh_before, idx_existing_fresh_after);
+    assert!(indexes_after.iter().any(|index| index.name == "idx_new"));
+}
+
+#[test]
 fn parse_create_table_with_all_types() {
     let db = mem_db();
     db.execute(
@@ -3735,5 +3815,84 @@ fn generated_virtual_columns_compute_returning_and_persist_mode() {
     assert!(
         ddl.contains("\"total\" FLOAT64 GENERATED ALWAYS AS ((price * qty)) VIRTUAL"),
         "unexpected DDL after reopen: {ddl}"
+    );
+}
+
+#[test]
+fn create_index_build_fast_path_produces_correct_single_column_and_partial_indexes() {
+    // Exercises the build_runtime_index fast path for single-column encoded
+    // indexes (FLOAT64, DATE, TEXT) and a partial TEXT index, verifying both
+    // index validity and correct range/equality query results.
+    let db = mem_db();
+    db.execute(
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT, rating FLOAT64, released DATE, status TEXT, collection TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO movies (id, title, rating, released, status, collection) VALUES \
+         (1, 'A', 7.5, DATE '2010-01-01', 'Released', ''), \
+         (2, 'B', 8.0, DATE '2012-06-15', 'Released', 'Series'), \
+         (3, 'C', 9.0, DATE '2009-12-31', 'Archived', 'Collection'), \
+         (4, 'D', 6.5, DATE '2015-03-01', 'Released', '')",
+    )
+    .unwrap();
+
+    db.execute("CREATE INDEX idx_rating ON movies(rating)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_released ON movies(released)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_status ON movies(status)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_collection ON movies(collection) WHERE collection <> ''")
+        .unwrap();
+
+    // All four indexes must verify as valid (entry counts match a rebuild).
+    for name in ["idx_rating", "idx_released", "idx_status", "idx_collection"] {
+        let verification = db.verify_index(name).unwrap();
+        assert!(
+            verification.valid,
+            "index {name} became invalid after build"
+        );
+    }
+
+    // Range query on the FLOAT64 index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE rating >= 7.5 AND rating <= 9.0 ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)]
+        ]
+    );
+
+    // Range query on the DATE index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE released >= CAST('2010-01-01' AS DATE) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(4)]
+        ]
+    );
+
+    // Equality query on the TEXT index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE status = 'Archived'")
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec![Value::Int64(3)]]);
+
+    // Partial index: only rows where collection <> '' are indexed.
+    let result = db
+        .execute("SELECT id FROM movies WHERE collection <> '' ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
     );
 }

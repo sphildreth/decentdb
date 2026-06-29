@@ -129,11 +129,64 @@ impl Row {
         Err(DbError::corruption("row field index exceeds field count"))
     }
 
+    pub(crate) fn decode_float64_at(bytes: &[u8], column_index: usize) -> Result<Option<f64>> {
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if column_index >= field_count {
+            return Err(DbError::corruption("row field index exceeds field count"));
+        }
+
+        for field_index in 0..field_count {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            if field_index != column_index {
+                continue;
+            }
+
+            return match tag {
+                TAG_NULL => {
+                    if !payload.is_empty() {
+                        return Err(DbError::corruption("NULL field must have empty payload"));
+                    }
+                    Ok(None)
+                }
+                TAG_FLOAT64 => {
+                    let bytes: [u8; 8] = payload
+                        .try_into()
+                        .map_err(|_| DbError::corruption("FLOAT64 payload length is invalid"))?;
+                    Ok(Some(f64::from_le_bytes(bytes)))
+                }
+                _ => Err(DbError::corruption(
+                    "row field is not encoded as a FLOAT64 value",
+                )),
+            };
+        }
+
+        Err(DbError::corruption("row field index exceeds field count"))
+    }
+
     pub(crate) fn decode_projection_with_overflow<S: PageStore>(
         bytes: &[u8],
         store: Option<&S>,
         projection_indexes: &[usize],
     ) -> Result<Vec<Value>> {
+        if projection_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
         let (field_count, mut offset) = decode_varint_u64(bytes)?;
         let field_count = usize::try_from(field_count)
             .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
@@ -145,6 +198,7 @@ impl Row {
         }
 
         let mut projected: Vec<Option<Value>> = vec![None; projection_indexes.len()];
+        let mut remaining = projection_indexes.len();
         for field_index in 0..field_count {
             let tag = *bytes
                 .get(offset)
@@ -172,11 +226,16 @@ impl Row {
                         .ok_or_else(|| DbError::internal("projected row value missing"))?
                         .clone();
                     projected[projection_offset] = Some(value);
+                    remaining = remaining.saturating_sub(1);
                 } else {
                     projected[projection_offset] =
                         Some(Self::decode_value_with_overflow(tag, payload, store)?);
+                    remaining = remaining.saturating_sub(1);
                     first_projection_offset = Some(projection_offset);
                 }
+            }
+            if remaining == 0 {
+                break;
             }
         }
 
@@ -186,6 +245,103 @@ impl Row {
                 value.ok_or_else(|| DbError::corruption("projected row field was not decoded"))
             })
             .collect()
+    }
+
+    pub(crate) fn decode_projection_sorted_unique_with_overflow<S: PageStore>(
+        bytes: &[u8],
+        store: Option<&S>,
+        projection_indexes: &[usize],
+    ) -> Result<Vec<Value>> {
+        if projection_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if projection_indexes
+            .windows(2)
+            .any(|window| window[0] >= window[1])
+        {
+            return Self::decode_projection_with_overflow(bytes, store, projection_indexes);
+        }
+
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if projection_indexes
+            .last()
+            .is_some_and(|column_index| *column_index >= field_count)
+        {
+            return Err(DbError::corruption("row field index exceeds field count"));
+        }
+
+        let mut projected = Vec::with_capacity(projection_indexes.len());
+        let mut projection_offset = 0usize;
+        let mut next_projection = projection_indexes[projection_offset];
+        for field_index in 0..field_count {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            if field_index != next_projection {
+                continue;
+            }
+
+            projected.push(Self::decode_value_with_overflow(tag, payload, store)?);
+            projection_offset += 1;
+            if projection_offset == projection_indexes.len() {
+                return Ok(projected);
+            }
+            next_projection = projection_indexes[projection_offset];
+        }
+
+        Err(DbError::corruption("projected row field was not decoded"))
+    }
+
+    pub(crate) fn encoded_prefix_matches(bytes: &[u8], prefix: &[Value]) -> Result<bool> {
+        if prefix.is_empty() {
+            return Ok(true);
+        }
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if prefix.len() > field_count {
+            return Ok(false);
+        }
+
+        for expected in prefix {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            let actual = Self::decode_value_with_overflow::<crate::storage::page::InMemoryPageStore>(
+                tag, payload, None,
+            )?;
+            if &actual != expected {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     pub(crate) fn encode_with_overflow<S: PageStore>(
@@ -863,6 +1019,54 @@ mod tests {
     }
 
     #[test]
+    fn decode_float64_at_reads_one_encoded_field() {
+        let row = Row::new(vec![
+            Value::Text("skip".to_string()),
+            Value::Float64(4.25),
+            Value::Null,
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        assert_eq!(
+            Row::decode_float64_at(&encoded, 1).expect("decode"),
+            Some(4.25)
+        );
+        assert_eq!(Row::decode_float64_at(&encoded, 2).expect("decode"), None);
+        assert!(Row::decode_float64_at(&encoded, 0).is_err());
+    }
+
+    #[test]
+    fn encoded_prefix_matches_leading_fields_without_full_projection() {
+        let uuid = [7_u8; 16];
+        let row = Row::new(vec![
+            Value::Uuid(uuid),
+            Value::Text("tail".to_string()),
+            Value::Int64(9),
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        assert!(Row::encoded_prefix_matches(&encoded, &[Value::Uuid(uuid)]).expect("prefix"));
+        assert!(Row::encoded_prefix_matches(
+            &encoded,
+            &[Value::Uuid(uuid), Value::Text("tail".to_string())]
+        )
+        .expect("prefix"));
+        assert!(
+            !Row::encoded_prefix_matches(&encoded, &[Value::Uuid([8_u8; 16])]).expect("prefix")
+        );
+        assert!(!Row::encoded_prefix_matches(
+            &encoded,
+            &[
+                Value::Uuid(uuid),
+                Value::Text("tail".to_string()),
+                Value::Int64(9),
+                Value::Null,
+            ]
+        )
+        .expect("prefix"));
+    }
+
+    #[test]
     fn decode_projection_materializes_requested_columns_in_order() {
         let row = Row::new(vec![
             Value::Int64(7),
@@ -886,6 +1090,44 @@ mod tests {
         assert!(
             Row::decode_projection_with_overflow::<InMemoryPageStore>(&encoded, None, &[3])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_sorted_unique_projection_uses_requested_columns_in_order() {
+        let row = Row::new(vec![
+            Value::Int64(7),
+            Value::Text("selected".to_string()),
+            Value::Bool(true),
+            Value::Int64(11),
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        let projected = Row::decode_projection_sorted_unique_with_overflow::<InMemoryPageStore>(
+            &encoded,
+            None,
+            &[1, 3],
+        )
+        .expect("decode projection");
+
+        assert_eq!(
+            projected,
+            vec![Value::Text("selected".to_string()), Value::Int64(11)]
+        );
+
+        let fallback = Row::decode_projection_sorted_unique_with_overflow::<InMemoryPageStore>(
+            &encoded,
+            None,
+            &[1, 0, 1],
+        )
+        .expect("decode fallback projection");
+        assert_eq!(
+            fallback,
+            vec![
+                Value::Text("selected".to_string()),
+                Value::Int64(7),
+                Value::Text("selected".to_string()),
+            ]
         );
     }
 

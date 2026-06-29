@@ -10,6 +10,7 @@ This file tests public API methods that have ZERO or minimal test coverage:
 - evict_shared_wal()
 - DB-API 2.0 constructors: DateFromTicks, TimeFromTicks, TimestampFromTicks, Binary
 """
+import decimal
 import datetime
 import gc
 import pytest
@@ -98,6 +99,182 @@ class TestCursorExecutemany:
         row = cur.fetchone()
         assert row == (42,)
         
+        conn.close()
+
+    def test_executemany_generic_typed_batch_for_wide_rows(self, tmp_path):
+        """Unlisted int/text/float row shapes use the generic typed batch path."""
+        db_path = str(tmp_path / "executemany_generic_typed.ddb")
+
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        native_batch = cur._native_execute_batch_typed_collected
+        if native_batch is None:
+            conn.close()
+            pytest.skip("fastdecode typed batch extension is not built")
+
+        seen_signatures = []
+
+        def wrapped_native_batch(stmt_addr, first_row, rows_iterable, signature):
+            seen_signatures.append(signature)
+            return native_batch(stmt_addr, first_row, rows_iterable, signature)
+
+        cur._native_execute_batch_typed_collected = wrapped_native_batch
+        cur.execute(
+            """
+            CREATE TABLE movies (
+                id INTEGER,
+                title TEXT,
+                overview TEXT,
+                released TEXT,
+                budget_cents INTEGER,
+                revenue_cents INTEGER,
+                runtime_minutes INTEGER,
+                status TEXT,
+                mpa_rating TEXT,
+                rating REAL,
+                vote_count INTEGER,
+                collection TEXT
+            )
+            """
+        )
+
+        rows = [
+            (
+                i,
+                f"title {i}",
+                "overview",
+                "2024-01-01",
+                1000 + i,
+                2000 + i,
+                90 + i,
+                "Released",
+                "PG",
+                7.5,
+                100 + i,
+                "Series",
+            )
+            for i in range(1, 4)
+        ]
+        cur.executemany(
+            """
+            INSERT INTO movies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+
+        assert seen_signatures == ["itttiiittfit"]
+        assert cur.rowcount == len(rows)
+        cur.execute("SELECT COUNT(*) FROM movies")
+        assert cur.fetchone() == (len(rows),)
+
+        conn.close()
+
+    def test_executemany_generic_typed_batch_allows_nullable_rows(self, tmp_path):
+        """Generic typed batching keeps batching non-null rows around NULL rows."""
+        db_path = str(tmp_path / "executemany_generic_typed_nullable.ddb")
+
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        native_batch = cur._native_execute_batch_typed_collected
+        if native_batch is None:
+            conn.close()
+            pytest.skip("fastdecode typed batch extension is not built")
+
+        batch_sizes = []
+
+        def wrapped_native_batch(stmt_addr, first_row, rows_iterable, signature):
+            rows = list(rows_iterable)
+            batch_sizes.append((signature, 1 + len(rows)))
+            return native_batch(stmt_addr, first_row, rows, signature)
+
+        cur._native_execute_batch_typed_collected = wrapped_native_batch
+        cur.execute("CREATE TABLE nullable_rows (id INT64, name TEXT, score FLOAT64, note TEXT)")
+
+        rows = [
+            (1, "one", 1.0, None),
+            (2, "two", 2.0, "ready"),
+            (3, "three", 3.0, "set"),
+            (4, "four", 4.0, None),
+            (5, "five", 5.0, "go"),
+        ]
+        cur.executemany("INSERT INTO nullable_rows VALUES (?, ?, ?, ?)", rows)
+        conn.commit()
+
+        assert batch_sizes == [("itft", 2), ("itft", 1)]
+        assert cur.rowcount == len(rows)
+        cur.execute("SELECT id, note FROM nullable_rows ORDER BY id")
+        assert cur.fetchall() == [
+            (1, None),
+            (2, "ready"),
+            (3, "set"),
+            (4, None),
+            (5, "go"),
+        ]
+
+        conn.close()
+
+    def test_executemany_generic_typed_batch_falls_back_for_all_null_rows(self, tmp_path):
+        """All-NULL columns should fall back to generic execution without data loss."""
+        db_path = str(tmp_path / "executemany_generic_typed_all_null.ddb")
+
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        native_batch = cur._native_execute_batch_typed_collected
+        batch_calls = []
+
+        if native_batch is not None:
+            def wrapped_native_batch(stmt_addr, first_row, rows_iterable, signature):
+                batch_calls.append(signature)
+                return native_batch(stmt_addr, first_row, rows_iterable, signature)
+
+            cur._native_execute_batch_typed_collected = wrapped_native_batch
+
+        cur.execute("CREATE TABLE all_null_rows (id INT64, name TEXT, note TEXT)")
+
+        rows = [
+            (1, "one", None),
+            (2, "two", None),
+            (3, "three", None),
+        ]
+        cur.executemany("INSERT INTO all_null_rows VALUES (?, ?, ?)", rows)
+        conn.commit()
+
+        assert cur.rowcount == len(rows)
+        assert batch_calls == []
+        cur.execute("SELECT id, name, note FROM all_null_rows ORDER BY id")
+        assert cur.fetchall() == rows
+
+        conn.close()
+
+    def test_executemany_generic_typed_batch_keeps_decimal_rows_working(self, tmp_path):
+        """Decimal values should not break surrounding executemany behavior."""
+        db_path = str(tmp_path / "executemany_generic_typed_decimal.ddb")
+
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        native_batch = cur._native_execute_batch_typed_collected
+
+        if native_batch is not None:
+            def wrapped_native_batch(stmt_addr, first_row, rows_iterable, signature):
+                return native_batch(stmt_addr, first_row, rows_iterable, signature)
+
+            cur._native_execute_batch_typed_collected = wrapped_native_batch
+
+        cur.execute("CREATE TABLE decimal_rows (id INT64, amount DECIMAL(10, 2), note TEXT)")
+
+        rows = [
+            (1, decimal.Decimal("1.25"), "one"),
+            (2, decimal.Decimal("2.50"), "two"),
+            (3, decimal.Decimal("3.75"), "three"),
+        ]
+        cur.executemany("INSERT INTO decimal_rows VALUES (?, ?, ?)", rows)
+        conn.commit()
+
+        assert cur.rowcount == len(rows)
+        cur.execute("SELECT id, amount, note FROM decimal_rows ORDER BY id")
+        assert cur.fetchall() == rows
+
         conn.close()
 
 

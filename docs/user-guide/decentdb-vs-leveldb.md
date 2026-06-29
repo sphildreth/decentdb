@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **LevelDB** for embedded storage workloads. These two systems operate at different abstraction levels, so the choice is less about features and more about what you want to build *on top* of your storage layer.
 
-> **Versions compared:** DecentDB 2.0.0 vs LevelDB 1.23 (as of 2024).
+> **Versions compared:** DecentDB 2.15.x vs LevelDB 1.23.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for DecentDB's full SQL surface, and [DecentDB vs SQLite](decentdb-vs-sqlite.md) for the comparison with SQLite.
 
@@ -21,14 +21,14 @@ LevelDB was created at Google and inspired many derivatives including RocksDB, H
 | **Data model** | Tables, rows, columns, types | Arbitrary key-value byte pairs |
 | **Query language** | SQL | None (get/put/delete API) |
 | **Indexing** | B-tree secondary indexes, trigram, expression, covering | Single sorted key-space; secondary indexes must be built manually |
-| **Durability** | WAL + fsync-on-commit, always | WAL + configurable sync |
+| **Durability** | WAL + full sync on commit by default; relaxed open-time modes are explicit | WAL + configurable sync |
 | **Architecture** | B-tree | LSM-tree (Log-Structured Merge-tree) |
 | **Write path** | In-place page updates | Append-only memtable, background compaction |
-| **Concurrency** | One writer, many concurrent reader threads | Single-threaded (thread-safe but serialized) |
+| **Concurrency** | One writer, many readers; local native cross-process WAL coordination when supported | Single-threaded (thread-safe but serialized) |
 | **Transactions** | Full ACID (SQL-level) | Atomic batches (WriteBatch) |
 | **Snapshots** | Transaction-level consistency | Point-in-time snapshots |
-| **Compression** | None (planned) | Snappy (default), Zstd |
-| **Compaction** | None (B-tree manages space in-place) | Background compaction is central to the design |
+| **Compression** | Transparent zlib compression for eligible overflow payloads | Snappy (default), Zstd |
+| **Compaction** | No LSM compaction; checkpointing and index rebuilds are separate maintenance work | Background compaction is central to the design |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | C++, C, Java, Go, Python, Node.js, and many others |
 | **License** | MIT or Apache-2.0 | BSD-3-Clause |
 | **Binary size** | ~2-3 MB | ~200-400 KB |
@@ -116,7 +116,7 @@ db->Delete(leveldb::WriteOptions(), "key1");
 
 LevelDB is ~20K lines of C++. It does one thing (key-value storage) and does it well. If you want minimal complexity and a small attack surface, LevelDB is attractive.
 
-### 3. You need built-in compression
+### 3. You need configurable storage compression
 
 LevelDB supports Snappy compression by default, with Zstd also available:
 
@@ -128,7 +128,9 @@ options.compression = leveldb::kZstdCompression;
 options.zstd_compression_level = 3;
 ```
 
-DecentDB does not currently have built-in compression.
+DecentDB has transparent zlib compression for eligible overflow/table payloads,
+but it does not expose LevelDB-style compression choices or per-workload
+compression tuning.
 
 ### 4. You need point-in-time snapshots
 
@@ -213,7 +215,8 @@ With LevelDB, you would maintain separate databases for each index and keep them
 
 ### 4. You need concurrent readers
 
-DecentDB supports multiple concurrent reader threads. LevelDB's reads are serialized (though thread-safe).
+DecentDB supports multiple concurrent readers under snapshot isolation.
+LevelDB's reads are serialized (though thread-safe).
 
 ### 5. You want predictable read latency
 
@@ -221,7 +224,9 @@ B-tree reads have predictable latency. LSM-tree reads may need to check multiple
 
 ### 6. You want to avoid compaction tuning
 
-LevelDB requires tuning compaction settings for optimal performance. DecentDB's B-tree has no background compaction to tune.
+LevelDB requires tuning compaction settings for optimal performance. DecentDB's
+B-tree has no LSM-style background compaction to tune, though WAL checkpointing
+and index rebuilds still need normal maintenance planning.
 
 ## Performance Characteristics
 
@@ -233,7 +238,7 @@ LevelDB requires tuning compaction settings for optimal performance. DecentDB's 
 | Write amplification | Moderate (page-level) | Higher (compaction) |
 | Read latency variance | Low (predictable) | Variable (compaction) |
 | Space amplification | Low (in-place) | Higher (multiple SST levels) |
-| Compression | Not yet supported | Snappy/Zstd built-in |
+| Compression | Transparent zlib for eligible overflow payloads | Snappy/Zstd built-in |
 
 ## Decision Matrix
 
@@ -244,7 +249,7 @@ LevelDB requires tuning compaction settings for optimal performance. DecentDB's 
 | Typed data with constraints | DecentDB |
 | Secondary indexes | DecentDB (automatic) |
 | Minimal binary size | LevelDB |
-| Built-in compression | LevelDB |
+| Configurable compression policy | LevelDB |
 | Concurrent readers | DecentDB |
 | Predictable read latency | DecentDB |
 | Write-heavy key-value workload | LevelDB |

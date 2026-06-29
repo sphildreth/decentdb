@@ -2,7 +2,7 @@
 
 This document provides a comprehensive matrix of SQL features, comparing support across DecentDB, SQLite, PostgreSQL, and DuckDB.
 
-> **See also:** [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md) for a narrative discussion of design differences, trade-offs, and architecture.
+> **See also:** [Comparison Overview](comparison.md) for a narrative discussion of design differences, trade-offs, and architecture.
 
 ## Local-first sync and replication
 

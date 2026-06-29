@@ -164,7 +164,7 @@ behavior still needs device validation before production claims are made.
 
 ### References
 
-- `design/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
+- `design/_archive/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
 - `design/adr/0166-production-sync-relay-boundary-and-identity.md`
 - `design/adr/0167-public-changeset-api.md`
 - `design/adr/0168-sync-shape-streaming-subscriptions.md`

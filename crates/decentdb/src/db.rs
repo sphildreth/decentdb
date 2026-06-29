@@ -22,14 +22,15 @@ use crate::catalog::{
 use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{
-    row_id_alias_column_name, PreparedDeleteLookup, PreparedSimpleDelete, PreparedSimpleInsert,
-    PreparedSimpleUpdate, PreparedSimpleValueSource,
+    resolve_prepared_simple_value, row_id_alias_column_name, PreparedDeleteLookup,
+    PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
-    decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
+    read_persisted_table_row_count, read_table_payload_live_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleRowIdJoinProjectionRequest,
-    ResolvedSimpleRowIdProjectionRequest, ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex,
+    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleOrderedRowIdProjectionRequest,
+    ResolvedSimpleRowIdJoinProjectionRequest, ResolvedSimpleRowIdProjectionRequest,
+    ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex, RuntimeRowIdSet,
     SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
 };
 use crate::metadata::{
@@ -55,7 +56,9 @@ use crate::search::fulltext::analyzer::{
     AnalyzerConfig, AnalyzerDiacritics, AnalyzerLanguage, AnalyzerStemmer, AnalyzerStopwords,
     AnalyzerTokenization,
 };
-use crate::sql::ast::Statement as SqlStatement;
+use crate::sql::ast::{
+    BinaryOp, DeleteStatement, Expr, FromItem, QueryBody, SelectItem, Statement as SqlStatement,
+};
 use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
@@ -109,7 +112,9 @@ pub struct Db {
 
 const AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT: usize = 4;
 const PREPARED_READ_ROW_SOURCE_MIN_ROWS: usize = 4_096;
+const PREPARED_READ_ROW_SOURCE_MIN_ROW_LIMIT: usize = 131_072;
 const PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB: usize = 8_192;
+const RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct ReadOnlyPagedRowSourceResidency {
@@ -216,7 +221,9 @@ pub struct PreparedStatement {
     statement: Arc<SqlStatement>,
     prepared_sql: String,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_indexed_projection: Option<PreparedSimpleIndexedProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
     simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
@@ -229,7 +236,9 @@ pub struct PreparedStatement {
 struct PreparedPlanBundle {
     statement: Arc<SqlStatement>,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_indexed_projection: Option<PreparedSimpleIndexedProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
     simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
@@ -442,6 +451,25 @@ struct PreparedSimpleRowIdProjection {
     param_index: usize,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedSimpleIndexedProjection {
+    table_name: String,
+    projection_indexes: Vec<usize>,
+    column_names: Arc<[String]>,
+    lookup: PreparedSimpleIndexedProjectionLookup,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedSimpleIndexedProjectionLookup {
+    RowId {
+        value_source: PreparedSimpleValueSource,
+    },
+    Index {
+        index_name: String,
+        value_source: PreparedSimpleValueSource,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreparedSimpleRangeBoundParam {
     inclusive: bool,
@@ -457,6 +485,17 @@ struct PreparedSimpleRowIdRangeProjection {
     lower_bound: Option<PreparedSimpleRangeBoundParam>,
     upper_bound: Option<PreparedSimpleRangeBoundParam>,
     limit_param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleOrderedRowIdProjection {
+    table_name: String,
+    order_column: String,
+    projection_indexes: Vec<usize>,
+    column_names: Arc<[String]>,
+    limit: Option<usize>,
+    offset: usize,
+    descending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -528,6 +567,7 @@ pub struct PreparedStatementBatch<'txn, 'db> {
     prepared: &'txn PreparedStatement,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     direct_positional: bool,
+    prepared_insert_candidate: Vec<Value>,
 }
 
 /// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
@@ -570,6 +610,7 @@ impl PreparedStatement {
     ///
     /// The transaction may mutate `params` during execution; callers should
     /// treat parameter values as consumed once execution completes.
+    #[inline(always)]
     pub fn execute_in_mut(
         &self,
         txn: &mut SqlTransaction<'_>,
@@ -614,6 +655,7 @@ impl<'db> SqlTransaction<'db> {
     ///
     /// This avoids cloning positional values for `PreparedStatement::Insert`
     /// fast paths that consume all parameters directly.
+    #[inline(always)]
     pub fn execute_prepared_mut(
         &mut self,
         prepared: &PreparedStatement,
@@ -696,16 +738,44 @@ impl PreparedStatementBatch<'_, '_> {
                 .prepared_insert
                 .as_ref()
                 .ok_or_else(|| DbError::internal("missing prepared insert batch plan"))?;
-            let affected = self
-                .state
-                .runtime
-                .execute_prepared_simple_insert_positional_params_in_place(
-                    prepared_insert.as_ref(),
-                    params,
-                    self.db.inner.config.page_size,
-                )?;
-            self.state.persistent_changed |=
-                Db::prepared_insert_changes_persistent_table(&self.state.runtime, prepared_insert);
+            if self.state.prepared_insert_last_next_row_id.is_none() {
+                self.state.prepared_insert_last_cache_key =
+                    Some(Db::prepared_statement_cache_key(self.prepared));
+                self.state.prepared_insert_last_plan = Some(Arc::clone(prepared_insert));
+                self.state.prepared_insert_last_next_row_id =
+                    Db::prepared_insert_current_next_row_id(
+                        &self.state.runtime,
+                        prepared_insert.as_ref(),
+                    )?;
+            }
+            let affected = if let Some(cached_next_row_id) =
+                self.state.prepared_insert_last_next_row_id.as_mut()
+            {
+                self.state
+                    .runtime
+                    .execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+                        prepared_insert.as_ref(),
+                        params,
+                        &mut self.prepared_insert_candidate,
+                        cached_next_row_id,
+                        self.db.inner.config.page_size,
+                    )?
+            } else {
+                self.state
+                    .runtime
+                    .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                        prepared_insert.as_ref(),
+                        params,
+                        &mut self.prepared_insert_candidate,
+                        self.db.inner.config.page_size,
+                    )?
+            };
+            if !self.state.persistent_changed {
+                self.state.persistent_changed |= Db::prepared_insert_changes_persistent_table(
+                    &self.state.runtime,
+                    prepared_insert,
+                );
+            }
             return Ok(affected);
         }
 
@@ -876,6 +946,10 @@ struct ExclusiveSqlTxnState<'a> {
     persistent_changed: bool,
     indexes_maybe_stale: bool,
     prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
+    prepared_insert_last_cache_key: Option<usize>,
+    prepared_insert_last_plan: Option<Arc<PreparedSimpleInsert>>,
+    prepared_insert_last_next_row_id: Option<i64>,
+    prepared_insert_candidate: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -1086,6 +1160,77 @@ impl PreparedInsertCache {
         self.entries.insert(key, Arc::clone(&plan));
         Ok(Some(plan))
     }
+}
+
+struct SimpleRowIdRangeDeleteSql {
+    table_name: String,
+    column_name: String,
+    low: i64,
+    high: i64,
+}
+
+fn parse_simple_row_id_range_delete_sql(sql: &str) -> Option<SimpleRowIdRangeDeleteSql> {
+    let tokens = sql.split_ascii_whitespace().collect::<Vec<_>>();
+    if tokens.len() != 9
+        || !tokens[0].eq_ignore_ascii_case("DELETE")
+        || !tokens[1].eq_ignore_ascii_case("FROM")
+        || !tokens[3].eq_ignore_ascii_case("WHERE")
+        || !tokens[5].eq_ignore_ascii_case("BETWEEN")
+        || !tokens[7].eq_ignore_ascii_case("AND")
+    {
+        return None;
+    }
+    let table_name = parse_simple_sql_identifier(tokens[2])?;
+    let column_name = parse_simple_sql_identifier(tokens[4])?;
+    let low = tokens[6].parse::<i64>().ok()?;
+    let high = tokens[8].parse::<i64>().ok()?;
+    Some(SimpleRowIdRangeDeleteSql {
+        table_name,
+        column_name,
+        low,
+        high,
+    })
+}
+
+fn parse_simple_sql_identifier(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let first = parts.next()?;
+    let second = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let identifier = second.unwrap_or(first);
+    if identifier.is_empty() {
+        return None;
+    }
+    let mut chars = identifier.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        return None;
+    }
+    Some(identifier.to_string())
+}
+
+fn simple_row_id_range_delete_statement(request: &SimpleRowIdRangeDeleteSql) -> SqlStatement {
+    SqlStatement::Delete(DeleteStatement {
+        table_name: request.table_name.clone(),
+        filter: Some(Expr::Between {
+            expr: Box::new(Expr::Column {
+                table: None,
+                column: request.column_name.clone(),
+            }),
+            low: Box::new(Expr::Literal(Value::Int64(request.low))),
+            high: Box::new(Expr::Literal(Value::Int64(request.high))),
+            negated: false,
+        }),
+        returning: Vec::new(),
+    })
 }
 
 impl Db {
@@ -1835,7 +1980,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Arc<[u8]>> {
@@ -1855,7 +2000,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     fn write_txn_header(&self, txn: &WriteTxn) -> Result<DatabaseHeader> {
@@ -1909,7 +2054,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     /// Performs a reader-aware checkpoint.
@@ -2671,6 +2816,21 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if params.is_empty() {
+                if let Some(result) =
+                    self.try_execute_simple_row_id_range_delete_sql_fast_path(trimmed)?
+                {
+                    self.record_statement_trace(
+                        trimmed,
+                        false,
+                        std::time::Duration::ZERO,
+                        0,
+                        Ok(&result),
+                    );
+                    results.push(result);
+                    continue;
+                }
+            }
             if !self.inner.sql_txn_active.load(Ordering::Acquire) && params.is_empty() {
                 if let Ok(prepared_sql) = prepared_statement_sql(trimmed) {
                     if let Some(prepared) = self.try_prepare_from_plan_cache(&prepared_sql)? {
@@ -2819,6 +2979,99 @@ impl Db {
 
         self.commit_exclusive_sql_txn(state)?;
         Ok(Some(results))
+    }
+
+    fn try_execute_simple_row_id_range_delete_sql_fast_path(
+        &self,
+        sql: &str,
+    ) -> Result<Option<QueryResult>> {
+        let Some(request) = parse_simple_row_id_range_delete_sql(sql) else {
+            return Ok(None);
+        };
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            return match &mut *txn {
+                SqlTxnSlot::Shared(state) => {
+                    self.try_execute_simple_row_id_range_delete_in_state(&request, state)
+                }
+                SqlTxnSlot::Exclusive => Err(self.exclusive_sql_txn_error()),
+                SqlTxnSlot::None => Ok(None),
+            };
+        }
+
+        let prepared = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )?
+        };
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        self.execute_autocommit_simple_delete_in_place(&prepared, &[])
+            .map(Some)
+    }
+
+    fn try_execute_simple_row_id_range_delete_in_state(
+        &self,
+        request: &SimpleRowIdRangeDeleteSql,
+        state: &mut SqlTxnState,
+    ) -> Result<Option<QueryResult>> {
+        if state.indexes_maybe_stale {
+            state
+                .runtime
+                .rebuild_stale_indexes(self.inner.config.page_size)?;
+            state.indexes_maybe_stale = false;
+        }
+        let Some(mut prepared) = state.runtime.prepare_simple_row_id_range_delete(
+            &request.table_name,
+            &request.column_name,
+            request.low,
+            request.high,
+        )?
+        else {
+            return Ok(None);
+        };
+        let table_names = prepared.required_row_source_table_names();
+        let child_index_targets = prepared.child_index_hydration_targets();
+        let snapshot_lsn = state.snapshot_lsn();
+        self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+            &mut state.runtime,
+            &table_names,
+            &child_index_targets,
+            snapshot_lsn,
+        )?;
+        if !state.runtime.can_reuse_prepared_simple_delete(&prepared) {
+            let Some(reprepared) = state.runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )?
+            else {
+                return Ok(None);
+            };
+            prepared = reprepared;
+        }
+        let temp_only = prepared.table.temporary;
+        let result = state.runtime.execute_prepared_simple_delete(
+            &prepared,
+            &[],
+            self.inner.config.page_size,
+        )?;
+        state.persistent_changed |= !temp_only;
+        Ok(Some(result))
     }
 
     fn dispatch_plan_cache_invalidation(&self, statement: &SqlStatement) {
@@ -4048,6 +4301,18 @@ impl Db {
                 return self.execute_autocommit_temp_only_statement(statement, params);
             }
         }
+        let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty();
+        if !extension_execution_enabled {
+            if let Some(runtime) =
+                self.try_resident_read_for_single_process_statement(statement, prepared)?
+            {
+                let result =
+                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+                drop(runtime);
+                return self.finalize_row_source_autocommit_statement(statement, result);
+            }
+        }
         if !self.inner.config.defer_table_materialization {
             self.refresh_engine_from_storage()?;
             self.ensure_all_tables_loaded()?;
@@ -4073,8 +4338,6 @@ impl Db {
         // unresolved. Row-level security also requires the deferred path when
         // security catalog tables are deferred or active; otherwise policies
         // and masks could be treated as absent by the generic executor.
-        let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
-            || !self.inner.config.extension_trust_anchors.is_empty();
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
@@ -4811,7 +5074,8 @@ impl Db {
         let active_readers = self.inner.wal.active_reader_count()?;
         let retained_snapshot = self.inner.wal.retained_snapshot_lsn().is_some();
         let before_versions = self.inner.wal.version_count()?;
-        self.checkpoint()?;
+        self.prepare_resident_payload_offset_caches_for_wal_checkpoint()?;
+        self.checkpoint_wal()?;
         let after_versions = self.inner.wal.version_count()?;
         let checkpointed = before_versions.saturating_sub(after_versions);
         Ok(QueryResult::with_rows(
@@ -4826,6 +5090,17 @@ impl Db {
                 Value::Int64(i64::try_from(checkpointed).unwrap_or(i64::MAX)),
             ])],
         ))
+    }
+
+    fn prepare_resident_payload_offset_caches_for_wal_checkpoint(&self) -> Result<()> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let store = PagerReadStore::new(self)?;
+        runtime.prepare_resident_payload_offset_caches(&store, self.config())?;
+        Ok(())
     }
 
     fn integrity_check_results(&self) -> Result<QueryResult> {
@@ -5115,13 +5390,16 @@ impl Db {
                                 prepared_insert.as_ref(),
                                 param_count,
                             ) {
+                                let mut candidate =
+                                    Vec::with_capacity(prepared_insert.columns.len());
                                 for row_index in 0..row_count {
                                     build_params(row_index, &mut params)?;
                                     let affected = state
                                         .runtime
-                                        .execute_prepared_simple_insert_positional_params_in_place(
+                                        .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
                                             prepared_insert.as_ref(),
                                             &mut params,
+                                            &mut candidate,
                                             self.inner.config.page_size,
                                         )?;
                                     total_affected = total_affected.saturating_add(affected);
@@ -5253,6 +5531,46 @@ impl Db {
         }
     }
 
+    fn try_execute_prepared_simple_ordered_row_id_projection(
+        &self,
+        prepared: &PreparedStatement,
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire)
+            || self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_ordered_row_id_projection.as_ref() else {
+            return Ok(None);
+        };
+        let Some(runtime) = self.try_resident_read_for_single_process_statement(
+            prepared.statement.as_ref(),
+            Some(prepared),
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = runtime.execute_resolved_simple_ordered_row_id_projection(
+            ResolvedSimpleOrderedRowIdProjectionRequest {
+                table_name: plan.table_name.as_str(),
+                order_column: plan.order_column.as_str(),
+                projection_indexes: &plan.projection_indexes,
+                column_names: Arc::clone(&plan.column_names),
+                limit: plan.limit,
+                offset: plan.offset,
+                descending: plan.descending,
+            },
+        )?;
+        drop(runtime);
+        if let Some(result) = result {
+            return self
+                .finalize_row_source_autocommit_statement(prepared.statement.as_ref(), Ok(result))
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     fn try_execute_prepared_simple_row_id_projection(
         &self,
         prepared: &PreparedStatement,
@@ -5267,6 +5585,32 @@ impl Db {
         let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
             return Ok(None);
         };
+
+        if !self.inner.config.extension_unsigned_development_mode
+            && self.inner.config.extension_trust_anchors.is_empty()
+        {
+            if let Some(runtime) = self.try_resident_read_for_prepared_table_statement(
+                prepared,
+                plan.table_name.as_str(),
+            )? {
+                let result = runtime.execute_resolved_simple_row_id_projection_at_snapshot(
+                    ResolvedSimpleRowIdProjectionRequest {
+                        table_name: plan.table_name.as_str(),
+                        projection_indexes: &plan.projection_indexes,
+                        column_names: Arc::clone(&plan.column_names),
+                        lookup_row_id: *lookup_row_id,
+                        pager: &self.inner.pager,
+                        wal: &self.inner.wal,
+                        snapshot_lsn: 0,
+                        use_persistent_pk_index: self.inner.config.persistent_pk_index,
+                    },
+                )?;
+                drop(runtime);
+                if let Some(result) = result {
+                    return Ok(Some(result));
+                }
+            }
+        }
 
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -5327,6 +5671,175 @@ impl Db {
         drop(runtime);
         drop(reader);
         Ok(result)
+    }
+
+    fn try_execute_prepared_simple_indexed_projection(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_indexed_projection.as_ref() else {
+            return Ok(None);
+        };
+
+        if !self.inner.config.extension_unsigned_development_mode
+            && self.inner.config.extension_trust_anchors.is_empty()
+        {
+            if let Some(runtime) = self.try_resident_read_for_single_process_statement(
+                prepared.statement.as_ref(),
+                Some(prepared),
+            )? {
+                let result = self.execute_prepared_simple_indexed_projection_in_runtime(
+                    &runtime, plan, params,
+                )?;
+                drop(runtime);
+                if let Some(result) = result {
+                    return self
+                        .finalize_row_source_autocommit_statement(
+                            prepared.statement.as_ref(),
+                            Ok(result),
+                        )
+                        .map(Some);
+                }
+            }
+        }
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(runtime) = self.runtime_read_for_prepared_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )? {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            let result =
+                self.execute_prepared_simple_indexed_projection_in_runtime(&runtime, plan, params)?;
+            if result.is_some() {
+                drop(runtime);
+                drop(reader);
+                return Ok(result);
+            }
+            drop(runtime);
+        }
+
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.try_load_prepared_read_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            drop(reader);
+            return Ok(None);
+        };
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let result =
+            self.execute_prepared_simple_indexed_projection_in_runtime(&runtime, plan, params)?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
+    fn execute_prepared_simple_indexed_projection_in_runtime(
+        &self,
+        runtime: &EngineRuntime,
+        plan: &PreparedSimpleIndexedProjection,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let lookup_value = match &plan.lookup {
+            PreparedSimpleIndexedProjectionLookup::RowId { value_source }
+            | PreparedSimpleIndexedProjectionLookup::Index { value_source, .. } => {
+                resolve_prepared_simple_value_for_fast_path(value_source, params)?
+            }
+        };
+        if matches!(lookup_value, Value::Null) {
+            return Ok(Some(QueryResult::with_rows(
+                plan.column_names.to_vec(),
+                Vec::new(),
+            )));
+        }
+
+        let Some(row_source) = runtime.table_row_source(plan.table_name.as_str()) else {
+            return Ok(None);
+        };
+
+        let mut rows = Vec::new();
+        match &plan.lookup {
+            PreparedSimpleIndexedProjectionLookup::RowId { .. } => {
+                let Value::Int64(row_id) = lookup_value else {
+                    return Ok(Some(QueryResult::with_rows(
+                        plan.column_names.to_vec(),
+                        Vec::new(),
+                    )));
+                };
+                if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                    rows.push(QueryRow::new(
+                        plan.projection_indexes
+                            .iter()
+                            .map(|index| stored_row.values()[*index].clone())
+                            .collect(),
+                    ));
+                }
+            }
+            PreparedSimpleIndexedProjectionLookup::Index { index_name, .. } => {
+                let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+                    return Ok(None);
+                };
+                match keys.row_ids_for_value_set(&lookup_value)? {
+                    RuntimeRowIdSet::Empty => {}
+                    RuntimeRowIdSet::Single(row_id) => {
+                        if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                            rows.push(QueryRow::new(
+                                plan.projection_indexes
+                                    .iter()
+                                    .map(|index| stored_row.values()[*index].clone())
+                                    .collect(),
+                            ));
+                        }
+                    }
+                    RuntimeRowIdSet::Many(row_ids) => {
+                        rows.reserve(row_ids.len());
+                        for row_id in row_ids {
+                            if let Some(stored_row) = row_source.row_by_id(*row_id)? {
+                                rows.push(QueryRow::new(
+                                    plan.projection_indexes
+                                        .iter()
+                                        .map(|index| stored_row.values()[*index].clone())
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                    RuntimeRowIdSet::Owned(row_ids) => {
+                        rows.reserve(row_ids.len());
+                        for row_id in row_ids {
+                            if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                                rows.push(QueryRow::new(
+                                    plan.projection_indexes
+                                        .iter()
+                                        .map(|index| stored_row.values()[*index].clone())
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.to_vec(),
+            rows,
+        )))
     }
 
     fn try_execute_prepared_simple_row_id_range_projection(
@@ -5601,8 +6114,20 @@ impl Db {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if params.is_empty() {
+            if let Some(result) =
+                self.try_execute_prepared_simple_ordered_row_id_projection(prepared)?
+            {
+                return Ok(result);
+            }
+        }
         if let Some(result) =
             self.try_execute_prepared_simple_row_id_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_prepared_simple_indexed_projection(prepared, params)?
         {
             return Ok(result);
         }
@@ -5621,13 +6146,8 @@ impl Db {
         {
             return Ok(result);
         }
-        {
-            let runtime = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_against_runtime(Some(prepared), &runtime)?;
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            self.validate_prepared_against_connection_state(prepared)?;
         }
         if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
             return Ok(result);
@@ -5685,6 +6205,7 @@ impl Db {
                 SqlTxnSlot::None => {}
             }
         }
+        self.validate_prepared_against_connection_state(prepared)?;
         let lw_start = if self.inner.tracing.config.lock_wait.enabled {
             Some(std::time::Instant::now())
         } else {
@@ -5729,11 +6250,6 @@ impl Db {
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(
-                prepared,
-                runtime.catalog.schema_cookie,
-                runtime.temp_schema_cookie,
-            )?;
             if matches!(
                 prepared.statement.as_ref(),
                 crate::sql::ast::Statement::Insert(insert)
@@ -5751,11 +6267,6 @@ impl Db {
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(
-                prepared,
-                runtime.catalog.schema_cookie,
-                runtime.temp_schema_cookie,
-            )?;
             self.statement_is_temp_only(&runtime, prepared.statement.as_ref())
         };
         if temp_only {
@@ -6203,11 +6714,13 @@ impl Db {
         prepared_delete: &PreparedSimpleDelete,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let mut table_names = vec![prepared_delete.table.name.as_str()];
-        for child in &prepared_delete.restrict_children {
-            table_names.push(child.child_table_name.as_str());
-        }
-        self.load_simple_write_row_sources_at_latest_snapshot(&table_names)?;
+        let table_names = prepared_delete.affected_table_names();
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+            &row_source_table_names,
+            &child_index_targets,
+        )?;
         let mut runtime = self
             .inner
             .engine
@@ -6546,11 +7059,13 @@ impl Db {
         )? {
             return Ok(Some(result));
         }
-        let mut table_names = vec![prepared_delete.table.name.as_str()];
-        for child in &prepared_delete.restrict_children {
-            table_names.push(child.child_table_name.as_str());
-        }
-        self.load_simple_write_row_sources_at_latest_snapshot(&table_names)?;
+        let table_names = prepared_delete.affected_table_names();
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+            &row_source_table_names,
+            &child_index_targets,
+        )?;
         let mut runtime = self
             .inner
             .engine
@@ -6694,6 +7209,13 @@ impl Db {
                 return Err(error);
             }
         };
+        if !self.runtime_has_persistent_commit_work(&runtime)?
+            && runtime.sync_mutations.is_empty()
+            && !Self::runtime_has_stale_indexes(&runtime)
+        {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            return Ok(result);
+        }
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
@@ -6734,6 +7256,15 @@ impl Db {
             return Ok(true);
         }
         Ok(self.inner.catalog.schema_cookie()? != runtime.catalog.schema_cookie)
+    }
+
+    fn runtime_has_stale_indexes(runtime: &EngineRuntime) -> bool {
+        runtime.catalog.indexes.iter().any(|(name, index)| {
+            let table_deferred = runtime
+                .deferred_table_names()
+                .any(|table_name| identifiers_equal(table_name, &index.table_name));
+            !table_deferred && (!index.fresh || !runtime.indexes.contains_key(name))
+        })
     }
 
     fn backfill_missing_persistent_pk_index_for_table(&self, table_name: &str) -> Result<()> {
@@ -6828,6 +7359,11 @@ impl Db {
             return Ok(());
         }
 
+        let base_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let base_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
         self.begin_write()?;
         let changed = match runtime.backfill_paged_row_storage(self) {
             Ok(changed) => changed,
@@ -6846,12 +7382,16 @@ impl Db {
             self.restore_runtime_from_storage(&mut runtime)?;
             return Err(error);
         }
-        let committed_lsn = match self.commit() {
+        let committed_lsn = match self.commit_if_latest(base_lsn, base_checkpoint_epoch) {
             Ok(lsn) => lsn,
             Err(error) => {
-                let _ = self.rollback();
                 self.restore_runtime_from_storage(&mut runtime)?;
-                return Err(error);
+                return if matches!(&error, DbError::Transaction { message } if message.starts_with("transaction conflict: WAL advanced"))
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
             }
         };
         self.inner
@@ -6877,8 +7417,11 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        if !runtime.has_checkpoint_compaction_candidates() {
-            return Ok(());
+        {
+            let store = PagerReadStore::new(self)?;
+            if !runtime.has_checkpoint_compaction_candidates(&store, self.config())? {
+                return Ok(());
+            }
         }
         self.begin_write()?;
         let changed = match runtime.compact_persisted_payloads_for_checkpoint(self) {
@@ -7159,7 +7702,9 @@ impl Db {
             statement: Arc::clone(&bundle.statement),
             prepared_sql: prepared_sql.to_string(),
             simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_indexed_projection: bundle.simple_indexed_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
             simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
             prepared_insert: bundle.prepared_insert,
@@ -7202,7 +7747,9 @@ impl Db {
                 statement: Arc::clone(&bundle.statement),
                 prepared_sql,
                 simple_row_id_projection: bundle.simple_row_id_projection,
+                simple_indexed_projection: bundle.simple_indexed_projection,
                 simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+                simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
                 simple_row_id_join_projection: bundle.simple_row_id_join_projection,
                 simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
                 prepared_insert: bundle.prepared_insert,
@@ -7210,6 +7757,53 @@ impl Db {
                 prepared_delete: bundle.prepared_delete,
                 read_only: bundle.read_only,
             });
+        }
+        if let Some(request) = parse_simple_row_id_range_delete_sql(&prepared_sql) {
+            if let Some(prepared_delete) = runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )? {
+                let statement = Arc::new(simple_row_id_range_delete_statement(&request));
+                let bundle = PreparedPlanBundle {
+                    statement: Arc::clone(&statement),
+                    simple_row_id_projection: None,
+                    simple_indexed_projection: None,
+                    simple_row_id_range_projection: None,
+                    simple_ordered_row_id_projection: None,
+                    simple_row_id_join_projection: None,
+                    simple_scalar_filtered_aggregate: None,
+                    prepared_insert: None,
+                    prepared_update: None,
+                    prepared_delete: Some(Arc::new(prepared_delete)),
+                    read_only: false,
+                };
+                if let Ok(mut cache) = self.inner.prepared_plan_cache.lock() {
+                    cache.insert(
+                        key,
+                        bundle.clone(),
+                        Self::prepared_plan_accounted_size(&bundle),
+                    );
+                }
+                return Ok(PreparedStatement {
+                    db: self.clone(),
+                    schema_cookie: runtime.catalog.schema_cookie,
+                    temp_schema_cookie: runtime.temp_schema_cookie,
+                    statement,
+                    prepared_sql: prepared_sql.clone(),
+                    simple_row_id_projection: None,
+                    simple_indexed_projection: None,
+                    simple_row_id_range_projection: None,
+                    simple_ordered_row_id_projection: None,
+                    simple_row_id_join_projection: None,
+                    simple_scalar_filtered_aggregate: None,
+                    prepared_insert: None,
+                    prepared_update: None,
+                    prepared_delete: bundle.prepared_delete,
+                    read_only: false,
+                });
+            }
         }
         let statement = self.parsed_statement(&prepared_sql)?;
         let read_only = statement_is_read_only(statement.as_ref());
@@ -7233,8 +7827,12 @@ impl Db {
         };
         let simple_row_id_projection =
             Self::prepared_simple_row_id_projection(&prepared_sql, runtime);
+        let simple_indexed_projection =
+            Self::prepared_simple_indexed_projection(statement.as_ref(), runtime);
         let simple_row_id_range_projection =
             Self::prepared_simple_row_id_range_projection(&prepared_sql, runtime);
+        let simple_ordered_row_id_projection =
+            Self::prepared_simple_ordered_row_id_projection(statement.as_ref(), runtime);
         let simple_row_id_join_projection =
             Self::prepared_simple_row_id_join_projection(statement.as_ref(), runtime);
         let simple_scalar_filtered_aggregate =
@@ -7242,7 +7840,9 @@ impl Db {
         let bundle = PreparedPlanBundle {
             statement: Arc::clone(&statement),
             simple_row_id_projection,
+            simple_indexed_projection,
             simple_row_id_range_projection,
+            simple_ordered_row_id_projection,
             simple_row_id_join_projection,
             simple_scalar_filtered_aggregate,
             prepared_insert,
@@ -7266,7 +7866,9 @@ impl Db {
             statement: Arc::clone(&statement),
             prepared_sql: prepared_sql.clone(),
             simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_indexed_projection: bundle.simple_indexed_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
             simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
             prepared_insert: bundle.prepared_insert,
@@ -7313,6 +7915,157 @@ impl Db {
             projection_indexes,
             column_names: Arc::from(column_names),
             param_index: plan.param_index,
+        })
+    }
+
+    fn prepared_simple_indexed_projection(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleIndexedProjection> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return None;
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.from.len() != 1
+        {
+            return None;
+        }
+        let filter = select.filter.as_ref()?;
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if runtime.temp_table_schema(name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(name)?;
+        if !prepared_table_generated_columns_are_stored(table) {
+            return None;
+        }
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let (filter_table, filter_column, value_expr) = match filter {
+            Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
+                (Expr::Column { table, column }, value_expr) => {
+                    (table.as_deref(), column.as_str(), value_expr)
+                }
+                (value_expr, Expr::Column { table, column }) => {
+                    (table.as_deref(), column.as_str(), value_expr)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if let Some(filter_table) = filter_table {
+            if !identifiers_equal(filter_table, name)
+                && !identifiers_equal(filter_table, binding_name)
+            {
+                return None;
+            }
+        }
+        let value_source = prepared_simple_value_source(value_expr)?;
+
+        let mut projection_indexes = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            match item {
+                SelectItem::Expr {
+                    expr,
+                    alias: select_alias,
+                } => {
+                    let Expr::Column {
+                        table: projection_table,
+                        column,
+                    } = expr
+                    else {
+                        return None;
+                    };
+                    if let Some(projection_table) = projection_table.as_deref() {
+                        if !identifiers_equal(projection_table, name)
+                            && !identifiers_equal(projection_table, binding_name)
+                        {
+                            return None;
+                        }
+                    }
+                    let index = table
+                        .columns
+                        .iter()
+                        .position(|candidate| identifiers_equal(&candidate.name, column))?;
+                    projection_indexes.push(index);
+                    column_names.push(select_alias.clone().unwrap_or_else(|| column.clone()));
+                }
+                SelectItem::Wildcard => {
+                    for (index, column) in table.columns.iter().enumerate() {
+                        projection_indexes.push(index);
+                        column_names.push(column.name.clone());
+                    }
+                }
+                SelectItem::QualifiedWildcard(qualified_name) => {
+                    if !identifiers_equal(qualified_name, name)
+                        && !identifiers_equal(qualified_name, binding_name)
+                    {
+                        return None;
+                    }
+                    for (index, column) in table.columns.iter().enumerate() {
+                        projection_indexes.push(index);
+                        column_names.push(column.name.clone());
+                    }
+                }
+            }
+        }
+
+        let lookup =
+            if row_id_alias_column_name(table)
+                .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
+            {
+                PreparedSimpleIndexedProjectionLookup::RowId { value_source }
+            } else {
+                let index_name =
+                    runtime
+                        .catalog
+                        .indexes
+                        .values()
+                        .find(|index| {
+                            index.fresh
+                                && index.kind == crate::catalog::IndexKind::Btree
+                                && identifiers_equal(&index.table_name, &table.name)
+                                && index.predicate_sql.is_none()
+                                && index.columns.len() == 1
+                                && index.columns[0].expression_sql.is_none()
+                                && index.columns[0].column_name.as_ref().is_some_and(
+                                    |column_name| identifiers_equal(column_name, filter_column),
+                                )
+                        })
+                        .map(|index| index.name.clone())?;
+                PreparedSimpleIndexedProjectionLookup::Index {
+                    index_name,
+                    value_source,
+                }
+            };
+
+        Some(PreparedSimpleIndexedProjection {
+            table_name: table.name.clone(),
+            projection_indexes,
+            column_names: Arc::from(column_names),
+            lookup,
         })
     }
 
@@ -7363,6 +8116,115 @@ impl Db {
             lower_bound: plan.lower_bound,
             upper_bound: plan.upper_bound,
             limit_param_index: plan.limit_param_index,
+        })
+    }
+
+    fn prepared_simple_ordered_row_id_projection(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleOrderedRowIdProjection> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty() || query.order_by.len() != 1 {
+            return None;
+        }
+        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+        {
+            return None;
+        }
+        let crate::sql::ast::FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if runtime.temp_table_schema(name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(name)?;
+        if !prepared_table_generated_columns_are_stored(table) {
+            return None;
+        }
+        let mut projection_indexes = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let crate::sql::ast::SelectItem::Expr {
+                expr,
+                alias: select_alias,
+            } = item
+            else {
+                return None;
+            };
+            let crate::sql::ast::Expr::Column {
+                table: projection_table,
+                column,
+            } = expr
+            else {
+                return None;
+            };
+            if !prepared_scalar_column_matches_table(projection_table.as_deref(), name, alias) {
+                return None;
+            }
+            let index = table
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, column))?;
+            projection_indexes.push(index);
+            column_names.push(select_alias.clone().unwrap_or_else(|| column.clone()));
+        }
+
+        let order = &query.order_by[0];
+        if order.collation.is_some() {
+            return None;
+        }
+        let crate::sql::ast::Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &order.expr
+        else {
+            return None;
+        };
+        if !prepared_scalar_column_matches_table(order_table.as_deref(), name, alias) {
+            return None;
+        }
+        let order_column_index = table
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, order_column))?;
+        if !row_id_alias_column_name(table)
+            .is_some_and(|column_name| identifiers_equal(column_name, order_column))
+            || table.columns[order_column_index].column_type != ColumnType::Int64
+        {
+            return None;
+        }
+        let limit = match query.limit.as_ref() {
+            Some(expr) => Some(prepared_usize_literal(expr)?),
+            None => None,
+        };
+        let offset = match query.offset.as_ref() {
+            Some(expr) => prepared_usize_literal(expr)?,
+            None => 0,
+        };
+        Some(PreparedSimpleOrderedRowIdProjection {
+            table_name: table.name.clone(),
+            order_column: table.columns[order_column_index].name.clone(),
+            projection_indexes,
+            column_names: Arc::from(column_names),
+            limit,
+            offset,
+            descending: order.descending,
         })
     }
 
@@ -7633,11 +8495,30 @@ impl Db {
                 )
                 .saturating_add(string_slice_bytes(&plan.column_names));
         }
+        if let Some(plan) = &bundle.simple_indexed_projection {
+            total = total
+                .saturating_add(192)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
         if let Some(plan) = &bundle.simple_row_id_range_projection {
             total = total
                 .saturating_add(160)
                 .saturating_add(string_bytes(&plan.table_name))
                 .saturating_add(string_bytes(&plan.filter_column))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
+        if let Some(plan) = &bundle.simple_ordered_row_id_projection {
+            total = total
+                .saturating_add(160)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(string_bytes(&plan.order_column))
                 .saturating_add(
                     (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
                 )
@@ -7693,10 +8574,15 @@ impl Db {
             persistent_changed: false,
             indexes_maybe_stale: false,
             prepared_insert_runtime_cache: HashMap::new(),
+            prepared_insert_last_cache_key: None,
+            prepared_insert_last_plan: None,
+            prepared_insert_last_next_row_id: None,
+            prepared_insert_candidate: Vec::new(),
         })
     }
 
     fn commit_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<u64> {
+        Self::flush_exclusive_prepared_insert_next_row_id(&mut state)?;
         if !state.persistent_changed {
             self.sync_temp_state_from_runtime(&state.runtime)?;
             return Ok(state.base_lsn);
@@ -7743,6 +8629,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(state);
+        self.maybe_demote_wal_after_large_explicit_commit();
         self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(committed_lsn)
     }
@@ -7762,6 +8649,7 @@ impl Db {
         if rebuild_stale_indexes {
             runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let compacted_bytes = runtime.compact_dirty_resident_storage_after_transaction_commit();
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
@@ -7796,6 +8684,7 @@ impl Db {
             guard.redefer_all_persisted_paged_tables();
             self.release_freed_heap_after_paged_row_source_drop();
         }
+        self.release_freed_heap_after_runtime_compaction(compacted_bytes);
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -7803,6 +8692,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
+        self.maybe_demote_wal_after_large_explicit_commit();
         self.publish_reactive_commit(reactive_pending, committed_lsn);
 
         Ok(committed_lsn)
@@ -7992,6 +8882,25 @@ impl Db {
                 .map_or(0, |data| data.rows.len()));
         }
 
+        if let Some(source) = runtime.table_row_source(table_name) {
+            return Ok(source.row_count());
+        }
+
+        let state = runtime.persisted_table_state(table_name);
+        if let Some(state) = state {
+            if state.pointer.is_table_paged_manifest()
+                && state.pointer.head_page_id != 0
+                && state.pointer.logical_len != 0
+            {
+                let store = if let Some(lsn) = snapshot_lsn {
+                    PagerReadStore::with_snapshot_lsn(self, lsn)
+                } else {
+                    PagerReadStore::new(self)?
+                };
+                return read_persisted_table_row_count(&store, state);
+            }
+        }
+
         if let Some(table) = runtime.catalog.table(table_name) {
             if let Some(stats) = runtime.catalog.table_stats.get(&table.name) {
                 let row_count = usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX);
@@ -8001,11 +8910,7 @@ impl Db {
             }
         }
 
-        if let Some(source) = runtime.table_row_source(table_name) {
-            return Ok(source.row_count());
-        }
-
-        let Some(state) = runtime.persisted_table_state(table_name) else {
+        let Some(state) = state else {
             return Ok(0);
         };
         if state.row_count != 0 || state.pointer.head_page_id == 0 {
@@ -8018,12 +8923,7 @@ impl Db {
             PagerReadStore::new(self)?
         };
         let payload = read_overflow(&store, state.pointer)?;
-        if state.pointer.is_table_paged_manifest() {
-            let manifest = decode_paged_table_manifest_payload(&payload)?;
-            Ok(manifest.chunks.iter().map(|chunk| chunk.row_count).sum())
-        } else {
-            read_table_payload_row_count_from_bytes(&payload)
-        }
+        read_table_payload_live_row_count_from_bytes(&payload)
     }
 
     fn runtime_for_prepare(&self) -> Result<EngineRuntime> {
@@ -8509,10 +9409,16 @@ impl Db {
     }
 
     fn prepared_read_row_source_row_limit(&self) -> usize {
-        self.inner
+        let row_limit = self
+            .inner
             .config
             .cache_size_mb
-            .saturating_mul(PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB)
+            .saturating_mul(PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB);
+        if row_limit == 0 {
+            0
+        } else {
+            row_limit.max(PREPARED_READ_ROW_SOURCE_MIN_ROW_LIMIT)
+        }
     }
 
     fn try_load_prepared_read_row_sources_at_snapshot(
@@ -8735,6 +9641,44 @@ impl Db {
         }
     }
 
+    fn try_resident_read_for_single_process_statement(
+        &self,
+        statement: &SqlStatement,
+        prepared: Option<&PreparedStatement>,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.inner.config.defer_table_materialization {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_against_runtime(prepared, &runtime)?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        let Some(base_tables) = self.safe_referenced_base_tables_in_runtime(&runtime, statement)
+        else {
+            return Ok(None);
+        };
+        if base_tables.is_empty() {
+            return Ok(Some(runtime));
+        }
+        let all_resident = base_tables.iter().all(|name| {
+            runtime
+                .canonical_catalog_table_name(name)
+                .is_some_and(|table_name| runtime.table_row_source(&table_name).is_some())
+        });
+        if all_resident {
+            Ok(Some(runtime))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn runtime_read_for_prepared_row_sources_at_snapshot(
         &self,
         names: &[&str],
@@ -8767,6 +9711,35 @@ impl Db {
         Ok(Some(runtime))
     }
 
+    fn try_resident_read_for_prepared_table_statement(
+        &self,
+        prepared: &PreparedStatement,
+        table_name: &str,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.inner.config.defer_table_materialization {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_against_runtime(Some(prepared), &runtime)?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        if runtime
+            .canonical_catalog_table_name(table_name)
+            .is_some_and(|canonical| runtime.table_row_source(&canonical).is_some())
+        {
+            Ok(Some(runtime))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn load_simple_write_row_sources_at_latest_snapshot(&self, names: &[&str]) -> Result<()> {
         if !self.inner.config.defer_table_materialization {
             self.refresh_engine_from_storage()?;
@@ -8781,6 +9754,42 @@ impl Db {
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.ensure_table_row_sources_loaded_at_snapshot(names, snapshot_lsn)?;
+        drop(reader);
+        Ok(())
+    }
+
+    fn load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+        &self,
+        names: &[&str],
+        child_index_targets: &[(&str, &str)],
+    ) -> Result<()> {
+        if !self.inner.config.defer_table_materialization {
+            self.refresh_engine_from_storage()?;
+            self.ensure_tables_loaded_at_snapshot(names, None)?;
+            return Ok(());
+        }
+
+        let indexes_loaded = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            child_index_targets
+                .iter()
+                .all(|(_, index_name)| runtime.index(index_name).is_some())
+        };
+        if self.simple_write_row_sources_loaded_for_current_runtime(names)? && indexes_loaded {
+            return Ok(());
+        }
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        for (table_name, index_name) in child_index_targets {
+            self.hydrate_deferred_runtime_index_at_snapshot(table_name, index_name, snapshot_lsn)?;
+        }
         self.ensure_table_row_sources_loaded_at_snapshot(names, snapshot_lsn)?;
         drop(reader);
         Ok(())
@@ -9048,6 +10057,34 @@ impl Db {
         }
     }
 
+    fn release_freed_heap_after_runtime_compaction(&self, freed_bytes: usize) {
+        if freed_bytes >= RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD {
+            crate::wal::platform::release_freed_heap();
+        }
+    }
+
+    fn maybe_demote_wal_after_large_explicit_commit(&self) {
+        let threshold = self.inner.config.wal_checkpoint_threshold_bytes;
+        if threshold == 0 {
+            return;
+        }
+        if self.inner.wal.latest_snapshot() < threshold {
+            return;
+        }
+        let target_bytes = threshold / 2;
+        if target_bytes == 0 {
+            return;
+        }
+        if matches!(
+            self.inner
+                .wal
+                .demote_resident_versions_if_reader_free(usize::try_from(target_bytes).unwrap_or(usize::MAX)),
+            Ok(demoted) if demoted > 0
+        ) {
+            crate::wal::platform::release_freed_heap();
+        }
+    }
+
     fn redefer_statement_tables(&self, statement: &SqlStatement) -> Result<()> {
         if !self.should_redefer_paged_row_sources_after_write() {
             return Ok(());
@@ -9142,6 +10179,22 @@ impl Db {
             &filter,
             snapshot_lsn,
         )
+    }
+
+    fn load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+        &self,
+        runtime: &mut EngineRuntime,
+        names: &[&str],
+        child_index_targets: &[(&str, &str)],
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        self.load_runtime_table_row_sources_at_snapshot(runtime, names, snapshot_lsn)?;
+        for (_, index_name) in child_index_targets {
+            if runtime.index(index_name).is_none() {
+                runtime.rebuild_index(index_name, self.inner.config.page_size)?;
+            }
+        }
+        Ok(())
     }
 
     fn load_all_runtime_row_sources_at_snapshot(
@@ -9569,15 +10622,23 @@ impl Db {
             }
             SqlStatement::Delete(delete) => {
                 if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
-                    let mut table_names = vec![prepared_delete.table.name.as_str()];
-                    for child in &prepared_delete.restrict_children {
-                        table_names.push(child.child_table_name.as_str());
-                    }
-                    self.load_runtime_table_row_sources_at_snapshot(
+                    let table_names = prepared_delete.required_row_source_table_names();
+                    let child_index_targets = prepared_delete.child_index_hydration_targets();
+                    self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
                         runtime,
                         &table_names,
+                        &child_index_targets,
                         snapshot_lsn,
                     )?;
+                    if runtime.can_reuse_prepared_simple_delete(&prepared_delete) {
+                        let result = runtime.execute_prepared_simple_delete(
+                            &prepared_delete,
+                            params,
+                            self.inner.config.page_size,
+                        )?;
+                        *persistent_changed |= !temp_only;
+                        return Ok(result);
+                    }
                     if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
                         let result = runtime.execute_prepared_simple_delete(
                             &prepared_delete,
@@ -9770,6 +10831,23 @@ impl Db {
         ))
     }
 
+    fn validate_prepared_against_connection_state(
+        &self,
+        prepared: &PreparedStatement,
+    ) -> Result<()> {
+        let temp_schema_cookie = self
+            .inner
+            .temp_state
+            .lock()
+            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
+            .schema_cookie;
+        self.validate_prepared_schema_cookie(
+            prepared,
+            self.inner.catalog.schema_cookie()?,
+            temp_schema_cookie,
+        )
+    }
+
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         let (snapshot_reader, current_lsn, current_epoch) = self.begin_sql_snapshot()?;
 
@@ -9834,6 +10912,32 @@ impl Db {
         )? {
             return Ok(result);
         }
+        if let Some(prepared_update) = prepared.prepared_update.as_deref() {
+            if let Some(result) = self.try_execute_prepared_update_in_runtime_state(
+                prepared,
+                prepared_update,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
+        if let Some(prepared_delete) = prepared.prepared_delete.as_deref() {
+            if let Some(result) = self.try_execute_prepared_delete_in_runtime_state(
+                prepared,
+                prepared_delete,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
             params,
@@ -9855,6 +10959,7 @@ impl Db {
                 "prepared statement belongs to a different database handle",
             ));
         }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         self.validate_prepared_schema_cookie(
             prepared,
             state.runtime.catalog.schema_cookie,
@@ -9901,6 +11006,14 @@ impl Db {
         params: &mut [Value],
         state: &mut ExclusiveSqlTxnState<'_>,
     ) -> Result<QueryResult> {
+        if !prepared.read_only {
+            if let Some(result) = self
+                .try_execute_last_prepared_insert_in_exclusive_state_mut(prepared, params, state)?
+            {
+                return Ok(result);
+            }
+        }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
             return Err(DbError::transaction(
                 "prepared statement belongs to a different database handle",
@@ -9933,8 +11046,38 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
             &mut state.prepared_insert_runtime_cache,
+            &mut state.prepared_insert_last_cache_key,
+            &mut state.prepared_insert_last_plan,
+            &mut state.prepared_insert_last_next_row_id,
+            &mut state.prepared_insert_candidate,
         )? {
             return Ok(result);
+        }
+        if let Some(prepared_update) = prepared.prepared_update.as_deref() {
+            if let Some(result) = self.try_execute_prepared_update_in_runtime_state(
+                prepared,
+                prepared_update,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
+        if let Some(prepared_delete) = prepared.prepared_delete.as_deref() {
+            if let Some(result) = self.try_execute_prepared_delete_in_runtime_state(
+                prepared,
+                prepared_delete,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
         }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
@@ -9944,6 +11087,84 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
         )
+    }
+
+    fn prepared_insert_current_next_row_id(
+        runtime: &EngineRuntime,
+        prepared_insert: &PreparedSimpleInsert,
+    ) -> Result<Option<i64>> {
+        let Some(table_name) = prepared_insert.catalog_table_name.as_deref() else {
+            return Ok(None);
+        };
+        runtime
+            .catalog
+            .tables
+            .get(table_name)
+            .map(|table| Some(table.next_row_id))
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared_insert.table_name)))
+    }
+
+    fn flush_exclusive_prepared_insert_next_row_id(
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<()> {
+        let Some(next_row_id) = state.prepared_insert_last_next_row_id.take() else {
+            return Ok(());
+        };
+        let Some(prepared_insert) = state.prepared_insert_last_plan.as_ref() else {
+            state.prepared_insert_last_cache_key = None;
+            return Ok(());
+        };
+        let Some(table_name) = prepared_insert.catalog_table_name.as_deref() else {
+            return Ok(());
+        };
+        let catalog = Arc::make_mut(&mut state.runtime.catalog);
+        let table = catalog
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared_insert.table_name)))?;
+        table.next_row_id = next_row_id;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn try_execute_last_prepared_insert_in_exclusive_state_mut(
+        &self,
+        prepared: &PreparedStatement,
+        params: &mut [Value],
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<Option<QueryResult>> {
+        if state.indexes_maybe_stale {
+            return Ok(None);
+        }
+        let Some(cache_key) = state.prepared_insert_last_cache_key else {
+            return Ok(None);
+        };
+        if cache_key != Self::prepared_statement_cache_key(prepared) {
+            return Ok(None);
+        }
+        let Some(insert_plan) = state.prepared_insert_last_plan.as_ref() else {
+            return Ok(None);
+        };
+        let Some(cached_next_row_id) = state.prepared_insert_last_next_row_id.as_mut() else {
+            return Ok(None);
+        };
+
+        let affected = state
+            .runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+                insert_plan.as_ref(),
+                params,
+                &mut state.prepared_insert_candidate,
+                cached_next_row_id,
+                self.inner.config.page_size,
+            )?;
+        if !state.persistent_changed {
+            state.persistent_changed |= Self::prepared_insert_changes_persistent_table(
+                &state.runtime,
+                insert_plan.as_ref(),
+            );
+        }
+        Ok(Some(QueryResult::with_affected_rows(affected)))
     }
 
     fn prepare_batch_in_exclusive_state<'txn, 'db>(
@@ -9957,6 +11178,7 @@ impl Db {
                 "prepared statement belongs to a different database handle",
             ));
         }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         self.validate_prepared_schema_cookie(
             prepared,
             state.runtime.catalog.schema_cookie,
@@ -9985,6 +11207,7 @@ impl Db {
             prepared,
             prepared_insert,
             direct_positional,
+            prepared_insert_candidate: Vec::new(),
         })
     }
 
@@ -10048,6 +11271,10 @@ impl Db {
         persistent_changed: &mut bool,
         indexes_maybe_stale: &mut bool,
         prepared_insert_runtime_cache: &mut HashMap<usize, Arc<PreparedSimpleInsert>>,
+        prepared_insert_last_cache_key: &mut Option<usize>,
+        prepared_insert_last_plan: &mut Option<Arc<PreparedSimpleInsert>>,
+        prepared_insert_last_next_row_id: &mut Option<i64>,
+        prepared_insert_candidate: &mut Vec<Value>,
     ) -> Result<Option<QueryResult>> {
         let Some(insert_plan) = self.prepared_insert_plan_for_runtime_state(
             prepared,
@@ -10065,14 +11292,96 @@ impl Db {
             return Ok(None);
         }
 
-        let result = runtime.execute_prepared_simple_insert_positional_params_in_place(
-            insert_plan.as_ref(),
+        let cache_key = Self::prepared_statement_cache_key(prepared);
+        *prepared_insert_last_cache_key = Some(cache_key);
+        *prepared_insert_last_plan = Some(Arc::clone(&insert_plan));
+        let result = runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                insert_plan.as_ref(),
+                params,
+                prepared_insert_candidate,
+                self.inner.config.page_size,
+            )?;
+        *prepared_insert_last_next_row_id =
+            Self::prepared_insert_current_next_row_id(runtime, insert_plan.as_ref())?;
+        if !*persistent_changed {
+            *persistent_changed |=
+                Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
+        }
+        Ok(Some(QueryResult::with_affected_rows(result)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_prepared_update_in_runtime_state(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_update: &PreparedSimpleUpdate,
+        params: &[Value],
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        persistent_changed: &mut bool,
+        indexes_maybe_stale: &mut bool,
+    ) -> Result<Option<QueryResult>> {
+        self.load_runtime_table_row_sources_at_snapshot(
+            runtime,
+            &[prepared_update.table_name.as_str()],
+            snapshot_lsn,
+        )?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_update(prepared_update) {
+            return Ok(None);
+        }
+        let temp_only = self.statement_is_temp_only(runtime, prepared_statement.statement.as_ref());
+        let result = runtime.execute_prepared_simple_update(
+            prepared_update,
             params,
             self.inner.config.page_size,
         )?;
-        *persistent_changed |=
-            Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
-        Ok(Some(QueryResult::with_affected_rows(result)))
+        *persistent_changed |= !temp_only;
+        *indexes_maybe_stale |= Self::runtime_has_stale_indexes(runtime);
+        Ok(Some(result))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_prepared_delete_in_runtime_state(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_delete: &PreparedSimpleDelete,
+        params: &[Value],
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        persistent_changed: &mut bool,
+        indexes_maybe_stale: &mut bool,
+    ) -> Result<Option<QueryResult>> {
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+            runtime,
+            &row_source_table_names,
+            &child_index_targets,
+            snapshot_lsn,
+        )?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_delete(prepared_delete) {
+            return Ok(None);
+        }
+        let temp_only = self.statement_is_temp_only(runtime, prepared_statement.statement.as_ref());
+        let result = runtime.execute_prepared_simple_delete(
+            prepared_delete,
+            params,
+            self.inner.config.page_size,
+        )?;
+        *persistent_changed |= !temp_only;
+        *indexes_maybe_stale |= Self::runtime_has_stale_indexes(runtime);
+        Ok(Some(result))
     }
 
     fn exclusive_sql_txn_error(&self) -> DbError {
@@ -15056,13 +16365,28 @@ fn resolve_prepared_simple_value_for_fast_path(
     source: &PreparedSimpleValueSource,
     params: &[Value],
 ) -> Result<Value> {
-    match source {
-        PreparedSimpleValueSource::Literal(value) => Ok(value.clone()),
-        PreparedSimpleValueSource::Parameter(number) => params
-            .get(number.saturating_sub(1))
-            .cloned()
-            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+    resolve_prepared_simple_value(source, params)
+}
+
+fn prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
+    match expr {
+        Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
+        Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            prepared_simple_value_source(expr).map(|source| PreparedSimpleValueSource::Cast {
+                source: Box::new(source),
+                target_type: *target_type,
+            })
+        }
+        _ => None,
     }
+}
+
+fn prepared_usize_literal(expr: &crate::sql::ast::Expr) -> Option<usize> {
+    let crate::sql::ast::Expr::Literal(Value::Int64(value)) = expr else {
+        return None;
+    };
+    usize::try_from((*value).max(0)).ok()
 }
 
 /// Evicts the shared WAL registry entry for an on-disk database path.

@@ -51,7 +51,7 @@ storage fundamentals.
   [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](_archive/WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md)
   as the complete compatibility-polish milestone.
 - Full-text search with BM25 ranking is tracked in
-  [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](WIN_FULL_TEXT_SEARCH_BM25_SPEC.md) as
+  [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](_archive/WIN_FULL_TEXT_SEARCH_BM25_SPEC.md) as
   its own roadmap item.
 - Native geospatial types and spatial indexes are shipped foundations covered by
   ADR 0124 through ADR 0128 and the user-guide data type/index docs.

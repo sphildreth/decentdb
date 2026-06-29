@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Implemented
 **Future Version:** vNext
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Dart/Flutter binding maintainers, C ABI maintainers, VFS and WAL
 maintainers, sync maintainers, security maintainers, release/package
@@ -11,24 +11,24 @@ maintainers, documentation authors, benchmark maintainers, coding agents
 
 **Governing ADRs and delivered inputs:**
 
-- [ADR 0162: Engine-Owned Write Queue Strict Group Commit](adr/0162-engine-owned-write-queue-strict-group-commit.md)
-- [ADR 0166: Production Sync Relay Boundary And Identity](adr/0166-production-sync-relay-boundary-and-identity.md)
-- [ADR 0167: Public Changeset API](adr/0167-public-changeset-api.md)
-- [ADR 0168: Sync Shape Streaming Subscriptions](adr/0168-sync-shape-streaming-subscriptions.md)
-- [ADR 0174: Local Data Security TDE, Policies, Masking, and Audit Context](adr/0174-local-data-security-tde-policies-masking-audit-context.md)
-- [ADR 0177: Cross-Process Coordination Sidecar And Locking](adr/0177-cross-process-coordination-sidecar-and-locking.md)
-- [ADR 0178: Cross-Process Reader Retention And WAL Refresh](adr/0178-cross-process-reader-retention-and-wal-refresh.md)
-- [ADR 0179: Cross-Process Public Contract, Bindings, And Diagnostics](adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
-- [ADR 0180: Database Identity For Coordination Sidecars](adr/0180-database-identity-for-coordination-sidecars.md)
-- [ADR 0181: Mobile Flutter Package And Native Artifact Contract](adr/0181-mobile-flutter-package-and-native-artifact-contract.md)
-- [ADR 0182: Mobile Runtime Lifecycle, Storage, Sync, And Support Tiers](adr/0182-mobile-runtime-lifecycle-storage-sync-and-support-tiers.md)
-- [ADR 0183: Mobile TDE Key Provider And Platform Keystore Boundary](adr/0183-mobile-tde-key-provider-and-platform-keystore-boundary.md)
-- [`docs/api/dart.md`](../docs/api/dart.md)
-- [`bindings/dart/README.md`](../bindings/dart/README.md)
-- [`docs/user-guide/security.md`](../docs/user-guide/security.md)
-- [`docs/user-guide/sync/relay.md`](../docs/user-guide/sync/relay.md)
-- [`docs/user-guide/write-concurrency.md`](../docs/user-guide/write-concurrency.md)
-- [`include/decentdb.h`](../include/decentdb.h)
+- [ADR 0162: Engine-Owned Write Queue Strict Group Commit](../adr/0162-engine-owned-write-queue-strict-group-commit.md)
+- [ADR 0166: Production Sync Relay Boundary And Identity](../adr/0166-production-sync-relay-boundary-and-identity.md)
+- [ADR 0167: Public Changeset API](../adr/0167-public-changeset-api.md)
+- [ADR 0168: Sync Shape Streaming Subscriptions](../adr/0168-sync-shape-streaming-subscriptions.md)
+- [ADR 0174: Local Data Security TDE, Policies, Masking, and Audit Context](../adr/0174-local-data-security-tde-policies-masking-audit-context.md)
+- [ADR 0177: Cross-Process Coordination Sidecar And Locking](../adr/0177-cross-process-coordination-sidecar-and-locking.md)
+- [ADR 0178: Cross-Process Reader Retention And WAL Refresh](../adr/0178-cross-process-reader-retention-and-wal-refresh.md)
+- [ADR 0179: Cross-Process Public Contract, Bindings, And Diagnostics](../adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
+- [ADR 0180: Database Identity For Coordination Sidecars](../adr/0180-database-identity-for-coordination-sidecars.md)
+- [ADR 0181: Mobile Flutter Package And Native Artifact Contract](../adr/0181-mobile-flutter-package-and-native-artifact-contract.md)
+- [ADR 0182: Mobile Runtime Lifecycle, Storage, Sync, And Support Tiers](../adr/0182-mobile-runtime-lifecycle-storage-sync-and-support-tiers.md)
+- [ADR 0183: Mobile TDE Key Provider And Platform Keystore Boundary](../adr/0183-mobile-tde-key-provider-and-platform-keystore-boundary.md)
+- [`docs/api/dart.md`](../../docs/api/dart.md)
+- [`bindings/dart/README.md`](../../bindings/dart/README.md)
+- [`docs/user-guide/security.md`](../../docs/user-guide/security.md)
+- [`docs/user-guide/sync/relay.md`](../../docs/user-guide/sync/relay.md)
+- [`docs/user-guide/write-concurrency.md`](../../docs/user-guide/write-concurrency.md)
+- [`include/decentdb.h`](../../include/decentdb.h)
 
 **ADR coverage and follow-up ADR triggers:**
 

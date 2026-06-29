@@ -107,9 +107,101 @@ pub(crate) fn crc32c_extend(initial_crc: u32, parts: &[&[u8]]) -> u32 {
     !crc
 }
 
+#[must_use]
+pub(crate) fn crc32c_patch_bytes(
+    existing_crc: u32,
+    total_len: usize,
+    offset: usize,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+) -> Option<u32> {
+    if old_bytes.len() != new_bytes.len() {
+        return None;
+    }
+    let end = offset.checked_add(old_bytes.len())?;
+    if end > total_len {
+        return None;
+    }
+
+    let mut delta = Vec::with_capacity(old_bytes.len());
+    let mut changed = false;
+    for (old, new) in old_bytes.iter().zip(new_bytes) {
+        let byte = old ^ new;
+        changed |= byte != 0;
+        delta.push(byte);
+    }
+    if !changed {
+        return Some(existing_crc);
+    }
+
+    let mut delta_crc = crc32c_update(0, &delta);
+    delta_crc = crc32c_shift_zeroes(delta_crc, total_len - end);
+    Some(existing_crc ^ delta_crc)
+}
+
+fn crc32c_shift_zeroes(mut crc: u32, mut zero_bytes: usize) -> u32 {
+    if zero_bytes == 0 {
+        return crc;
+    }
+
+    let mut odd = [0_u32; 32];
+    let mut even = [0_u32; 32];
+
+    odd[0] = CRC32C_POLYNOMIAL;
+    let mut row = 1_u32;
+    for slot in odd.iter_mut().skip(1) {
+        *slot = row;
+        row <<= 1;
+    }
+
+    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square(&mut odd, &even);
+
+    loop {
+        gf2_matrix_square(&mut even, &odd);
+        if zero_bytes & 1 != 0 {
+            crc = gf2_matrix_times(&even, crc);
+        }
+        zero_bytes >>= 1;
+        if zero_bytes == 0 {
+            break;
+        }
+
+        gf2_matrix_square(&mut odd, &even);
+        if zero_bytes & 1 != 0 {
+            crc = gf2_matrix_times(&odd, crc);
+        }
+        zero_bytes >>= 1;
+        if zero_bytes == 0 {
+            break;
+        }
+    }
+
+    crc
+}
+
+fn gf2_matrix_times(matrix: &[u32; 32], mut value: u32) -> u32 {
+    let mut sum = 0_u32;
+    let mut index = 0_usize;
+    while value != 0 {
+        if value & 1 != 0 {
+            sum ^= matrix[index];
+        }
+        value >>= 1;
+        index += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(square: &mut [u32; 32], matrix: &[u32; 32]) {
+    for index in 0..32 {
+        square[index] = gf2_matrix_times(matrix, matrix[index]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_extend, crc32c_parts};
+    use super::{crc32c, crc32c_extend, crc32c_parts, crc32c_patch_bytes};
 
     #[test]
     fn crc32c_matches_known_castagnoli_vector() {
@@ -165,6 +257,50 @@ mod tests {
         let full = crc32c_parts(&[a, b, c]);
         let ext = crc32c_extend(crc32c_parts(&[a]), &[b, c]);
         assert_eq!(full, ext);
+    }
+
+    #[test]
+    fn crc32c_patch_bytes_matches_full_rehash() {
+        let mut original = Vec::new();
+        for index in 0..16_384 {
+            original.push((index * 31 % 251) as u8);
+        }
+        let original_crc = crc32c_parts(&[original.as_slice()]);
+
+        for offset in [0_usize, 1, 7, 255, 4093, 8192, original.len() - 4] {
+            let mut updated = original.clone();
+            let old = updated[offset..offset + 4].to_vec();
+            let new = [0x80, 0x00, 0x00, 0x00];
+            updated[offset..offset + 4].copy_from_slice(&new);
+
+            let patched =
+                crc32c_patch_bytes(original_crc, original.len(), offset, &old, &new).unwrap();
+            assert_eq!(patched, crc32c_parts(&[updated.as_slice()]));
+        }
+    }
+
+    #[test]
+    fn crc32c_patch_bytes_composes_multiple_patches() {
+        let mut original = vec![0_u8; 65_537];
+        for (index, byte) in original.iter_mut().enumerate() {
+            *byte = (index * 17 % 239) as u8;
+        }
+        let mut patched_crc = crc32c_parts(&[original.as_slice()]);
+        let mut updated = original.clone();
+
+        for (offset, new) in [
+            (3_usize, [1, 2, 3, 4]),
+            (4095, [5, 6, 7, 8]),
+            (40_000, [9, 10, 11, 12]),
+            (65_533, [13, 14, 15, 16]),
+        ] {
+            let old = updated[offset..offset + 4].to_vec();
+            updated[offset..offset + 4].copy_from_slice(&new);
+            patched_crc =
+                crc32c_patch_bytes(patched_crc, updated.len(), offset, &old, &new).unwrap();
+        }
+
+        assert_eq!(patched_crc, crc32c_parts(&[updated.as_slice()]));
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! DML execution helpers.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::catalog::{
-    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TableSchema,
-    TriggerEvent,
+    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, IndexSchema,
+    TableSchema, TriggerEvent,
 };
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
@@ -22,15 +22,21 @@ use crate::sync::{self, SyncOperation};
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
-    generated_columns_are_stored, row_satisfies_index_predicate, spatial_index_value_for_row,
-    table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow,
-    TablePageManifest, TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    generated_columns_are_stored, infer_expr_name, plain_single_text_index_column_position,
+    row_satisfies_index_predicate, row_satisfies_index_predicate_with_expr,
+    spatial_index_value_for_row, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
+    RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef, TableRowSource,
+    PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedInsertValueSource {
     Literal(Value),
     Parameter(usize),
+    Cast {
+        source: Box<PreparedInsertValueSource>,
+        target_type: ColumnType,
+    },
     DefaultExpr(Expr),
     Null,
 }
@@ -40,6 +46,7 @@ pub(crate) struct PreparedBtreeIndex {
     pub(crate) name: String,
     pub(crate) column_indexes: Vec<usize>,
     pub(crate) int64_key: bool,
+    pub(crate) uuid_key: bool,
     pub(crate) has_covering_payload: bool,
     pub(crate) covering_payload_column_indexes: Vec<usize>,
     pub(crate) nullable: bool,
@@ -71,6 +78,10 @@ pub(crate) struct PreparedForeignKey {
 pub(crate) enum PreparedSimpleValueSource {
     Literal(Value),
     Parameter(usize),
+    Cast {
+        source: Box<PreparedSimpleValueSource>,
+        target_type: ColumnType,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -92,10 +103,32 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) compiled_index_state_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedInsertApplyMode {
+    preserve_stored_row: bool,
+    update_catalog_next_row_id: bool,
+}
+
+impl PreparedInsertApplyMode {
+    const fn update_catalog(preserve_stored_row: bool) -> Self {
+        Self {
+            preserve_stored_row,
+            update_catalog_next_row_id: true,
+        }
+    }
+
+    const fn caller_tracks_next_row_id() -> Self {
+        Self {
+            preserve_stored_row: false,
+            update_catalog_next_row_id: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleUpdate {
     pub(crate) table_name: String,
-    pub(crate) row_id_source: PreparedSimpleValueSource,
+    pub(crate) lookup: PreparedSimpleUpdateLookup,
     pub(crate) assignments: Vec<PreparedSimpleUpdateAssignment>,
     pub(crate) indexes: Vec<PreparedBtreeIndex>,
     pub(crate) compiled_index_state_epoch: u64,
@@ -110,9 +143,27 @@ pub(crate) struct PreparedSimpleUpdateAssignment {
     pub(crate) value_source: PreparedSimpleValueSource,
 }
 
+struct RowIdNoopUpsertCandidate {
+    row_id: i64,
+    candidate: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedSimpleUpdateLookup {
+    RowId(PreparedSimpleValueSource),
+    UniqueIndex {
+        index_name: String,
+        value_source: PreparedSimpleValueSource,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedDeleteLookup {
     RowId(PreparedSimpleValueSource),
+    RowIdRange {
+        low_source: PreparedSimpleValueSource,
+        high_source: PreparedSimpleValueSource,
+    },
     Index {
         index_name: String,
         value_source: PreparedSimpleValueSource,
@@ -124,6 +175,7 @@ pub(crate) struct PreparedSimpleDeleteRestrictChild {
     pub(crate) child_table_name: String,
     pub(crate) child_column_indexes: Vec<usize>,
     pub(crate) child_index_name: Option<String>,
+    pub(crate) child_index_prefix_len: Option<usize>,
     pub(crate) parent_column_indexes: Vec<usize>,
 }
 
@@ -134,7 +186,110 @@ pub(crate) struct PreparedSimpleDelete {
     pub(crate) indexes: Vec<crate::catalog::IndexSchema>,
     pub(crate) lookup: PreparedDeleteLookup,
     pub(crate) restrict_children: Vec<PreparedSimpleDeleteRestrictChild>,
+    delete_children_by_table: DeleteChildrenByTable,
+    table_indexes_by_table: TableIndexesByTable,
+    delete_children: Vec<PreparedDeleteCascadeChild>,
+    dependency_table_names: Vec<String>,
     pub(crate) compiled_index_state_epoch: u64,
+}
+
+impl PreparedSimpleDelete {
+    pub(crate) fn affected_table_names(&self) -> Vec<&str> {
+        let mut table_names = Vec::with_capacity(1 + self.dependency_table_names.len());
+        table_names.push(self.table.name.as_str());
+        for dependency in &self.dependency_table_names {
+            if !table_names
+                .iter()
+                .any(|name| identifiers_equal(name, dependency))
+            {
+                table_names.push(dependency.as_str());
+            }
+        }
+        table_names
+    }
+
+    pub(crate) fn required_row_source_table_names(&self) -> Vec<&str> {
+        let mut table_names = Vec::new();
+        table_names.push(self.table.name.as_str());
+        if self.delete_children.is_empty() {
+            for child in &self.restrict_children {
+                if child.child_index_name.is_none()
+                    && !table_names
+                        .iter()
+                        .any(|name| identifiers_equal(name, &child.child_table_name))
+                {
+                    table_names.push(child.child_table_name.as_str());
+                }
+            }
+            return table_names;
+        }
+        for dependency in &self.dependency_table_names {
+            if !table_names
+                .iter()
+                .any(|name| identifiers_equal(name, dependency))
+            {
+                table_names.push(dependency.as_str());
+            }
+        }
+        table_names
+    }
+
+    pub(crate) fn child_index_hydration_targets(&self) -> Vec<(&str, &str)> {
+        let mut targets = Vec::new();
+        for child in &self.restrict_children {
+            if let Some(index_name) = child.child_index_name.as_deref() {
+                push_unique_child_index_hydration_target(
+                    &mut targets,
+                    child.child_table_name.as_str(),
+                    index_name,
+                );
+            }
+        }
+        for child in &self.delete_children {
+            if let Some(index_name) = child.child_index_name.as_deref() {
+                push_unique_child_index_hydration_target(
+                    &mut targets,
+                    child.child_table.name.as_str(),
+                    index_name,
+                );
+            }
+        }
+        targets
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedDeleteCascadeChild {
+    child_table: crate::catalog::TableSchema,
+    foreign_key: ForeignKeyConstraint,
+    parent_column_indexes: Vec<usize>,
+    child_column_indexes: Vec<usize>,
+    child_index_name: Option<String>,
+    child_index_prefix_len: Option<usize>,
+}
+
+type DeleteChildrenByTable = BTreeMap<String, Vec<PreparedDeleteCascadeChild>>;
+type TableIndexesByTable = BTreeMap<String, Vec<IndexSchema>>;
+
+fn push_unique_child_index_hydration_target<'a>(
+    targets: &mut Vec<(&'a str, &'a str)>,
+    table_name: &'a str,
+    index_name: &'a str,
+) {
+    if targets.iter().any(|(existing_table, existing_index)| {
+        identifiers_equal(existing_table, table_name)
+            && identifiers_equal(existing_index, index_name)
+    }) {
+        return;
+    }
+    targets.push((table_name, index_name));
+}
+
+#[derive(Clone, Debug)]
+struct PreparedIntArithmeticUpdate {
+    column_index: usize,
+    op: BinaryOp,
+    delta_source: PreparedSimpleValueSource,
 }
 
 impl EngineRuntime {
@@ -536,7 +691,17 @@ impl EngineRuntime {
         &self,
         statement: &InsertStatement,
     ) -> Result<Option<PreparedSimpleInsert>> {
-        if !self.can_execute_insert_in_place(statement) || !statement.returning.is_empty() {
+        self.prepare_simple_insert_with_returning(statement, false)
+    }
+
+    fn prepare_simple_insert_with_returning(
+        &self,
+        statement: &InsertStatement,
+        allow_returning: bool,
+    ) -> Result<Option<PreparedSimpleInsert>> {
+        if !self.can_execute_insert_in_place(statement)
+            || (!allow_returning && !statement.returning.is_empty())
+        {
             return Ok(None);
         }
 
@@ -636,16 +801,20 @@ impl EngineRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        let direct_positional_param_count = if value_sources
-            .iter()
-            .enumerate()
-            .all(|(index, source)| {
-                matches!(source, PreparedInsertValueSource::Parameter(position) if *position == index + 1)
-            }) {
-            Some(value_sources.len())
-        } else {
-            None
-        };
+        let direct_positional_param_count =
+            if value_sources
+                .iter()
+                .zip(&columns)
+                .enumerate()
+                .all(|(index, (source, column))| {
+                    prepared_insert_source_direct_positional_param(source, column.column_type)
+                        == Some(index + 1)
+                })
+            {
+                Some(value_sources.len())
+            } else {
+                None
+            };
         let has_auto_increment = columns.iter().any(|column| column.auto_increment);
         let mut row_source_dependency_tables: Vec<String> = Vec::new();
         for foreign_key in &table.foreign_keys {
@@ -748,13 +917,37 @@ impl EngineRuntime {
         if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
             return Ok(None);
         }
-        if !row_id_alias_column_name(table).is_some_and(|name| identifiers_equal(name, column_name))
-        {
-            return Ok(None);
-        }
 
-        let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
-            return Ok(None);
+        let lookup = if row_id_alias_column_name(table)
+            .is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
+                return Ok(None);
+            };
+            PreparedSimpleUpdateLookup::RowId(row_id_source)
+        } else {
+            let Some(index) = self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, &table.name)
+                    && index.fresh
+                    && index.unique
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0].expression_sql.is_none()
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|entry| identifiers_equal(entry, column_name))
+            }) else {
+                return Ok(None);
+            };
+            let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+                return Ok(None);
+            };
+            PreparedSimpleUpdateLookup::UniqueIndex {
+                index_name: index.name.clone(),
+                value_source,
+            }
         };
 
         let mut assignments = Vec::with_capacity(statement.assignments.len());
@@ -820,7 +1013,7 @@ impl EngineRuntime {
 
         Ok(Some(PreparedSimpleUpdate {
             table_name: prepared_table_name,
-            row_id_source,
+            lookup,
             assignments,
             indexes,
             compiled_index_state_epoch: self.index_state_epoch,
@@ -844,9 +1037,9 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<QueryResult> {
-        let row_id = match resolve_prepared_simple_value(&prepared.row_id_source, params)? {
-            Value::Int64(value) => value,
-            _ => return Ok(QueryResult::with_affected_rows(0)),
+        let row_id = resolve_prepared_simple_update_row_id(self, prepared, params)?;
+        let Some(row_id) = row_id else {
+            return Ok(QueryResult::with_affected_rows(0));
         };
         let mut resolved_assignments = Vec::with_capacity(prepared.assignments.len());
         for assignment in &prepared.assignments {
@@ -1037,10 +1230,18 @@ impl EngineRuntime {
                         break;
                     }
                 }
-                let mut row_changes = BTreeMap::new();
-                row_changes.insert(row_id, Some(next_values.clone()));
-                let updated_manifest =
-                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                let updated_manifest = if let Some(updated_manifest) =
+                    super::try_apply_single_paged_row_update_to_manifest(
+                        manifest.as_ref(),
+                        row_id,
+                        &next_values,
+                    )? {
+                    updated_manifest
+                } else {
+                    let mut row_changes = BTreeMap::new();
+                    row_changes.insert(row_id, Some(next_values.clone()));
+                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?
+                };
                 self.replace_table_row_source(
                     &prepared.table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1092,24 +1293,21 @@ impl EngineRuntime {
             .table_schema(&statement.table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
-        let Some(restrict_children) = prepare_simple_delete_restrict_children(self, &table)? else {
+        let Some(restrict_children) =
+            prepare_simple_delete_prepared_restrict_children(self, &table)?
+        else {
             return Ok(None);
         };
+        let Some(delete_children) = prepare_simple_delete_cascade_children(self, &table)? else {
+            return Ok(None);
+        };
+        let (delete_children_by_table, table_indexes_by_table) =
+            prepare_delete_children_and_indexes(self, &table)?;
 
         let Some(filter) = statement.filter.as_ref() else {
             return Ok(None);
         };
-        let Some((filter_table, column_name, value_expr)) = simple_btree_lookup_filter(filter)
-        else {
-            return Ok(None);
-        };
-        if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
-            return Ok(None);
-        }
-        let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
-            return Ok(None);
-        };
-
+        let dependency_table_names = collect_delete_dependency_tables(self, &table.name);
         let indexes = self
             .catalog
             .indexes
@@ -1117,27 +1315,60 @@ impl EngineRuntime {
             .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
-        let lookup = if row_id_alias_column_name(&table)
-            .is_some_and(|name| identifiers_equal(name, column_name))
+        let lookup = if let Some((filter_table, column_name, low_expr, high_expr)) =
+            simple_row_id_between_filter(filter)
         {
-            PreparedDeleteLookup::RowId(value_source)
-        } else {
-            let Some(index) = indexes.iter().find(|index| {
-                index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == 1
-                    && index.columns[0].expression_sql.is_none()
-                    && index.columns[0]
-                        .column_name
-                        .as_ref()
-                        .is_some_and(|entry| identifiers_equal(entry, column_name))
-            }) else {
+            if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
+                return Ok(None);
+            }
+            if !row_id_alias_column_name(&table)
+                .is_some_and(|name| identifiers_equal(name, column_name))
+            {
+                return Ok(None);
+            }
+            let Some(low_source) = compile_prepared_simple_value_source(low_expr) else {
                 return Ok(None);
             };
-            PreparedDeleteLookup::Index {
-                index_name: index.name.clone(),
-                value_source,
+            let Some(high_source) = compile_prepared_simple_value_source(high_expr) else {
+                return Ok(None);
+            };
+            PreparedDeleteLookup::RowIdRange {
+                low_source,
+                high_source,
+            }
+        } else {
+            let Some((filter_table, column_name, value_expr)) = simple_btree_lookup_filter(filter)
+            else {
+                return Ok(None);
+            };
+            if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
+                return Ok(None);
+            }
+            let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+                return Ok(None);
+            };
+            if row_id_alias_column_name(&table)
+                .is_some_and(|name| identifiers_equal(name, column_name))
+            {
+                PreparedDeleteLookup::RowId(value_source)
+            } else {
+                let Some(index) = indexes.iter().find(|index| {
+                    index.fresh
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() == 1
+                        && index.columns[0].expression_sql.is_none()
+                        && index.columns[0]
+                            .column_name
+                            .as_ref()
+                            .is_some_and(|entry| identifiers_equal(entry, column_name))
+                }) else {
+                    return Ok(None);
+                };
+                PreparedDeleteLookup::Index {
+                    index_name: index.name.clone(),
+                    value_source,
+                }
             }
         };
 
@@ -1153,6 +1384,65 @@ impl EngineRuntime {
             indexes,
             lookup,
             restrict_children,
+            delete_children_by_table,
+            table_indexes_by_table,
+            delete_children,
+            dependency_table_names,
+            compiled_index_state_epoch: self.index_state_epoch,
+        }))
+    }
+
+    pub(crate) fn prepare_simple_row_id_range_delete(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        low: i64,
+        high: i64,
+    ) -> Result<Option<PreparedSimpleDelete>> {
+        let table = self
+            .table_schema(table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        if !row_id_alias_column_name(&table)
+            .is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            return Ok(None);
+        }
+        let Some(restrict_children) =
+            prepare_simple_delete_prepared_restrict_children(self, &table)?
+        else {
+            return Ok(None);
+        };
+        let Some(delete_children) = prepare_simple_delete_cascade_children(self, &table)? else {
+            return Ok(None);
+        };
+        let (delete_children_by_table, table_indexes_by_table) =
+            prepare_delete_children_and_indexes(self, &table)?;
+        let dependency_table_names = collect_delete_dependency_tables(self, &table.name);
+        let indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let prepared_table_name = match super::compat_schema_qualified_name(table_name).0 {
+            Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
+            _ => table.name.clone(),
+        };
+        Ok(Some(PreparedSimpleDelete {
+            table_name: prepared_table_name,
+            table,
+            indexes,
+            lookup: PreparedDeleteLookup::RowIdRange {
+                low_source: PreparedSimpleValueSource::Literal(Value::Int64(low)),
+                high_source: PreparedSimpleValueSource::Literal(Value::Int64(high)),
+            },
+            restrict_children,
+            delete_children_by_table,
+            table_indexes_by_table,
+            delete_children,
+            dependency_table_names,
             compiled_index_state_epoch: self.index_state_epoch,
         }))
     }
@@ -1166,6 +1456,10 @@ impl EngineRuntime {
                 .restrict_children
                 .iter()
                 .all(|child| !self.visible_table_is_temporary(&child.child_table_name))
+            && prepared
+                .dependency_table_names
+                .iter()
+                .all(|table_name| !self.visible_table_is_temporary(table_name))
     }
 
     pub(crate) fn execute_prepared_simple_delete(
@@ -1174,6 +1468,8 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<QueryResult> {
+        let lookup_validated_live_rows =
+            !matches!(prepared.lookup, PreparedDeleteLookup::Index { .. });
         let matching_row_ids = match &prepared.lookup {
             PreparedDeleteLookup::RowId(value_source) => {
                 let Value::Int64(row_id) = resolve_prepared_simple_value(value_source, params)?
@@ -1184,6 +1480,24 @@ impl EngineRuntime {
                     Some(row_source) if row_source.row_by_id(row_id)?.is_some() => vec![row_id],
                     _ => Vec::new(),
                 }
+            }
+            PreparedDeleteLookup::RowIdRange {
+                low_source,
+                high_source,
+            } => {
+                let Value::Int64(low) = resolve_prepared_simple_value(low_source, params)? else {
+                    return Ok(QueryResult::with_affected_rows(0));
+                };
+                let Value::Int64(high) = resolve_prepared_simple_value(high_source, params)? else {
+                    return Ok(QueryResult::with_affected_rows(0));
+                };
+                if low > high {
+                    return Ok(QueryResult::with_affected_rows(0));
+                }
+                let Some(row_source) = self.visible_table_row_source(&prepared.table_name) else {
+                    return Ok(QueryResult::with_affected_rows(0));
+                };
+                row_source.row_ids_in_range(low, high)
             }
             PreparedDeleteLookup::Index {
                 index_name,
@@ -1199,8 +1513,126 @@ impl EngineRuntime {
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
             }
         };
+        let matching_row_ids = if lookup_validated_live_rows {
+            matching_row_ids
+        } else {
+            match self.visible_table_row_source(&prepared.table_name) {
+                Some(row_source) => {
+                    let mut live_row_ids = Vec::with_capacity(matching_row_ids.len());
+                    for row_id in matching_row_ids {
+                        if row_source.row_by_id(row_id)?.is_some() {
+                            live_row_ids.push(row_id);
+                        }
+                    }
+                    live_row_ids
+                }
+                None => Vec::new(),
+            }
+        };
         if matching_row_ids.is_empty() {
             return Ok(QueryResult::with_affected_rows(0));
+        }
+
+        let can_fast_delete_by_row_id = prepared.delete_children.is_empty()
+            && !self.should_record_sync_mutation_for_table(&prepared.table)
+            && self.prepared_simple_delete_restrict_children_are_row_id_index_checks(prepared);
+        if can_fast_delete_by_row_id {
+            for child in &prepared.restrict_children {
+                let Some(index_name) = child.child_index_name.as_deref() else {
+                    continue;
+                };
+                let Some(index_schema) = self.catalog.indexes.get(index_name) else {
+                    continue;
+                };
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(index_name) else {
+                    continue;
+                };
+                let use_prefix_scan = child
+                    .child_index_prefix_len
+                    .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
+                for &row_id in &matching_row_ids {
+                    let has_referencing_child = if use_prefix_scan {
+                        row_ids_have_live_row(
+                            self,
+                            &child.child_table_name,
+                            keys.row_ids_for_encoded_key_prefix(&[Value::Int64(row_id)])?,
+                        )?
+                    } else {
+                        row_id_set_has_live_row(
+                            self,
+                            &child.child_table_name,
+                            keys.row_ids_for_value_set(&Value::Int64(row_id))?,
+                        )?
+                    };
+                    if has_referencing_child {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            prepared.table.name, child.child_table_name
+                        )));
+                    }
+                }
+            }
+
+            let affected_rows = matching_row_ids.len();
+            let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
+            let mut stale_indexes = Vec::new();
+            match self.table_row_source(&prepared.table_name) {
+                Some(TableRowSource::Resident(_)) => {
+                    let row_source = self
+                        .table_row_source(&prepared.table_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "table data for {} is missing",
+                                prepared.table_name
+                            ))
+                        })?;
+                    stale_indexes.extend(incremental_delete_indexes_by_row_id(
+                        self,
+                        &prepared.table,
+                        &prepared.indexes,
+                        &deleted_row_ids,
+                        &row_source,
+                    )?);
+                    let table_data =
+                        self.table_data_mut(&prepared.table_name).ok_or_else(|| {
+                            DbError::internal(format!(
+                                "table data for {} is missing",
+                                prepared.table_name
+                            ))
+                        })?;
+                    table_data.mark_existing_row_set_deleted(&deleted_row_ids);
+                    self.mark_table_rows_deleted(&prepared.table_name, &deleted_row_ids);
+                }
+                Some(TableRowSource::Paged(manifest)) => {
+                    let updated_manifest = super::apply_paged_row_deletions_to_manifest(
+                        manifest.as_ref(),
+                        &deleted_row_ids,
+                    )?;
+                    self.replace_table_row_source(
+                        &prepared.table_name,
+                        TableRowSource::Paged(Arc::new(updated_manifest)),
+                    )?;
+                    self.mark_table_dirty(&prepared.table_name);
+                    stale_indexes.extend(prepared.indexes.iter().map(|index| index.name.clone()));
+                }
+                None => {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        prepared.table_name
+                    )));
+                }
+            }
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
+            }
+            self.execute_after_triggers(
+                &prepared.table_name,
+                TriggerEvent::Delete,
+                affected_rows,
+                _page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(affected_rows as u64));
         }
 
         let (removed_rows, row_source_was_resident) = {
@@ -1235,39 +1667,24 @@ impl EngineRuntime {
                 }
             }
         }
+        if !prepared.delete_children.is_empty() {
+            self.apply_parent_delete_actions_rows(
+                &prepared.table_name,
+                &prepared.table,
+                &removed_rows,
+                &prepared.delete_children,
+                Some(&prepared.delete_children_by_table),
+                Some(&prepared.table_indexes_by_table),
+                params,
+                _page_size,
+            )?;
+        }
 
         if row_source_was_resident {
-            {
-                let mut row_indices = {
-                    let table_data = self.table_data(&prepared.table_name).ok_or_else(|| {
-                        DbError::internal(format!(
-                            "table data for {} is missing",
-                            prepared.table_name
-                        ))
-                    })?;
-                    let mut indices = Vec::with_capacity(matching_row_ids.len());
-                    for &row_id in &matching_row_ids {
-                        let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
-                            DbError::internal(format!("row {row_id} vanished during DELETE"))
-                        })?;
-                        indices.push(row_index);
-                    }
-                    indices
-                };
-                row_indices.sort_unstable_by(|left, right| right.cmp(left));
-                {
-                    let table_data =
-                        self.table_data_mut(&prepared.table_name).ok_or_else(|| {
-                            DbError::internal(format!(
-                                "table data for {} is missing",
-                                prepared.table_name
-                            ))
-                        })?;
-                    for &row_index in &row_indices {
-                        table_data.remove_row(row_index);
-                    }
-                }
-            }
+            let table_data = self.table_data_mut(&prepared.table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table_name))
+            })?;
+            table_data.mark_rows_deleted(matching_row_ids.iter());
         } else {
             let manifest = match self.table_row_source(&prepared.table_name) {
                 Some(TableRowSource::Paged(manifest)) => Arc::clone(manifest),
@@ -1285,13 +1702,11 @@ impl EngineRuntime {
                 }
             };
             {
-                let row_changes = matching_row_ids
-                    .iter()
-                    .copied()
-                    .map(|row_id| (row_id, None))
-                    .collect::<BTreeMap<_, _>>();
-                let updated_manifest =
-                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
+                let updated_manifest = super::apply_paged_row_deletions_to_manifest(
+                    manifest.as_ref(),
+                    &deleted_row_ids,
+                )?;
                 self.replace_table_row_source(
                     &prepared.table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1299,16 +1714,8 @@ impl EngineRuntime {
             }
         }
 
-        for row in &removed_rows {
-            for index in &prepared.indexes {
-                apply_runtime_index_delete_for_row(
-                    self,
-                    &prepared.table,
-                    index,
-                    row.row_id,
-                    &row.values,
-                )?;
-            }
+        for index in &prepared.indexes {
+            apply_runtime_index_delete_for_rows(self, &prepared.table, index, &removed_rows)?;
         }
 
         if row_source_was_resident {
@@ -1331,6 +1738,26 @@ impl EngineRuntime {
             }
         }
         Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
+    }
+
+    fn prepared_simple_delete_restrict_children_are_row_id_index_checks(
+        &self,
+        prepared: &PreparedSimpleDelete,
+    ) -> bool {
+        let Some(row_id_column) = row_id_alias_column_name(&prepared.table) else {
+            return prepared.restrict_children.is_empty();
+        };
+        prepared.restrict_children.iter().all(|child| {
+            child.parent_column_indexes.len() == 1
+                && child.child_index_name.as_deref().is_some_and(|index_name| {
+                    matches!(self.index(index_name), Some(RuntimeIndex::Btree { .. }))
+                })
+                && child
+                    .parent_column_indexes
+                    .first()
+                    .and_then(|index| prepared.table.columns.get(*index))
+                    .is_some_and(|column| identifiers_equal(&column.name, row_id_column))
+        })
     }
 
     pub(crate) fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
@@ -1373,18 +1800,19 @@ impl EngineRuntime {
         } else {
             None
         };
-        let candidate_clone = sync_schema.as_ref().map(|_| candidate.clone());
-        let affected = self.apply_prepared_simple_insert_candidate(
+        let needs_stored_row = sync_schema.is_some();
+        let (affected, stored_row) = self.apply_prepared_simple_insert_candidate(
             prepared,
             candidate,
             next_row_id,
             params,
             page_size,
+            needs_stored_row,
         )?;
         if affected > 0 {
-            if let (Some(schema), Some(values)) = (sync_schema.as_ref(), candidate_clone.as_ref()) {
-                let pk = sync::build_primary_key_json(schema, values);
-                let after = sync::build_after_json(schema, values);
+            if let (Some(schema), Some(stored_row)) = (sync_schema.as_ref(), stored_row.as_ref()) {
+                let pk = sync::build_primary_key_json(schema, &stored_row.values);
+                let after = sync::build_after_json(schema, &stored_row.values);
                 let schema_cookie = self.catalog.schema_cookie;
                 self.record_sync_mutation(
                     &schema.name,
@@ -1398,15 +1826,89 @@ impl EngineRuntime {
         Ok(QueryResult::with_affected_rows(affected))
     }
 
+    pub(crate) fn execute_prepared_simple_insert_with_returning(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &[Value],
+        returning: &[SelectItem],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        let mut next_row_id = prepared_next_row_id(self, prepared)?;
+        let candidate = if prepared.direct_positional_param_count == Some(params.len()) {
+            materialize_direct_positional_insert_candidate(prepared, params, &mut next_row_id)?
+        } else {
+            materialize_prepared_insert_candidate(self, prepared, params, &mut next_row_id)?
+        };
+        let sync_schema = if self.mutation_capture_active() {
+            self.table_schema(prepared.table_name.as_str())
+                .filter(|schema| !schema.temporary)
+                .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                .cloned()
+        } else {
+            None
+        };
+        let (affected, stored_row) = self.apply_prepared_simple_insert_candidate(
+            prepared,
+            candidate,
+            next_row_id,
+            params,
+            page_size,
+            true,
+        )?;
+        if affected > 0 {
+            if let (Some(schema), Some(stored_row)) = (sync_schema.as_ref(), stored_row.as_ref()) {
+                let pk = sync::build_primary_key_json(schema, &stored_row.values);
+                let after = sync::build_after_json(schema, &stored_row.values);
+                let schema_cookie = self.catalog.schema_cookie;
+                self.record_sync_mutation(
+                    &schema.name,
+                    SyncOperation::Insert,
+                    pk,
+                    Some(after),
+                    schema_cookie,
+                );
+            }
+        }
+        if affected == 0 {
+            Ok(QueryResult::with_affected_rows(0))
+        } else {
+            let stored_row = stored_row.ok_or_else(|| {
+                DbError::internal("prepared INSERT RETURNING did not preserve inserted row")
+            })?;
+            self.render_returning(
+                &prepared.table_name,
+                std::slice::from_ref(&stored_row),
+                returning,
+                params,
+            )
+        }
+    }
+
     pub(crate) fn execute_prepared_simple_insert_positional_params_in_place(
         &mut self,
         prepared: &PreparedSimpleInsert,
         params: &mut [Value],
         page_size: u32,
     ) -> Result<u64> {
+        let mut candidate = Vec::with_capacity(prepared.columns.len());
+        self.execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+            prepared,
+            params,
+            &mut candidate,
+            page_size,
+        )
+    }
+
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        page_size: u32,
+    ) -> Result<u64> {
         let table_name = prepared.table_name.as_str();
         let mut next_row_id = prepared_next_row_id(self, prepared)?;
-        let mut candidate = Vec::with_capacity(prepared.columns.len());
+        candidate.clear();
 
         if params.len() < prepared.columns.len() {
             return Err(DbError::sql(format!(
@@ -1451,21 +1953,110 @@ impl EngineRuntime {
 
         self.apply_prepared_simple_insert_candidate(
             prepared,
-            candidate,
+            std::mem::take(candidate),
             next_row_id,
             params,
             page_size,
+            false,
         )
+        .map(|result| result.0)
+    }
+
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        cached_next_row_id: &mut i64,
+        page_size: u32,
+    ) -> Result<u64> {
+        let table_name = prepared.table_name.as_str();
+        let mut next_row_id = *cached_next_row_id;
+        candidate.clear();
+
+        if params.len() < prepared.columns.len() {
+            return Err(DbError::sql(format!(
+                "prepared insert expected {} parameters but received {}",
+                prepared.columns.len(),
+                params.len()
+            )));
+        }
+
+        if prepared.has_auto_increment {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let mut value = std::mem::replace(param, Value::Null);
+
+                if column.auto_increment {
+                    match value {
+                        Value::Null => {
+                            value = Value::Int64(next_row_id);
+                            next_row_id += 1;
+                        }
+                        Value::Int64(explicit) => {
+                            if explicit >= next_row_id {
+                                next_row_id = explicit + 1;
+                            }
+                        }
+                        _ => {
+                            return Err(DbError::constraint(format!(
+                                "auto-increment column {}.{} requires INT64 values",
+                                table_name, column.name
+                            )));
+                        }
+                    }
+                }
+
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
+            }
+        } else {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let value = std::mem::replace(param, Value::Null);
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
+            }
+        }
+
+        let (affected, _stored_row, new_next_row_id) = self
+            .apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+                prepared,
+                std::mem::take(candidate),
+                next_row_id,
+                params,
+                page_size,
+                PreparedInsertApplyMode::caller_tracks_next_row_id(),
+            )?;
+        *cached_next_row_id = new_next_row_id;
+        Ok(affected)
     }
 
     fn apply_prepared_simple_insert_candidate(
         &mut self,
         prepared: &PreparedSimpleInsert,
         candidate: Vec<Value>,
+        next_row_id: i64,
+        params: &[Value],
+        page_size: u32,
+        preserve_stored_row: bool,
+    ) -> Result<(u64, Option<StoredRow>)> {
+        self.apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+            prepared,
+            candidate,
+            next_row_id,
+            params,
+            page_size,
+            PreparedInsertApplyMode::update_catalog(preserve_stored_row),
+        )
+        .map(|(affected, stored_row, _next_row_id)| (affected, stored_row))
+    }
+
+    fn apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        candidate: Vec<Value>,
         mut next_row_id: i64,
         params: &[Value],
         page_size: u32,
-    ) -> Result<u64> {
+        apply_mode: PreparedInsertApplyMode,
+    ) -> Result<(u64, Option<StoredRow>, i64)> {
         let table_name = prepared.table_name.as_str();
 
         if prepared.use_generic_validation {
@@ -1502,19 +2093,25 @@ impl EngineRuntime {
                 !prepared.use_generic_validation,
             )?;
         }
+        let preserved_stored_row = apply_mode.preserve_stored_row.then(|| stored_row.clone());
+        let update_catalog_next_row_id = apply_mode.update_catalog_next_row_id;
         if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
-            self.catalog_table_exact_mut(catalog_table_name)
-                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-                .next_row_id = next_row_id;
+            if update_catalog_next_row_id {
+                self.catalog_table_exact_mut(catalog_table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                    .next_row_id = next_row_id;
+            }
             self.append_owned_stored_row_to_catalog_table_row_source(
                 catalog_table_name,
                 stored_row,
                 page_size,
             )?;
         } else {
-            self.catalog_table_mut(table_name)
-                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-                .next_row_id = next_row_id;
+            if update_catalog_next_row_id {
+                self.catalog_table_mut(table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                    .next_row_id = next_row_id;
+            }
             self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
         }
         if prepared.use_generic_index_updates {
@@ -1525,7 +2122,7 @@ impl EngineRuntime {
         } else {
             self.mark_table_row_appended(table_name);
         }
-        Ok(1)
+        Ok((1, preserved_stored_row, next_row_id))
     }
 
     fn catalog_table_exact_mut(&mut self, table_name: &str) -> Option<&mut TableSchema> {
@@ -1587,12 +2184,14 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(data) => {
                 let data = Arc::make_mut(data);
-                data.rows.push(stored_row);
+                data.push_row(stored_row);
                 if use_paged_row_storage
-                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                    && data.row_count() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
                 {
+                    let visible_rows = data.visible_rows().cloned().collect::<Vec<_>>();
                     *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
-                        &data.rows, page_size,
+                        &visible_rows,
+                        page_size,
                     )?));
                 }
                 Ok(())
@@ -1629,8 +2228,7 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
-                .rows
-                .push(stored_row);
+                .push_row(stored_row);
             return Ok(());
         }
         let Some(canonical_table_name) = self.canonical_catalog_table_name(table_name) else {
@@ -1647,12 +2245,14 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(data) => {
                 let data = Arc::make_mut(data);
-                data.rows.push(stored_row);
+                data.push_row(stored_row);
                 if use_paged_row_storage
-                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                    && data.row_count() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
                 {
+                    let visible_rows = data.visible_rows().cloned().collect::<Vec<_>>();
                     *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
-                        &data.rows, page_size,
+                        &visible_rows,
+                        page_size,
                     )?));
                 }
                 Ok(())
@@ -1676,14 +2276,7 @@ impl EngineRuntime {
             let table_data = self.temp_table_data_mut(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
-            for row in &mut table_data.rows {
-                if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
-                    row.values = next_values.clone();
-                }
-            }
-            table_data
-                .rows
-                .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
+            Self::apply_row_changes_to_resident_table_data(table_data, row_changes);
             return Ok(());
         }
         if matches!(
@@ -1693,14 +2286,7 @@ impl EngineRuntime {
             let table_data = self.table_data_mut(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
-            for row in &mut table_data.rows {
-                if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
-                    row.values = next_values.clone();
-                }
-            }
-            table_data
-                .rows
-                .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
+            Self::apply_row_changes_to_resident_table_data(table_data, row_changes);
             return Ok(());
         }
         let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
@@ -1708,12 +2294,42 @@ impl EngineRuntime {
                 "table row source for {table_name} is missing"
             )));
         };
-        let updated_manifest =
-            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), row_changes)?;
+        let updated_manifest = if row_changes.values().all(|change| change.is_none()) {
+            let deleted_row_ids = row_changes.keys().copied().collect::<BTreeSet<_>>();
+            super::apply_paged_row_deletions_to_manifest(manifest.as_ref(), &deleted_row_ids)?
+        } else {
+            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), row_changes)?
+        };
         self.replace_table_row_source(
             table_name,
             TableRowSource::Paged(Arc::new(updated_manifest)),
         )
+    }
+
+    fn apply_row_changes_to_resident_table_data(
+        table_data: &mut super::TableData,
+        row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
+    ) {
+        let pure_delete = row_changes.values().all(|change| change.is_none());
+        if pure_delete {
+            table_data.mark_rows_deleted(row_changes.keys());
+            return;
+        }
+
+        let mut deleted_row_ids = Vec::new();
+        for (row_id, change) in row_changes {
+            let Some(row_index) = table_data.row_index_by_id(*row_id) else {
+                continue;
+            };
+            match change {
+                Some(next_values) => {
+                    table_data.replace_row_values(row_index, next_values.clone());
+                }
+                None => deleted_row_ids.push(*row_id),
+            }
+        }
+
+        table_data.mark_rows_deleted(deleted_row_ids.iter());
     }
 
     pub(super) fn execute_insert(
@@ -1739,6 +2355,10 @@ impl EngineRuntime {
                 page_size,
             )?;
             return Ok(QueryResult::with_affected_rows(affected_rows));
+        }
+
+        if let Some(result) = self.try_execute_rowid_noop_upsert(statement, params, page_size)? {
+            return Ok(result);
         }
 
         if let Some(result) = self.try_execute_in_place_insert(statement, params, page_size)? {
@@ -1880,7 +2500,7 @@ impl EngineRuntime {
         assignment_only_validation: bool,
         _updates_foreign_key_columns: bool,
         has_referencing_tables: bool,
-        table_indexes: &[crate::catalog::IndexSchema],
+        _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
         params: &[Value],
         page_size: u32,
@@ -1894,7 +2514,7 @@ impl EngineRuntime {
         let mut changed_rows = 0_u64;
         let mut returning_rows = Vec::new();
         let mut row_changes = BTreeMap::new();
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
             let current_row = manifest
@@ -1948,19 +2568,23 @@ impl EngineRuntime {
                     page_size,
                 )?;
             }
-            if indexes_remain_fresh {
-                for index in indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            for index in indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
                     }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
                 }
             }
             if !statement.returning.is_empty() {
@@ -1987,8 +2611,8 @@ impl EngineRuntime {
                     self.mark_table_row_dirty(&table.name, 0, *row_id, values);
                 }
             }
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table.name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
         }
 
@@ -2014,6 +2638,7 @@ impl EngineRuntime {
         matching_row_ids: &[i64],
         has_referencing_tables: bool,
         restrict_children: &[PreparedSimpleDeleteRestrictChild],
+        delete_children: &[PreparedDeleteCascadeChild],
         table_indexes: &[crate::catalog::IndexSchema],
         params: &[Value],
         page_size: u32,
@@ -2046,28 +2671,19 @@ impl EngineRuntime {
                 }
             }
         }
-
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-        if indexes_remain_fresh {
-            for row in &matching_rows {
-                for index in table_indexes {
-                    if !apply_runtime_index_delete_for_row(
-                        self,
-                        table,
-                        index,
-                        row.row_id,
-                        &row.values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
-                    }
-                }
-                if !indexes_remain_fresh {
-                    break;
-                }
-            }
-        }
-        if has_referencing_tables {
+        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &matching_rows)?;
+        if has_referencing_tables && !delete_children.is_empty() {
+            self.apply_parent_delete_actions_rows(
+                &table.name,
+                table,
+                &matching_rows,
+                delete_children,
+                None,
+                None,
+                params,
+                page_size,
+            )?;
+        } else if has_referencing_tables {
             for row in &matching_rows {
                 self.apply_parent_delete_actions(
                     &table.name,
@@ -2080,12 +2696,12 @@ impl EngineRuntime {
         }
 
         if !matching_rows.is_empty() {
-            let row_changes = matching_rows
+            let deleted_row_ids = matching_rows
                 .iter()
-                .map(|row| (row.row_id, None))
-                .collect::<BTreeMap<_, _>>();
+                .map(|row| row.row_id)
+                .collect::<BTreeSet<_>>();
             let updated_manifest =
-                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                super::apply_paged_row_deletions_to_manifest(manifest.as_ref(), &deleted_row_ids)?;
             self.replace_table_row_source(
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -2094,11 +2710,10 @@ impl EngineRuntime {
                 self.mark_table_row_deleted(&table.name, row.row_id);
                 self.record_sync_delete_for_row(table, &row.values);
             }
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table.name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
         }
-
         self.execute_after_triggers(
             &table.name,
             TriggerEvent::Delete,
@@ -2112,6 +2727,412 @@ impl EngineRuntime {
         } else {
             self.render_returning(&table.name, &matching_rows, &statement.returning, params)
                 .map(Some)
+        }
+    }
+
+    fn try_execute_resident_restrict_delete(
+        &mut self,
+        table_name: &str,
+        table: &crate::catalog::TableSchema,
+        matching_row_ids: &[i64],
+        restrict_children: &[PreparedSimpleDeleteRestrictChild],
+        table_indexes: &[crate::catalog::IndexSchema],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        if !matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Resident(_))
+        ) {
+            return Ok(None);
+        }
+        if matching_row_ids.is_empty() {
+            self.execute_after_triggers(table_name, TriggerEvent::Delete, 0, page_size)?;
+            return Ok(Some(QueryResult::with_affected_rows(0)));
+        }
+
+        let mut removed_rows = Vec::with_capacity(matching_row_ids.len());
+        {
+            let table_data = self.table_data(table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {table_name} is missing"))
+            })?;
+            for &row_id in matching_row_ids {
+                let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
+                    DbError::internal(format!("row {row_id} vanished during DELETE"))
+                })?;
+                removed_rows.push(table_data.rows[row_index].clone());
+            }
+        }
+        if !restrict_children.is_empty() {
+            for row in &removed_rows {
+                for child in restrict_children {
+                    if prepared_delete_has_referencing_child(self, child, &row.values)? {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            table.name, child.child_table_name
+                        )));
+                    }
+                }
+            }
+        }
+        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &removed_rows)?;
+        {
+            let table_data = self.table_data_mut(table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {table_name} is missing"))
+            })?;
+            table_data.mark_rows_deleted(matching_row_ids.iter());
+        }
+        for row in &removed_rows {
+            self.mark_table_row_deleted(table_name, row.row_id);
+            self.record_sync_delete_for_row(table, &row.values);
+        }
+        if !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
+        }
+        self.execute_after_triggers(
+            table_name,
+            TriggerEvent::Delete,
+            removed_rows.len(),
+            page_size,
+        )?;
+        Ok(Some(QueryResult::with_affected_rows(
+            removed_rows.len() as u64
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_paged_int_arithmetic_update(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        matching_row_ids: &[i64],
+        prepared_update: &PreparedIntArithmeticUpdate,
+        _table_indexes: &[crate::catalog::IndexSchema],
+        indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(&table.name).cloned()
+        else {
+            return Ok(None);
+        };
+
+        let resolved_delta = resolve_prepared_simple_value(&prepared_update.delta_source, params)?;
+        let mut affected_rows = 0_u64;
+        let mut changed_rows = 0_u64;
+        let mut row_changes = BTreeMap::new();
+        let mut returning_rows = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
+
+        for &row_id in matching_row_ids {
+            let current_row = manifest
+                .row_by_id(row_id)?
+                .map(|row| StoredRow {
+                    row_id,
+                    values: row.values().to_vec(),
+                })
+                .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
+
+            let Some(current_value) = current_row.values.get(prepared_update.column_index) else {
+                return Err(DbError::internal(format!(
+                    "column index {} is invalid for {}",
+                    prepared_update.column_index, table.name
+                )));
+            };
+            let next_value = super::expressions::arithmetic(
+                &prepared_update.op,
+                current_value.clone(),
+                resolved_delta.clone(),
+            )?;
+            let next_value = super::constraints::coerce_column_value(
+                &table.columns[prepared_update.column_index],
+                next_value,
+            )?;
+
+            if next_value == *current_value {
+                affected_rows += 1;
+                if !returning.is_empty() {
+                    returning_rows.push(current_row);
+                }
+                continue;
+            }
+
+            let mut next_values = current_row.values.clone();
+            next_values[prepared_update.column_index] = next_value;
+            validate_assigned_not_null_columns(
+                table,
+                std::slice::from_ref(&prepared_update.column_index),
+                &next_values,
+                &table.name,
+            )?;
+            for index in indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
+                    }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
+                }
+            }
+
+            self.record_sync_update_for_row(table, &next_values);
+            row_changes.insert(row_id, Some(next_values.clone()));
+            if !returning.is_empty() {
+                returning_rows.push(StoredRow {
+                    row_id,
+                    values: next_values,
+                });
+            }
+            changed_rows += 1;
+            affected_rows += 1;
+        }
+
+        if changed_rows > 0 {
+            let updated_manifest =
+                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+            self.replace_table_row_source(
+                &table.name,
+                TableRowSource::Paged(Arc::new(updated_manifest)),
+            )?;
+            for (row_id, next_values) in &row_changes {
+                if let Some(values) = next_values {
+                    self.mark_table_row_dirty(&table.name, 0, *row_id, values);
+                }
+            }
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
+            }
+        }
+
+        self.execute_after_triggers(
+            &table.name,
+            TriggerEvent::Update,
+            affected_rows as usize,
+            page_size,
+        )?;
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_resident_int_arithmetic_update(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        matching_row_ids: &[i64],
+        prepared_update: &PreparedIntArithmeticUpdate,
+        _table_indexes: &[crate::catalog::IndexSchema],
+        indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        let Some(TableRowSource::Resident(_)) = self.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+
+        let resolved_delta = resolve_prepared_simple_value(&prepared_update.delta_source, params)?;
+        let mut affected_rows = 0_u64;
+        let mut changed_rows = 0_u64;
+        let mut returning_rows = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
+
+        for &row_id in matching_row_ids {
+            let (row_index, current_value, old_values) = {
+                let Some(table_data) = self.table_data(&table.name) else {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        table.name
+                    )));
+                };
+                let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
+                    DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                })?;
+                let stored_row = &table_data.rows[row_index];
+                let current_value = stored_row.values.get(prepared_update.column_index).cloned();
+                // Only clone the full old row when an index update needs it
+                // for key comparison. When no indexes are touched, the
+                // arithmetic update can read just the single column and write
+                // it back without materializing the rest of the row.
+                let old_values = if indexes_to_update.is_empty() {
+                    None
+                } else {
+                    Some(stored_row.values.clone())
+                };
+                (row_index, current_value, old_values)
+            };
+
+            let Some(current_value) = current_value else {
+                return Err(DbError::internal(format!(
+                    "column index {} is invalid for {}",
+                    prepared_update.column_index, table.name
+                )));
+            };
+            let next_value = super::expressions::arithmetic(
+                &prepared_update.op,
+                current_value.clone(),
+                resolved_delta.clone(),
+            )?;
+            let next_value = super::constraints::coerce_column_value(
+                &table.columns[prepared_update.column_index],
+                next_value,
+            )?;
+
+            if next_value == current_value {
+                affected_rows += 1;
+                if !returning.is_empty() {
+                    let values = if let Some(values) = old_values.as_ref() {
+                        values.clone()
+                    } else {
+                        let Some(table_data) = self.table_data(&table.name) else {
+                            return Err(DbError::internal(format!(
+                                "table data for {} is missing",
+                                table.name
+                            )));
+                        };
+                        table_data.rows[row_index].values.clone()
+                    };
+                    returning_rows.push(StoredRow { row_id, values });
+                }
+                continue;
+            }
+
+            if let Some(old_values) = old_values.as_ref() {
+                let mut next_values = old_values.clone();
+                next_values[prepared_update.column_index] = next_value.clone();
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values.clone(),
+                    });
+                }
+                for index in indexes_to_update {
+                    if !index.fresh {
+                        if !stale_indexes.contains(&index.name) {
+                            stale_indexes.push(index.name.clone());
+                        }
+                        continue;
+                    }
+                    if !apply_runtime_index_update_for_row_change(
+                        self,
+                        table,
+                        index,
+                        row_id,
+                        old_values,
+                        &next_values,
+                    )? && !stale_indexes.contains(&index.name)
+                    {
+                        stale_indexes.push(index.name.clone());
+                    }
+                }
+
+                {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    table_data
+                        .replace_row_values(row_index, next_values.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                }
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    old_values,
+                    &next_values,
+                );
+                self.record_sync_update_for_row(table, &next_values);
+            } else {
+                // No index touches the updated column: write just the changed
+                // value back without cloning the rest of the row.
+                let next_values = {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    let old_values = table_data.rows[row_index].values.clone();
+                    table_data
+                        .replace_value(row_index, prepared_update.column_index, next_value.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                    let next_values = table_data.rows[row_index].values.clone();
+                    (next_values, old_values)
+                };
+                let (next_values, old_values) = next_values;
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values.clone(),
+                    });
+                }
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    &old_values,
+                    &next_values,
+                );
+                self.record_sync_update_for_row(table, &next_values);
+            }
+            changed_rows += 1;
+            affected_rows += 1;
+        }
+
+        if changed_rows > 0 && !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
+        }
+
+        self.execute_after_triggers(
+            &table.name,
+            TriggerEvent::Update,
+            affected_rows as usize,
+            page_size,
+        )?;
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
         }
     }
 
@@ -2159,7 +3180,7 @@ impl EngineRuntime {
             .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
         let assignment_columns = statement
             .assignments
             .iter()
@@ -2201,11 +3222,32 @@ impl EngineRuntime {
                     index_might_change_for_assignments(&table, index, &assignment_columns)
                 });
 
-        let updates_single_row_fast_path = statement.returning.is_empty()
-            && assignment_only_validation
+        let updates_single_row_fast_path = assignment_only_validation
             && !has_referencing_tables
             && !updates_foreign_key_columns
             && matching_row_ids.len() == 1;
+        if !table.temporary
+            && assignment_only_validation
+            && !has_referencing_tables
+            && !updates_foreign_key_columns
+        {
+            if let Some(prepared_update) =
+                compile_int_arithmetic_update(statement, &table, &assignment_columns)
+            {
+                if let Some(result) = self.try_execute_paged_int_arithmetic_update(
+                    &table,
+                    &matching_row_ids,
+                    &prepared_update,
+                    &table_indexes,
+                    &indexes_to_update,
+                    &statement.returning,
+                    params,
+                    page_size,
+                )? {
+                    return Ok(result);
+                }
+            }
+        }
         if !table.temporary {
             if let Some(result) = self.try_execute_paged_generic_update(
                 statement,
@@ -2221,6 +3263,24 @@ impl EngineRuntime {
                 page_size,
             )? {
                 return Ok(result);
+            }
+        }
+        if assignment_only_validation && !has_referencing_tables && !updates_foreign_key_columns {
+            if let Some(prepared_update) =
+                compile_int_arithmetic_update(statement, &table, &assignment_columns)
+            {
+                if let Some(result) = self.try_execute_resident_int_arithmetic_update(
+                    &table,
+                    &matching_row_ids,
+                    &prepared_update,
+                    &table_indexes,
+                    &indexes_to_update,
+                    &statement.returning,
+                    params,
+                    page_size,
+                )? {
+                    return Ok(result);
+                }
             }
         }
         if updates_single_row_fast_path && assignment_columns.len() == 1 {
@@ -2264,31 +3324,39 @@ impl EngineRuntime {
                             table_name, table.columns[column_index].name
                         )));
                     }
-                    let Some(table_data) = self.table_data_mut(&table_name) else {
-                        return Err(DbError::internal(format!(
-                            "table data for {table_name} is missing"
-                        )));
+                    let (row_index, returning_values, updated_values) = {
+                        let Some(table_data) = self.table_data_mut(&table_name) else {
+                            return Err(DbError::internal(format!(
+                                "table data for {table_name} is missing"
+                            )));
+                        };
+                        let Some(row_index) = table_data.row_index_by_id(single_row_id) else {
+                            return Err(DbError::internal(format!(
+                                "row {single_row_id} vanished during UPDATE"
+                            )));
+                        };
+                        let Some(current_value) =
+                            table_data.rows[row_index].values.get(column_index)
+                        else {
+                            return Err(DbError::internal(format!(
+                                "column index {column_index} is invalid for {table_name}"
+                            )));
+                        };
+                        let mut updated_values = None;
+                        if current_value != &next_email {
+                            table_data
+                                .replace_value(row_index, column_index, next_email)
+                                .ok_or_else(|| {
+                                    DbError::internal(format!(
+                                        "column index {column_index} is invalid for {table_name}"
+                                    ))
+                                })?;
+                            updated_values = Some(table_data.rows[row_index].values.clone());
+                        }
+                        let returning_values = table_data.rows[row_index].values.clone();
+                        (row_index, returning_values, updated_values)
                     };
-                    let Some(row_index) = table_data.row_index_by_id(single_row_id) else {
-                        return Err(DbError::internal(format!(
-                            "row {single_row_id} vanished during UPDATE"
-                        )));
-                    };
-                    let Some(current_value) = table_data.rows[row_index].values.get(column_index)
-                    else {
-                        return Err(DbError::internal(format!(
-                            "column index {column_index} is invalid for {table_name}"
-                        )));
-                    };
-                    if current_value != &next_email {
-                        table_data
-                            .replace_value(row_index, column_index, next_email)
-                            .ok_or_else(|| {
-                                DbError::internal(format!(
-                                    "column index {column_index} is invalid for {table_name}"
-                                ))
-                            })?;
-                        let updated_values = table_data.rows[row_index].values.clone();
+                    if let Some(updated_values) = updated_values {
                         self.mark_table_row_dirty(
                             &table_name,
                             row_index,
@@ -2298,8 +3366,20 @@ impl EngineRuntime {
                         self.record_sync_update_for_row(&table, &updated_values);
                     }
                     self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
-                    return Ok(QueryResult::with_affected_rows(1));
-                }
+                    if statement.returning.is_empty() {
+                        return Ok(QueryResult::with_affected_rows(1));
+                    }
+                    let returning_row = StoredRow {
+                        row_id: single_row_id,
+                        values: returning_values,
+                    };
+                    return self.render_returning(
+                        &table_name,
+                        std::slice::from_ref(&returning_row),
+                        &statement.returning,
+                        params,
+                    );
+                };
                 let (row_index, current_row) = {
                     let Some(table_data) = self.table_data(&table_name) else {
                         return Err(DbError::internal(format!(
@@ -2328,8 +3408,14 @@ impl EngineRuntime {
                     &table_name,
                 )?;
 
-                if current_row.values != next_values && indexes_remain_fresh {
+                if current_row.values != next_values {
                     for index in &indexes_to_update {
+                        if !index.fresh {
+                            if !stale_indexes.contains(&index.name) {
+                                stale_indexes.push(index.name.clone());
+                            }
+                            continue;
+                        }
                         if !apply_runtime_index_update_for_row_change(
                             self,
                             &table,
@@ -2337,35 +3423,55 @@ impl EngineRuntime {
                             single_row_id,
                             &current_row.values,
                             &next_values,
-                        )? {
-                            indexes_remain_fresh = false;
-                            break;
+                        )? && !stale_indexes.contains(&index.name)
+                        {
+                            stale_indexes.push(index.name.clone());
                         }
                     }
                 }
-                let Some(table_data) = self.table_data_mut(&table_name) else {
-                    return Err(DbError::internal(format!(
-                        "table data for {table_name} is missing"
-                    )));
+                let (target_index, returning_values, updated_values, mark_indexes_stale) = {
+                    let Some(table_data) = self.table_data_mut(&table_name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {table_name} is missing"
+                        )));
+                    };
+                    let Some(target_index) = table_data.row_index_by_id(single_row_id) else {
+                        return Err(DbError::internal(format!(
+                            "row {single_row_id} vanished during UPDATE"
+                        )));
+                    };
+                    if target_index != row_index {
+                        return Err(DbError::internal(format!(
+                            "row {single_row_id} shifted during UPDATE"
+                        )));
+                    }
+                    if current_row.values != next_values {
+                        table_data
+                            .replace_row_values(target_index, next_values.clone())
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "row {single_row_id} vanished during UPDATE"
+                                ))
+                            })?;
+                        let updated_values = table_data.rows[target_index].values.clone();
+                        let stale_now = !stale_indexes.is_empty();
+                        (
+                            target_index,
+                            table_data.rows[target_index].values.clone(),
+                            Some(updated_values),
+                            stale_now,
+                        )
+                    } else {
+                        (
+                            target_index,
+                            table_data.rows[target_index].values.clone(),
+                            None,
+                            false,
+                        )
+                    }
                 };
-                let Some(target_index) = table_data.row_index_by_id(single_row_id) else {
-                    return Err(DbError::internal(format!(
-                        "row {single_row_id} vanished during UPDATE"
-                    )));
-                };
-                if target_index != row_index {
-                    return Err(DbError::internal(format!(
-                        "row {single_row_id} shifted during UPDATE"
-                    )));
-                }
-                if current_row.values != next_values {
-                    table_data
-                        .replace_row_values(target_index, next_values.clone())
-                        .ok_or_else(|| {
-                            DbError::internal(format!("row {single_row_id} vanished during UPDATE"))
-                        })?;
-                    let updated_values = table_data.rows[target_index].values.clone();
-                    if !indexes_remain_fresh {
+                if let Some(updated_values) = updated_values {
+                    if mark_indexes_stale {
                         self.mark_indexes_stale_for_table(&table_name);
                     }
                     self.mark_table_row_dirty(
@@ -2377,13 +3483,31 @@ impl EngineRuntime {
                     self.record_sync_update_for_row(&table, &updated_values);
                 }
                 self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
-                return Ok(QueryResult::with_affected_rows(1));
+                if statement.returning.is_empty() {
+                    return Ok(QueryResult::with_affected_rows(1));
+                } else {
+                    let returning_row = StoredRow {
+                        row_id: single_row_id,
+                        values: if current_row.values == next_values {
+                            current_row.values
+                        } else {
+                            returning_values
+                        },
+                    };
+                    return self.render_returning(
+                        &table_name,
+                        std::slice::from_ref(&returning_row),
+                        &statement.returning,
+                        params,
+                    );
+                }
             }
         }
 
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
         let mut returning_rows = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
         for row_id in matching_row_ids {
             let (row_index, current_row) = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
@@ -2439,19 +3563,23 @@ impl EngineRuntime {
             } else {
                 self.validate_row(&table_name, &next_values, Some(row_id), params)?;
             }
-            if indexes_remain_fresh {
-                for index in &indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        &table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            for index in &indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
                     }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    &table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
                 }
             }
             let returning_values = if statement.returning.is_empty() {
@@ -2474,8 +3602,8 @@ impl EngineRuntime {
             changed_rows += 1;
         }
 
-        if changed_rows > 0 && !indexes_remain_fresh {
-            self.mark_indexes_stale_for_table(&table_name);
+        if changed_rows > 0 && !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
 
         self.execute_after_triggers(
@@ -2528,13 +3656,13 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let matching_row_ids =
             matching_row_ids(self, &table_name, &table, statement.filter.as_ref(), params)?;
-        let restrict_children = if table.temporary {
-            Vec::new()
+        let restrict_children_prepared = if table.temporary {
+            Some(Vec::new())
         } else {
-            prepare_simple_delete_restrict_children(self, &table)?.unwrap_or_default()
+            prepare_simple_delete_restrict_children(self, &table)?
         };
-        let has_referencing_tables =
-            !table.temporary && !collect_direct_referencing_tables(self, &table.name).is_empty();
+        let restrict_only_delete = restrict_children_prepared.is_some();
+        let restrict_children = restrict_children_prepared.unwrap_or_default();
         let table_indexes = self
             .catalog
             .indexes
@@ -2542,6 +3670,24 @@ impl EngineRuntime {
             .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
+        if statement.returning.is_empty() && restrict_only_delete {
+            if let Some(result) = self.try_execute_resident_restrict_delete(
+                &table_name,
+                &table,
+                &matching_row_ids,
+                &restrict_children,
+                &table_indexes,
+                page_size,
+            )? {
+                return Ok(result);
+            }
+        };
+        let delete_children = if table.temporary {
+            Vec::new()
+        } else {
+            collect_parent_delete_children(self, &table)?
+        };
+        let has_referencing_tables = !table.temporary && !delete_children.is_empty();
         if !table.temporary {
             if let Some(result) = self.try_execute_paged_generic_delete(
                 statement,
@@ -2549,6 +3695,7 @@ impl EngineRuntime {
                 &matching_row_ids,
                 has_referencing_tables,
                 &restrict_children,
+                &delete_children,
                 &table_indexes,
                 params,
                 page_size,
@@ -2579,36 +3726,19 @@ impl EngineRuntime {
                     })?;
                     let mut removed = Vec::with_capacity(row_indices.len());
                     for &row_index in &row_indices {
-                        removed.push(table_data.remove_row(row_index));
+                        removed.push(table_data.rows[row_index].clone());
                     }
+                    table_data.mark_rows_deleted(matching_row_ids.iter());
                     removed
                 };
-                let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-                if indexes_remain_fresh {
-                    for row in &removed_rows {
-                        for index in &table_indexes {
-                            if !apply_runtime_index_delete_for_row(
-                                self,
-                                &table,
-                                index,
-                                row.row_id,
-                                &row.values,
-                            )? {
-                                indexes_remain_fresh = false;
-                                break;
-                            }
-                        }
-                        if !indexes_remain_fresh {
-                            break;
-                        }
-                    }
-                }
-                if !indexes_remain_fresh {
-                    self.mark_indexes_stale_for_table(&table_name);
-                }
+                let stale_indexes =
+                    incremental_delete_indexes(self, &table, &table_indexes, &removed_rows)?;
                 for row in &removed_rows {
                     self.mark_table_row_deleted(&table_name, row.row_id);
                     self.record_sync_delete_for_row(&table, &row.values);
+                }
+                if !stale_indexes.is_empty() {
+                    self.mark_named_indexes_stale(&stale_indexes);
                 }
             }
             self.execute_after_triggers(
@@ -2632,8 +3762,18 @@ impl EngineRuntime {
             }
             rows
         };
-
-        if has_referencing_tables {
+        if has_referencing_tables && !delete_children.is_empty() {
+            self.apply_parent_delete_actions_rows(
+                &table_name,
+                &table,
+                &matching_rows,
+                &delete_children,
+                None,
+                None,
+                params,
+                page_size,
+            )?;
+        } else if has_referencing_tables {
             for row in &matching_rows {
                 self.apply_parent_delete_actions(
                     &table_name,
@@ -2644,53 +3784,24 @@ impl EngineRuntime {
                 )?;
             }
         }
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-        if indexes_remain_fresh {
-            for row in &matching_rows {
-                for index in &table_indexes {
-                    if !apply_runtime_index_delete_for_row(
-                        self,
-                        &table,
-                        index,
-                        row.row_id,
-                        &row.values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
-                    }
-                }
-                if !indexes_remain_fresh {
-                    break;
-                }
-            }
-        }
+        let stale_indexes =
+            incremental_delete_indexes(self, &table, &table_indexes, &matching_rows)?;
         let matching_row_id_set = matching_row_ids
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        if matching_row_ids.len() == 1 {
-            let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
-                DbError::internal(format!("table data for {table_name} is missing"))
-            })?;
-            if let Some(row_index) = table_data.row_index_by_id(matching_row_ids[0]) {
-                table_data.remove_row(row_index);
-            }
-        } else {
-            self.table_data_mut(&table_name)
-                .ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?
-                .retain_rows(|row| !matching_row_id_set.contains(&row.row_id));
-        }
+        self.table_data_mut(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .mark_rows_deleted(matching_row_id_set.iter());
 
         if !matching_row_ids.is_empty() {
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table_name);
-            }
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table_name, row.row_id);
                 self.record_sync_delete_for_row(&table, &row.values);
             }
+        }
+        if !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
 
         self.execute_after_triggers(
@@ -2706,6 +3817,493 @@ impl EngineRuntime {
         }
     }
 
+    fn try_execute_rowid_noop_upsert(
+        &mut self,
+        statement: &InsertStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        if !statement.returning.is_empty()
+            || self.visible_table_is_temporary(&statement.table_name)
+            || self.has_table_trigger(&statement.table_name, TriggerEvent::Insert)
+            || self.has_table_trigger(&statement.table_name, TriggerEvent::Update)
+        {
+            return Ok(None);
+        }
+        let Some(ConflictAction::DoUpdate {
+            target,
+            assignments,
+            filter: None,
+        }) = statement.on_conflict.as_ref()
+        else {
+            return Ok(None);
+        };
+        let table = self
+            .table_schema(&statement.table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        let Some(row_id_column) = row_id_alias_column_name(&table) else {
+            return Ok(None);
+        };
+        match target {
+            ConflictTarget::Columns(columns)
+                if columns.len() == 1 && identifiers_equal(&columns[0], row_id_column) => {}
+            _ => return Ok(None),
+        }
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+
+        if let Some(noop_candidate) =
+            self.try_materialize_rowid_noop_upsert_candidate(&table, statement, params)?
+        {
+            let Some(row_source) = self.table_row_source(&table.name) else {
+                return Ok(None);
+            };
+            let Some(current_ref) = row_source.row_by_id(noop_candidate.row_id)? else {
+                return Ok(None);
+            };
+            let current_values = current_ref.values();
+            let mut noop_update = true;
+            for assignment in assignments {
+                let Some(target_column_index) = table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+                else {
+                    return Ok(None);
+                };
+                if table.columns[target_column_index].generated_sql.is_some() {
+                    return Ok(None);
+                }
+                let value = match &assignment.expr {
+                    Expr::Column {
+                        table: Some(source_table),
+                        column: source_column,
+                    } if identifiers_equal(source_table, "excluded") => {
+                        let Some(source_column_index) = table
+                            .columns
+                            .iter()
+                            .position(|column| identifiers_equal(&column.name, source_column))
+                        else {
+                            return Ok(None);
+                        };
+                        noop_candidate.candidate[source_column_index].clone()
+                    }
+                    _ => {
+                        let Some(value_source) =
+                            compile_prepared_simple_value_source(&assignment.expr)
+                        else {
+                            return Ok(None);
+                        };
+                        resolve_prepared_simple_value(&value_source, params)?
+                    }
+                };
+                let value = super::constraints::coerce_column_value(
+                    &table.columns[target_column_index],
+                    value,
+                )?;
+                if current_values.get(target_column_index) != Some(&value) {
+                    noop_update = false;
+                    break;
+                }
+            }
+            if noop_update {
+                return Ok(Some(QueryResult::with_affected_rows(1)));
+            }
+            if self
+                .apply_conflict_update(
+                    &table.name,
+                    noop_candidate.row_id,
+                    &noop_candidate.candidate,
+                    assignments,
+                    None,
+                    params,
+                    page_size,
+                )?
+                .is_some()
+            {
+                return Ok(Some(QueryResult::with_affected_rows(1)));
+            }
+            return Ok(None);
+        }
+
+        if let Some(result) =
+            self.try_execute_rowid_noop_upsert_partial_columns(&table, statement, params)?
+        {
+            return Ok(Some(result));
+        }
+
+        let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let Some(source_row) = source_rows.pop() else {
+            return Ok(None);
+        };
+        if !source_rows.is_empty() {
+            return Ok(None);
+        }
+        let candidate = {
+            let mut staged_table = table.clone();
+            build_insert_row_values(
+                self,
+                &mut staged_table,
+                &statement.columns,
+                source_row,
+                params,
+            )?
+        };
+        let Some(row_id) = primary_row_id(&table, &candidate) else {
+            return Ok(None);
+        };
+        let Some(row_source) = self.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+        let Some(current_ref) = row_source.row_by_id(row_id)? else {
+            return Ok(None);
+        };
+        let current_values = current_ref.values();
+        let mut next_values = current_values.to_vec();
+        for assignment in assignments {
+            let Some(target_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+            else {
+                return Ok(None);
+            };
+            if table.columns[target_column_index].generated_sql.is_some() {
+                return Ok(None);
+            }
+            let Expr::Column {
+                table: Some(source_table),
+                column: source_column,
+            } = &assignment.expr
+            else {
+                return Ok(None);
+            };
+            if !identifiers_equal(source_table, "excluded") {
+                return Ok(None);
+            }
+            let Some(source_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, source_column))
+            else {
+                return Ok(None);
+            };
+            next_values[target_column_index] = super::constraints::coerce_column_value(
+                &table.columns[target_column_index],
+                candidate[source_column_index].clone(),
+            )?;
+        }
+        apply_generated_columns(self, &table, &mut next_values, params)?;
+        if next_values == current_values {
+            return Ok(Some(QueryResult::with_affected_rows(1)));
+        }
+        Ok(None)
+    }
+
+    fn try_execute_rowid_noop_upsert_partial_columns(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some())
+        {
+            return Ok(None);
+        }
+
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        let [source_row] = rows.as_slice() else {
+            return Ok(None);
+        };
+
+        let Some(row_source) = self.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+        let Some(row_id_column_name) = row_id_alias_column_name(table) else {
+            return Ok(None);
+        };
+
+        let row_id_column_index = table
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, row_id_column_name))
+            .ok_or_else(|| DbError::sql(format!("unknown column {}", row_id_column_name)))?;
+
+        let Some(row_id) = self.try_resolve_rowid_noop_upsert_row_id(
+            table,
+            statement,
+            source_row,
+            row_id_column_name,
+            row_id_column_index,
+            params,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(current_ref) = row_source.row_by_id(row_id)? else {
+            return Ok(None);
+        };
+        let current_values = current_ref.values();
+        let mut next_values = current_values.to_vec();
+
+        let ConflictAction::DoUpdate { assignments, .. } = statement
+            .on_conflict
+            .as_ref()
+            .ok_or_else(|| DbError::constraint("duplicate key"))?
+        else {
+            return Ok(None);
+        };
+
+        for assignment in assignments {
+            let Some(target_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+            else {
+                return Ok(None);
+            };
+            if table.columns[target_column_index].generated_sql.is_some() {
+                return Ok(None);
+            }
+
+            let Some(value) = self.try_resolve_rowid_noop_upsert_assignment_value(
+                table,
+                statement,
+                source_row,
+                &assignment.expr,
+                params,
+            )?
+            else {
+                return Ok(None);
+            };
+            let value = super::constraints::coerce_column_value(
+                &table.columns[target_column_index],
+                value,
+            )?;
+            next_values[target_column_index] = value;
+        }
+
+        if next_values == current_values {
+            return Ok(Some(QueryResult::with_affected_rows(1)));
+        }
+        Ok(None)
+    }
+
+    fn try_resolve_rowid_noop_upsert_row_id(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        source_row: &[Expr],
+        row_id_column_name: &str,
+        row_id_column_index: usize,
+        params: &[Value],
+    ) -> Result<Option<i64>> {
+        let Some(expr) =
+            statement
+                .columns
+                .iter()
+                .zip(source_row)
+                .find_map(|(column_name, expr)| {
+                    identifiers_equal(column_name, row_id_column_name).then_some(expr)
+                })
+        else {
+            return Ok(None);
+        };
+        let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+            return Ok(None);
+        };
+        let mut value = resolve_prepared_simple_value(&value_source, params)?;
+        let column = &table.columns[row_id_column_index];
+        if column.auto_increment {
+            match value {
+                Value::Null => {
+                    value = Value::Int64(table.next_row_id);
+                }
+                Value::Int64(explicit) => {
+                    value = Value::Int64(explicit);
+                }
+                _ => {
+                    return Err(DbError::constraint(format!(
+                        "auto-increment column {}.{} requires INT64 values",
+                        table.name, column.name
+                    )));
+                }
+            }
+        }
+        let value = super::constraints::coerce_column_value(column, value)?;
+        Ok(match value {
+            Value::Int64(row_id) => Some(row_id),
+            _ => None,
+        })
+    }
+
+    fn try_resolve_rowid_noop_upsert_assignment_value(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        source_row: &[Expr],
+        expr: &Expr,
+        params: &[Value],
+    ) -> Result<Option<Value>> {
+        match expr {
+            Expr::Column {
+                table: Some(source_table),
+                column: source_column,
+            } if identifiers_equal(source_table, "excluded") => {
+                let Some((_, (_, source_expr))) =
+                    statement.columns.iter().zip(source_row).enumerate().find(
+                        |(_, (column_name, _))| identifiers_equal(column_name, source_column),
+                    )
+                else {
+                    return Ok(None);
+                };
+                let Some(source_column_index) = table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, source_column))
+                else {
+                    return Ok(None);
+                };
+                let Some(value_source) = compile_prepared_simple_value_source(source_expr) else {
+                    return Ok(None);
+                };
+                let mut value = resolve_prepared_simple_value(&value_source, params)?;
+                let source_column_schema = &table.columns[source_column_index];
+                if source_column_schema.auto_increment {
+                    match value {
+                        Value::Null => {
+                            value = Value::Int64(table.next_row_id);
+                        }
+                        Value::Int64(explicit) => {
+                            value = Value::Int64(explicit);
+                        }
+                        _ => {
+                            return Err(DbError::constraint(format!(
+                                "auto-increment column {}.{} requires INT64 values",
+                                table.name, source_column_schema.name
+                            )));
+                        }
+                    }
+                }
+                super::constraints::coerce_column_value(source_column_schema, value).map(Some)
+            }
+            _ => {
+                let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+                    return Ok(None);
+                };
+                resolve_prepared_simple_value(&value_source, params).map(Some)
+            }
+        }
+    }
+
+    fn try_materialize_rowid_noop_upsert_candidate(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        params: &[Value],
+    ) -> Result<Option<RowIdNoopUpsertCandidate>> {
+        let Some(ConflictAction::DoUpdate {
+            target,
+            filter: None,
+            ..
+        }) = statement.on_conflict.as_ref()
+        else {
+            return Ok(None);
+        };
+        let Some(row_id_column) = row_id_alias_column_name(table) else {
+            return Ok(None);
+        };
+        match target {
+            ConflictTarget::Columns(columns)
+                if columns.len() == 1 && identifiers_equal(&columns[0], row_id_column) => {}
+            _ => return Ok(None),
+        }
+
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        let [source_row] = rows.as_slice() else {
+            return Ok(None);
+        };
+        if statement.columns.len() != table.columns.len()
+            || source_row.len() != statement.columns.len()
+            || table
+                .columns
+                .iter()
+                .any(|column| column.generated_sql.is_some())
+        {
+            return Ok(None);
+        }
+
+        let mut candidate = vec![Value::Null; table.columns.len()];
+        let mut seen = vec![false; table.columns.len()];
+        for (column_name, expr) in statement.columns.iter().zip(source_row) {
+            let Some(column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, column_name))
+            else {
+                return Ok(None);
+            };
+            if seen[column_index] {
+                return Ok(None);
+            }
+            let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+                return Ok(None);
+            };
+            let mut value = resolve_prepared_simple_value(&value_source, params)?;
+            let column = &table.columns[column_index];
+            if column.auto_increment {
+                match value {
+                    Value::Null => {
+                        value = Value::Int64(table.next_row_id);
+                    }
+                    Value::Int64(explicit) => {
+                        value = Value::Int64(explicit);
+                    }
+                    _ => {
+                        return Err(DbError::constraint(format!(
+                            "auto-increment column {}.{} requires INT64 values",
+                            table.name, column.name
+                        )));
+                    }
+                }
+            }
+            candidate[column_index] = value;
+            seen[column_index] = true;
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Ok(None);
+        }
+        let candidate = self.coerce_row_values(table, candidate)?;
+
+        let Value::Int64(row_id) = candidate
+            .get(
+                table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, row_id_column))
+                    .ok_or_else(|| DbError::sql(format!("unknown column {row_id_column}")))?,
+            )
+            .cloned()
+            .ok_or_else(|| DbError::internal("row-id candidate is missing"))?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(RowIdNoopUpsertCandidate { row_id, candidate }))
+    }
+
     fn render_returning(
         &self,
         table_name: &str,
@@ -2716,6 +4314,9 @@ impl EngineRuntime {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        if let Some(result) = try_render_simple_returning(table, table_name, rows, items) {
+            return Ok(result);
+        }
         let rendered_rows = if generated_columns_are_stored(table) {
             rows.to_vec()
         } else {
@@ -2855,7 +4456,27 @@ impl EngineRuntime {
             assignment_targets_foreign_key_columns(&table, &assignment_columns);
         let has_referencing_tables = !table.temporary
             && assignment_targets_referenced_parent_key_columns(self, &table, &assignment_columns);
-        if updates_foreign_key_columns || has_referencing_tables {
+        let table_indexes: Vec<crate::catalog::IndexSchema> = if table.temporary {
+            self.temp_indexes
+                .values()
+                .filter(|index| identifiers_equal(&index.table_name, &table.name))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.catalog
+                .indexes
+                .values()
+                .filter(|index| identifiers_equal(&index.table_name, &table.name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let indexes_to_update: Vec<crate::catalog::IndexSchema> = table_indexes
+            .iter()
+            .filter(|index| index_might_change_for_assignments(&table, index, &assignment_columns))
+            .cloned()
+            .collect();
+        let rows_changed = current_row.values != next_values;
+        if rows_changed && (updates_foreign_key_columns || has_referencing_tables) {
             self.apply_parent_update_actions(
                 table_name,
                 &table,
@@ -2865,12 +4486,17 @@ impl EngineRuntime {
                 page_size,
             )?;
         }
-        self.validate_row(table_name, &next_values, Some(row_id), params)?;
+        if rows_changed {
+            self.validate_row(table_name, &next_values, Some(row_id), params)?;
+        }
         match row_source {
             TableRowSource::Resident(_) => {
+                if !rows_changed {
+                    return Ok(Some(current_row));
+                }
                 let row_index = self
                     .table_data(table_name)
-                    .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
+                    .and_then(|data| data.row_index_by_id(row_id))
                     .ok_or_else(|| {
                         DbError::internal(format!("row {row_id} vanished during UPSERT"))
                     })?;
@@ -2878,10 +4504,64 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
-                    .rows[row_index]
-                    .values = next_values.clone();
+                    .replace_row_values(row_index, next_values.clone())
+                    .ok_or_else(|| {
+                        DbError::internal(format!("row {row_id} vanished during UPSERT"))
+                    })?;
+                if !indexes_to_update.is_empty() {
+                    let mut stale_indexes: Vec<String> = Vec::new();
+                    for index in &indexes_to_update {
+                        if !index.fresh {
+                            stale_indexes.push(index.name.clone());
+                            continue;
+                        }
+                        if !apply_runtime_index_update_for_row_change(
+                            self,
+                            &table,
+                            index,
+                            row_id,
+                            &current_row.values,
+                            &next_values,
+                        )? {
+                            stale_indexes.push(index.name.clone());
+                        }
+                    }
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
+                    }
+                }
+                self.mark_table_row_dirty(table_name, row_index, row_id, &next_values);
+                Ok(Some(StoredRow {
+                    row_id,
+                    values: next_values,
+                }))
             }
             TableRowSource::Paged(manifest) => {
+                if !rows_changed {
+                    return Ok(Some(current_row));
+                }
+                if !indexes_to_update.is_empty() {
+                    let mut stale_indexes: Vec<String> = Vec::new();
+                    for index in &indexes_to_update {
+                        if !index.fresh {
+                            stale_indexes.push(index.name.clone());
+                            continue;
+                        }
+                        if !apply_runtime_index_update_for_row_change(
+                            self,
+                            &table,
+                            index,
+                            row_id,
+                            &current_row.values,
+                            &next_values,
+                        )? {
+                            stale_indexes.push(index.name.clone());
+                        }
+                    }
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
+                    }
+                }
                 let mut row_changes = BTreeMap::new();
                 row_changes.insert(row_id, Some(next_values.clone()));
                 let updated_manifest =
@@ -2890,14 +4570,13 @@ impl EngineRuntime {
                     table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
                 )?;
+                self.mark_table_dirty(table_name);
+                Ok(Some(StoredRow {
+                    row_id,
+                    values: next_values,
+                }))
             }
         }
-        self.mark_indexes_stale_for_table(table_name);
-        self.mark_table_dirty(table_name);
-        Ok(Some(StoredRow {
-            row_id,
-            values: next_values,
-        }))
     }
 
     fn apply_parent_delete_actions(
@@ -2911,95 +4590,137 @@ impl EngineRuntime {
         if table.temporary {
             return Ok(());
         }
-        let referencing_tables =
-            self.catalog
-                .tables
-                .values()
-                .filter(|child| {
-                    child.foreign_keys.iter().any(|foreign_key| {
-                        identifiers_equal(&foreign_key.referenced_table, table_name)
-                    })
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+        let parent_row = StoredRow {
+            row_id: 0,
+            values: row.to_vec(),
+        };
+        let delete_children = collect_parent_delete_children(self, table)?;
+        self.apply_parent_delete_actions_rows(
+            table_name,
+            table,
+            std::slice::from_ref(&parent_row),
+            &delete_children,
+            None,
+            None,
+            params,
+            page_size,
+        )
+    }
 
-        for child_table in referencing_tables {
-            let foreign_keys = child_table
-                .foreign_keys
-                .iter()
-                .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, table_name))
-                .cloned()
-                .collect::<Vec<_>>();
-            for foreign_key in foreign_keys {
-                let matching_children =
-                    matching_foreign_key_children(self, table, row, &child_table, &foreign_key)?;
-                if matching_children.is_empty() {
-                    continue;
+    #[allow(clippy::too_many_arguments)]
+    fn apply_parent_delete_actions_rows(
+        &mut self,
+        table_name: &str,
+        table: &crate::catalog::TableSchema,
+        rows: &[StoredRow],
+        delete_children: &[PreparedDeleteCascadeChild],
+        delete_children_by_table: Option<&DeleteChildrenByTable>,
+        table_indexes_by_table: Option<&TableIndexesByTable>,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<()> {
+        if table.temporary {
+            return Ok(());
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for child in delete_children {
+            let matching_children =
+                matching_foreign_key_children_for_parent_rows(self, table, rows, child)?;
+            if matching_children.is_empty() {
+                continue;
+            }
+            match child.foreign_key.on_delete {
+                crate::catalog::ForeignKeyAction::NoAction
+                | crate::catalog::ForeignKeyAction::Restrict => {
+                    return Err(DbError::constraint(format!(
+                        "DELETE on {} violates a foreign key from {}",
+                        table_name, child.child_table.name
+                    )))
                 }
-                match foreign_key.on_delete {
-                    crate::catalog::ForeignKeyAction::NoAction
-                    | crate::catalog::ForeignKeyAction::Restrict => {
-                        return Err(DbError::constraint(format!(
-                            "DELETE on {} violates a foreign key from {}",
-                            table_name, child_table.name
-                        )))
-                    }
-                    crate::catalog::ForeignKeyAction::Cascade => {
-                        for child_row in &matching_children {
-                            self.apply_parent_delete_actions(
-                                &child_table.name,
-                                &child_table,
-                                &child_row.values,
-                                params,
-                                page_size,
-                            )?;
+                crate::catalog::ForeignKeyAction::Cascade => {
+                    let child_delete_children = match delete_children_by_table
+                        .and_then(|cache| cache.get(&child.child_table.name))
+                    {
+                        Some(child_delete_children) => {
+                            Cow::Borrowed(child_delete_children.as_slice())
                         }
-                        let row_changes = matching_children
-                            .iter()
-                            .map(|row| (row.row_id, None))
-                            .collect::<BTreeMap<_, _>>();
+                        None => {
+                            Cow::Owned(collect_parent_delete_children(self, &child.child_table)?)
+                        }
+                    };
+                    self.apply_parent_delete_actions_rows(
+                        &child.child_table.name,
+                        &child.child_table,
+                        &matching_children,
+                        child_delete_children.as_ref(),
+                        delete_children_by_table,
+                        table_indexes_by_table,
+                        params,
+                        page_size,
+                    )?;
+                    let child_table_indexes = match table_indexes_by_table
+                        .and_then(|cache| cache.get(&child.child_table.name))
+                    {
+                        Some(indexes) => Cow::Borrowed(indexes.as_slice()),
+                        None => Cow::Owned(
+                            self.catalog
+                                .indexes
+                                .values()
+                                .filter(|index| {
+                                    identifiers_equal(&index.table_name, &child.child_table.name)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        ),
+                    };
+                    let stale_indexes = incremental_delete_indexes(
+                        self,
+                        &child.child_table,
+                        child_table_indexes.as_ref(),
+                        &matching_children,
+                    )?;
+                    let row_changes = matching_children
+                        .iter()
+                        .map(|row| (row.row_id, None))
+                        .collect::<BTreeMap<_, _>>();
+                    self.apply_row_changes_to_table_row_source(
+                        &child.child_table.name,
+                        &row_changes,
+                        page_size,
+                    )?;
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
+                    }
+                    for child_row in &matching_children {
+                        self.mark_table_row_deleted(&child.child_table.name, child_row.row_id);
+                    }
+                }
+                crate::catalog::ForeignKeyAction::SetNull => {
+                    let mut row_changes = BTreeMap::new();
+                    for child_row in matching_children {
+                        let mut updated_values = child_row.values.clone();
+                        for child_index in &child.child_column_indexes {
+                            let column_index = *child_index;
+                            updated_values[column_index] = Value::Null;
+                        }
+                        self.validate_row_skip_fk(
+                            &child.child_table.name,
+                            &updated_values,
+                            Some(child_row.row_id),
+                            params,
+                        )?;
+                        row_changes.insert(child_row.row_id, Some(updated_values));
+                    }
+                    if !row_changes.is_empty() {
                         self.apply_row_changes_to_table_row_source(
-                            &child_table.name,
+                            &child.child_table.name,
                             &row_changes,
                             page_size,
                         )?;
-                        self.mark_indexes_stale_for_table(&child_table.name);
-                        self.mark_table_dirty(&child_table.name);
-                    }
-                    crate::catalog::ForeignKeyAction::SetNull => {
-                        let mut row_changes = BTreeMap::new();
-                        for child_row in matching_children {
-                            let mut updated_values = child_row.values.clone();
-                            for column_name in &foreign_key.columns {
-                                let column_index = child_table
-                                    .columns
-                                    .iter()
-                                    .position(|column| identifiers_equal(&column.name, column_name))
-                                    .ok_or_else(|| {
-                                        DbError::internal(format!(
-                                            "unknown child foreign-key column {}",
-                                            column_name
-                                        ))
-                                    })?;
-                                updated_values[column_index] = Value::Null;
-                            }
-                            self.validate_row_skip_fk(
-                                &child_table.name,
-                                &updated_values,
-                                Some(child_row.row_id),
-                                params,
-                            )?;
-                            row_changes.insert(child_row.row_id, Some(updated_values));
-                        }
-                        if !row_changes.is_empty() {
-                            self.apply_row_changes_to_table_row_source(
-                                &child_table.name,
-                                &row_changes,
-                                page_size,
-                            )?;
-                            self.mark_indexes_stale_for_table(&child_table.name);
-                            self.mark_table_dirty(&child_table.name);
-                        }
+                        self.mark_indexes_stale_for_table(&child.child_table.name);
+                        self.mark_table_dirty(&child.child_table.name);
                     }
                 }
             }
@@ -3147,15 +4868,26 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
-        if let Some(prepared) = self.prepare_simple_insert(statement)? {
+        if statement.returning.is_empty() {
+            if let Some(prepared) = self.prepare_simple_insert(statement)? {
+                return self
+                    .execute_prepared_simple_insert(&prepared, params, page_size)
+                    .map(Some);
+            }
+        } else if let Some(prepared) = self.prepare_simple_insert_with_returning(statement, true)? {
             return self
-                .execute_prepared_simple_insert(&prepared, params, page_size)
+                .execute_prepared_simple_insert_with_returning(
+                    &prepared,
+                    params,
+                    &statement.returning,
+                    page_size,
+                )
                 .map(Some);
         }
+
         if !self.can_execute_insert_in_place(statement) {
             return Ok(None);
         }
-
         let table_name = statement.table_name.clone();
         let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
         let source_row = source_rows
@@ -3218,6 +4950,83 @@ impl EngineRuntime {
         };
         Ok(Some(result))
     }
+}
+
+fn try_render_simple_returning(
+    table_schema: &TableSchema,
+    table_name: &str,
+    rows: &[StoredRow],
+    items: &[SelectItem],
+) -> Option<QueryResult> {
+    let mut column_names = Vec::new();
+    let mut projection_indexes = Vec::new();
+
+    for (item_index, item) in items.iter().enumerate() {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                let Expr::Column {
+                    table: column_table,
+                    column,
+                } = expr
+                else {
+                    return None;
+                };
+                if column_table
+                    .as_deref()
+                    .is_some_and(|qualified| !identifiers_equal(qualified, table_name))
+                {
+                    return None;
+                }
+                let column_index = table_schema
+                    .columns
+                    .iter()
+                    .position(|schema_column| identifiers_equal(&schema_column.name, column))?;
+                let schema_column = &table_schema.columns[column_index];
+                if schema_column.generated_sql.is_some() && !schema_column.generated_stored {
+                    return None;
+                }
+                projection_indexes.push(column_index);
+                column_names.push(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, item_index + 1)),
+                );
+            }
+            SelectItem::Wildcard => {
+                if !generated_columns_are_stored(table_schema) {
+                    return None;
+                }
+                for (column_index, schema_column) in table_schema.columns.iter().enumerate() {
+                    projection_indexes.push(column_index);
+                    column_names.push(schema_column.name.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(qualified_name) => {
+                if !identifiers_equal(qualified_name, table_name) {
+                    return None;
+                }
+                if !generated_columns_are_stored(table_schema) {
+                    return None;
+                }
+                for (column_index, schema_column) in table_schema.columns.iter().enumerate() {
+                    projection_indexes.push(column_index);
+                    column_names.push(schema_column.name.clone());
+                }
+            }
+        }
+    }
+
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let mut values = Vec::with_capacity(projection_indexes.len());
+            for column_index in &projection_indexes {
+                values.push(row.values[*column_index].clone());
+            }
+            QueryRow::new(values)
+        })
+        .collect();
+    Some(QueryResult::with_rows(column_names, rows))
 }
 
 fn can_execute_row_local_update_assignment_expr(expr: &Expr, table_name: &str) -> bool {
@@ -3291,6 +5100,65 @@ fn can_execute_row_local_update_assignment_expr(expr: &Expr, table_name: &str) -
         | Expr::CompareSubquery { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Exists(_) => false,
+    }
+}
+
+fn is_assignment_column_reference(expr: &Expr, table_name: &str, column_name: &str) -> bool {
+    match expr {
+        Expr::Column { table, column } => {
+            identifiers_equal(column, column_name)
+                && table
+                    .as_deref()
+                    .is_none_or(|candidate| identifiers_equal(candidate, table_name))
+        }
+        _ => false,
+    }
+}
+
+fn compile_int_arithmetic_update(
+    statement: &UpdateStatement,
+    table: &crate::catalog::TableSchema,
+    assignment_columns: &[usize],
+) -> Option<PreparedIntArithmeticUpdate> {
+    let ([assignment], [assignment_column]) = (&statement.assignments[..], assignment_columns)
+    else {
+        return None;
+    };
+
+    let column_name = &table.columns.get(*assignment_column)?.name;
+    let (delta_source, op) = match &assignment.expr {
+        Expr::Binary { left, op, right } if *op == BinaryOp::Add => {
+            let delta_source =
+                if is_assignment_column_reference(left, &statement.table_name, column_name) {
+                    compile_prepared_simple_value_source(right)?
+                } else if is_assignment_column_reference(right, &statement.table_name, column_name)
+                {
+                    compile_prepared_simple_value_source(left)?
+                } else {
+                    return None;
+                };
+            (delta_source, *op)
+        }
+        Expr::Binary { left, op, right }
+            if *op == BinaryOp::Sub
+                && is_assignment_column_reference(left, &statement.table_name, column_name) =>
+        {
+            (compile_prepared_simple_value_source(right)?, *op)
+        }
+        _ => return None,
+    };
+
+    match &delta_source {
+        PreparedSimpleValueSource::Literal(value)
+            if !matches!(value, Value::Int64(_) | Value::Float64(_)) =>
+        {
+            None
+        }
+        _ => Some(PreparedIntArithmeticUpdate {
+            column_index: *assignment_column,
+            op,
+            delta_source,
+        }),
     }
 }
 
@@ -3420,6 +5288,31 @@ fn compile_prepared_insert_value_source(expr: &Expr) -> Option<PreparedInsertVal
     match expr {
         Expr::Literal(value) => Some(PreparedInsertValueSource::Literal(value.clone())),
         Expr::Parameter(number) => Some(PreparedInsertValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            compile_prepared_insert_value_source(expr).map(|source| {
+                PreparedInsertValueSource::Cast {
+                    source: Box::new(source),
+                    target_type: *target_type,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn prepared_insert_source_direct_positional_param(
+    source: &PreparedInsertValueSource,
+    column_type: ColumnType,
+) -> Option<usize> {
+    match source {
+        PreparedInsertValueSource::Parameter(position) => Some(*position),
+        PreparedInsertValueSource::Cast {
+            source,
+            target_type,
+        } if *target_type == column_type => match source.as_ref() {
+            PreparedInsertValueSource::Parameter(position) => Some(*position),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3461,11 +5354,15 @@ fn prepare_btree_insert_index(
     let int64_key = index.columns.len() == 1
         && table.columns[column_indexes[0]].column_type == ColumnType::Int64
         && !table.columns[column_indexes[0]].nullable;
+    let uuid_key = index.columns.len() == 1
+        && table.columns[column_indexes[0]].column_type == ColumnType::Uuid
+        && !table.columns[column_indexes[0]].nullable;
 
     Ok(Some(PreparedBtreeIndex {
         name: index.name.clone(),
         column_indexes,
         int64_key,
+        uuid_key,
         has_covering_payload: !index.include_columns.is_empty(),
         covering_payload_column_indexes: prepare_btree_index_covering_payload_column_indexes(
             table, index,
@@ -3595,7 +5492,8 @@ fn validate_prepared_insert(
                     index.name
                 )));
             };
-            if keys.contains_any(&key) {
+            let row_ids = keys.row_ids_for_key(&key);
+            if row_ids_have_live_row(runtime, &prepared.table_name, row_ids)? {
                 return Err(DbError::constraint(format!(
                     "unique constraint {} on {} was violated",
                     index.name, prepared.table_name
@@ -3649,20 +5547,6 @@ fn validate_prepared_insert(
                 prepared.table_name, foreign_key.parent_table_name
             )));
         }
-        // When the parent table has not been modified in this transaction,
-        // the index is guaranteed to be consistent with the actual rows.
-        // Also safe when the parent table only had append-only inserts:
-        // inserts never remove rows, so any indexed row_id still exists.
-        if !runtime
-            .dirty_tables
-            .contains(&foreign_key.parent_table_name)
-            || runtime
-                .paged_mutations
-                .get(&foreign_key.parent_table_name)
-                .is_some_and(|delta| delta.updated_rows.is_empty() && delta.deleted_rows.is_empty())
-        {
-            continue;
-        }
         let Some(parent_rows) = runtime.visible_table_row_source(&foreign_key.parent_table_name)
         else {
             return Err(DbError::constraint(format!(
@@ -3670,6 +5554,23 @@ fn validate_prepared_insert(
                 foreign_key.parent_table_name
             )));
         };
+        // When the parent table has not been modified in this transaction,
+        // the index is guaranteed to be consistent with the actual rows.
+        // Also safe when the parent table only had append-only inserts:
+        // inserts never remove rows, so any indexed row_id still exists.
+        if !parent_rows.has_tombstoned_rows()
+            && (!runtime
+                .dirty_tables
+                .contains(&foreign_key.parent_table_name)
+                || runtime
+                    .paged_mutations
+                    .get(&foreign_key.parent_table_name)
+                    .is_some_and(|delta| {
+                        delta.updated_rows.is_empty() && delta.deleted_rows.is_empty()
+                    }))
+        {
+            continue;
+        }
         let mut exists = false;
         for row_id in matched_row_ids {
             if parent_rows.row_by_id(row_id)?.is_some() {
@@ -3716,22 +5617,7 @@ fn materialize_prepared_insert_candidate(
                 "prepared insert column index {index} is out of range for {table_name}"
             ))
         })?;
-        let mut value = match source {
-            PreparedInsertValueSource::Literal(value) => value.clone(),
-            PreparedInsertValueSource::Parameter(number) => params
-                .get(number.saturating_sub(1))
-                .cloned()
-                .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided")))?,
-            PreparedInsertValueSource::DefaultExpr(expr) => runtime.eval_expr(
-                expr,
-                &Dataset::empty(),
-                &[],
-                params,
-                &std::collections::BTreeMap::new(),
-                None,
-            )?,
-            PreparedInsertValueSource::Null => Value::Null,
-        };
+        let mut value = resolve_prepared_insert_value_source(runtime, source, params)?;
 
         if column.auto_increment {
             match value {
@@ -3756,6 +5642,36 @@ fn materialize_prepared_insert_candidate(
         candidate.push(cast_prepared_owned_value(value, column.column_type)?);
     }
     Ok(candidate)
+}
+
+fn resolve_prepared_insert_value_source(
+    runtime: &EngineRuntime,
+    source: &PreparedInsertValueSource,
+    params: &[Value],
+) -> Result<Value> {
+    match source {
+        PreparedInsertValueSource::Literal(value) => Ok(value.clone()),
+        PreparedInsertValueSource::Parameter(number) => params
+            .get(number.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+        PreparedInsertValueSource::Cast {
+            source,
+            target_type,
+        } => cast_prepared_owned_value(
+            resolve_prepared_insert_value_source(runtime, source, params)?,
+            *target_type,
+        ),
+        PreparedInsertValueSource::DefaultExpr(expr) => runtime.eval_expr(
+            expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        ),
+        PreparedInsertValueSource::Null => Ok(Value::Null),
+    }
 }
 
 fn materialize_direct_positional_insert_candidate(
@@ -3925,6 +5841,13 @@ fn apply_prepared_insert_index_updates(
     } else {
         None
     };
+    let unique_tombstone_cleanup_required =
+        prepared.insert_indexes.iter().any(|index| index.unique)
+            && prepared
+                .catalog_table_name
+                .as_deref()
+                .and_then(|table_name| runtime.tables.get(table_name))
+                .is_none_or(|row_source| row_source.has_tombstoned_rows());
     for index in &prepared.insert_indexes {
         if index.int64_key {
             let [column_index] = index.column_indexes.as_slice() else {
@@ -3952,6 +5875,14 @@ fn apply_prepared_insert_index_updates(
             } else {
                 None
             };
+            if index.unique && unique_tombstone_cleanup_required {
+                remove_tombstoned_unique_btree_entries_for_key(
+                    runtime,
+                    &prepared.table_name,
+                    &index.name,
+                    &RuntimeBtreeKey::Int64(*key),
+                )?;
+            }
             let Some(super::RuntimeIndex::Btree { keys, covering }) =
                 runtime.index_mut(&index.name)
             else {
@@ -3960,31 +5891,74 @@ fn apply_prepared_insert_index_updates(
                     index.name
                 )));
             };
-            match keys {
-                super::RuntimeBtreeKeys::UniqueInt64(entries) => {
-                    if check_unique && index.unique {
-                        if entries.insert(*key, row.row_id).is_some() {
-                            return Err(DbError::constraint(format!(
-                                "unique constraint {} on {} was violated",
-                                index.name, prepared.table_name
-                            )));
-                        }
-                    } else if entries.insert(*key, row.row_id).is_some() {
-                        return Err(DbError::internal(format!(
-                            "unique runtime BTREE index {} received a duplicate key insert",
-                            index.name
-                        )));
-                    }
+            let key = RuntimeBtreeKey::Int64(*key);
+            if check_unique && index.unique {
+                if keys.insert_row_id(key, row.row_id).is_err() {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, prepared.table_name
+                    )));
                 }
-                super::RuntimeBtreeKeys::NonUniqueInt64(entries) => {
-                    entries.entry(*key).or_default().push(row.row_id);
+            } else {
+                keys.insert_row_id(key, row.row_id)?;
+            }
+            if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                covering.insert_row_values(row.row_id, values);
+            }
+            continue;
+        }
+        if index.uuid_key {
+            let [column_index] = index.column_indexes.as_slice() else {
+                return Err(DbError::internal(
+                    "typed UUID prepared index expected exactly one indexed column",
+                ));
+            };
+            let Value::Uuid(key) = row
+                .values
+                .get(*column_index)
+                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+            else {
+                return Err(DbError::internal(
+                    "typed UUID prepared index expected a UUID value",
+                ));
+            };
+            let covering_values = if let Some(table) = table.as_ref() {
+                runtime
+                    .catalog
+                    .indexes
+                    .get(&index.name)
+                    .and_then(|index_schema| {
+                        covering_payload_values_for_row(index_schema, table, &row.values)
+                    })
+            } else {
+                None
+            };
+            if index.unique && unique_tombstone_cleanup_required {
+                remove_tombstoned_unique_btree_entries_for_key(
+                    runtime,
+                    &prepared.table_name,
+                    &index.name,
+                    &RuntimeBtreeKey::Uuid(*key),
+                )?;
+            }
+            let Some(super::RuntimeIndex::Btree { keys, covering }) =
+                runtime.index_mut(&index.name)
+            else {
+                return Err(DbError::internal(format!(
+                    "runtime index {} is missing",
+                    index.name
+                )));
+            };
+            let key = RuntimeBtreeKey::Uuid(*key);
+            if check_unique && index.unique {
+                if keys.insert_row_id(key, row.row_id).is_err() {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, prepared.table_name
+                    )));
                 }
-                _ => {
-                    return Err(DbError::internal(format!(
-                        "runtime index {} did not use typed INT64 keys as expected",
-                        index.name
-                    )))
-                }
+            } else {
+                keys.insert_row_id(key, row.row_id)?;
             }
             if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                 covering.insert_row_values(row.row_id, values);
@@ -4007,6 +5981,14 @@ fn apply_prepared_insert_index_updates(
         } else {
             None
         };
+        if index.unique && unique_tombstone_cleanup_required {
+            remove_tombstoned_unique_btree_entries_for_key(
+                runtime,
+                &prepared.table_name,
+                &index.name,
+                &key,
+            )?;
+        }
         let Some(super::RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
         else {
             return Err(DbError::internal(format!(
@@ -4050,6 +6032,22 @@ fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result
             ));
         };
         return Ok(RuntimeBtreeKey::Int64(*value));
+    }
+    if index.uuid_key {
+        let [column_index] = index.column_indexes.as_slice() else {
+            return Err(DbError::internal(
+                "typed UUID prepared index expected exactly one indexed column",
+            ));
+        };
+        let Value::Uuid(value) = row
+            .get(*column_index)
+            .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+        else {
+            return Err(DbError::internal(
+                "typed UUID prepared index expected a UUID value",
+            ));
+        };
+        return Ok(RuntimeBtreeKey::Uuid(*value));
     }
     if let [column_index] = index.column_indexes.as_slice() {
         let value = row
@@ -4278,6 +6276,11 @@ fn indexed_row_ids_for_filter(
     let Some(filter) = filter else {
         return Ok(None);
     };
+    if let Some(row_ids) =
+        row_id_range_row_ids_for_filter(runtime, table_ref, table, filter, params)?
+    {
+        return Ok(Some(row_ids));
+    }
     let Some((filter_table, column_name, value_expr)) = simple_btree_lookup_filter(filter) else {
         return Ok(None);
     };
@@ -4331,12 +6334,79 @@ fn indexed_row_ids_for_filter(
     };
     if matches!(
         keys,
-        super::RuntimeBtreeKeys::UniqueInt64(_) | super::RuntimeBtreeKeys::NonUniqueInt64(_)
+        super::RuntimeBtreeKeys::UniqueInt64(..) | super::RuntimeBtreeKeys::NonUniqueInt64(..)
     ) && !matches!(value, Value::Int64(_))
     {
         return Ok(None);
     }
     Ok(Some(row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)))
+}
+
+fn row_id_range_row_ids_for_filter(
+    runtime: &EngineRuntime,
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    filter: &Expr,
+    params: &[Value],
+) -> Result<Option<Vec<i64>>> {
+    let Some(row_id_column) = row_id_alias_column_name(table) else {
+        return Ok(None);
+    };
+    let Some((filter_table, column_name, low_expr, high_expr)) =
+        simple_row_id_between_filter(filter)
+    else {
+        return Ok(None);
+    };
+    if !identifiers_equal(column_name, row_id_column) {
+        return Ok(None);
+    }
+    if let Some(filter_table) = filter_table {
+        if !identifiers_equal(filter_table, &table.name)
+            && !identifiers_equal(filter_table, table_ref)
+        {
+            return Ok(None);
+        }
+    }
+
+    let low_value = runtime.eval_expr(
+        low_expr,
+        &Dataset::empty(),
+        &[],
+        params,
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
+    let high_value = runtime.eval_expr(
+        high_expr,
+        &Dataset::empty(),
+        &[],
+        params,
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
+    let (Value::Int64(low), Value::Int64(high)) = (low_value, high_value) else {
+        return Ok(None);
+    };
+    if high < low {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(width) = high
+        .checked_sub(low)
+        .and_then(|delta| delta.checked_add(1))
+        .and_then(|delta| usize::try_from(delta).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(row_source) = runtime.visible_table_row_source(table_ref) else {
+        return Ok(Some(Vec::new()));
+    };
+    let row_count = row_source.row_count();
+    let max_enumerated_range = row_count.saturating_mul(4).max(1024);
+    if width > max_enumerated_range {
+        return Ok(None);
+    }
+
+    Ok(Some(row_source.row_ids_in_range(low, high)))
 }
 
 pub(crate) fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> Option<&str> {
@@ -4351,23 +6421,114 @@ pub(crate) fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> O
         .map(|column| column.name.as_str())
 }
 
+fn simple_row_id_between_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr, &Expr)> {
+    let Expr::Between {
+        expr,
+        low,
+        high,
+        negated,
+    } = filter
+    else {
+        return None;
+    };
+    if *negated {
+        return None;
+    }
+    let Expr::Column { table, column } = expr.as_ref() else {
+        return None;
+    };
+    if !simple_constant_bound_expr(low) || !simple_constant_bound_expr(high) {
+        return None;
+    }
+    Some((
+        table.as_deref(),
+        column.as_str(),
+        low.as_ref(),
+        high.as_ref(),
+    ))
+}
+
+fn simple_constant_bound_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Cast { expr, .. } => simple_constant_bound_expr(expr),
+        _ => false,
+    }
+}
+
 fn row_id_set_to_vec(row_ids: RuntimeRowIdSet<'_>) -> Vec<i64> {
     let mut values = Vec::with_capacity(row_ids.len());
     row_ids.for_each(|row_id| values.push(row_id));
     values
 }
 
+fn row_ids_have_live_row<I>(runtime: &EngineRuntime, table_name: &str, row_ids: I) -> Result<bool>
+where
+    I: IntoIterator<Item = i64>,
+{
+    let mut row_ids = row_ids.into_iter();
+    let Some(row_source) = runtime.visible_table_row_source(table_name) else {
+        return Ok(row_ids.next().is_some());
+    };
+    for row_id in row_ids {
+        if row_source.row_by_id(row_id)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn row_id_set_has_live_row(
+    runtime: &EngineRuntime,
+    table_name: &str,
+    row_ids: RuntimeRowIdSet<'_>,
+) -> Result<bool> {
+    row_ids_have_live_row(runtime, table_name, row_id_set_to_vec(row_ids))
+}
+
+fn remove_tombstoned_unique_btree_entries_for_key(
+    runtime: &mut EngineRuntime,
+    table_name: &str,
+    index_name: &str,
+    key: &RuntimeBtreeKey,
+) -> Result<()> {
+    let Some(row_source) = runtime.visible_table_row_source(table_name) else {
+        return Ok(());
+    };
+    if !row_source.has_tombstoned_rows() {
+        return Ok(());
+    }
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+        return Ok(());
+    };
+    let mut stale_row_ids = Vec::new();
+    for row_id in keys.row_ids_for_key(key) {
+        if row_source.row_by_id(row_id)?.is_none() {
+            stale_row_ids.push(row_id);
+        }
+    }
+    if stale_row_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(index_name) else {
+        return Ok(());
+    };
+    for row_id in stale_row_ids {
+        keys.remove_row_id(key, row_id)?;
+        if let Some(covering) = covering.as_mut() {
+            covering.remove_row_id(row_id);
+        }
+    }
+    Ok(())
+}
+
 fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
-            (Expr::Column { table, column }, value)
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (Expr::Column { table, column }, value) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
-            (value, Expr::Column { table, column })
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (value, Expr::Column { table, column }) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
             _ => None,
@@ -4376,15 +6537,31 @@ fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Exp
     }
 }
 
+fn simple_btree_lookup_value_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Cast { expr, .. } => simple_btree_lookup_value_expr(expr),
+        _ => false,
+    }
+}
+
 fn compile_prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
     match expr {
         Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
         Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            compile_prepared_simple_value_source(expr).map(|source| {
+                PreparedSimpleValueSource::Cast {
+                    source: Box::new(source),
+                    target_type: *target_type,
+                }
+            })
+        }
         _ => None,
     }
 }
 
-fn resolve_prepared_simple_value(
+pub(crate) fn resolve_prepared_simple_value(
     source: &PreparedSimpleValueSource,
     params: &[Value],
 ) -> Result<Value> {
@@ -4394,6 +6571,44 @@ fn resolve_prepared_simple_value(
             .get(number.saturating_sub(1))
             .cloned()
             .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+        PreparedSimpleValueSource::Cast {
+            source,
+            target_type,
+        } => {
+            cast_prepared_simple_value(resolve_prepared_simple_value(source, params)?, *target_type)
+        }
+    }
+}
+
+fn resolve_prepared_simple_update_row_id(
+    runtime: &EngineRuntime,
+    prepared: &PreparedSimpleUpdate,
+    params: &[Value],
+) -> Result<Option<i64>> {
+    match &prepared.lookup {
+        PreparedSimpleUpdateLookup::RowId(value_source) => {
+            Ok(match resolve_prepared_simple_value(value_source, params)? {
+                Value::Int64(value) => Some(value),
+                _ => None,
+            })
+        }
+        PreparedSimpleUpdateLookup::UniqueIndex {
+            index_name,
+            value_source,
+        } => {
+            let value = resolve_prepared_simple_value(value_source, params)?;
+            if matches!(value, Value::Null) {
+                return Ok(None);
+            }
+            let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+                return Ok(None);
+            };
+            let row_ids = row_id_set_to_vec(keys.row_ids_for_value_set(&value)?);
+            Ok(match row_ids.as_slice() {
+                [row_id] => Some(*row_id),
+                _ => None,
+            })
+        }
     }
 }
 
@@ -4459,31 +6674,481 @@ fn prepare_simple_delete_restrict_children(
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
-            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
-                (identifiers_equal(&index.table_name, &child_table.name)
-                    && index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == foreign_key.columns.len()
-                    && index.columns.iter().zip(&foreign_key.columns).all(
-                        |(index_column, foreign_key_column)| {
-                            index_column.expression_sql.is_none()
-                                && index_column.column_name.as_ref().is_some_and(|entry| {
-                                    identifiers_equal(entry, foreign_key_column)
-                                })
-                        },
-                    ))
-                .then(|| index.name.clone())
-            });
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
             prepared.push(PreparedSimpleDeleteRestrictChild {
                 child_table_name: child_table.name.clone(),
                 child_column_indexes,
                 child_index_name,
+                child_index_prefix_len,
                 parent_column_indexes,
             });
         }
     }
     Ok(Some(prepared))
+}
+
+fn prepare_simple_delete_prepared_restrict_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Option<Vec<PreparedSimpleDeleteRestrictChild>>> {
+    if table.temporary {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut prepared = Vec::new();
+    for child_table in runtime.catalog.tables.values().filter(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+    }) {
+        for foreign_key in child_table
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+        {
+            match foreign_key.on_delete {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {}
+                ForeignKeyAction::Cascade => continue,
+                ForeignKeyAction::SetNull => return Ok(None),
+            }
+            if foreign_key.columns.is_empty() {
+                return Ok(None);
+            }
+            let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+                table.primary_key_columns.clone()
+            } else {
+                foreign_key.referenced_columns.clone()
+            };
+            if referenced_columns.len() != foreign_key.columns.len() {
+                return Ok(None);
+            }
+            let parent_column_indexes = referenced_columns
+                .iter()
+                .map(|referenced_column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, referenced_column))
+                        .ok_or(())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| DbError::internal("parent foreign-key column is missing"))?;
+            let child_column_indexes = foreign_key
+                .columns
+                .iter()
+                .map(|child_column| {
+                    child_table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, child_column))
+                        .ok_or(())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
+            prepared.push(PreparedSimpleDeleteRestrictChild {
+                child_table_name: child_table.name.clone(),
+                child_column_indexes,
+                child_index_name,
+                child_index_prefix_len,
+                parent_column_indexes,
+            });
+        }
+    }
+    Ok(Some(prepared))
+}
+
+fn prepare_simple_delete_cascade_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Option<Vec<PreparedDeleteCascadeChild>>> {
+    if table.temporary {
+        return Ok(Some(Vec::new()));
+    }
+
+    let children = collect_parent_delete_children(runtime, table)?;
+    if children
+        .iter()
+        .any(|child| matches!(child.foreign_key.on_delete, ForeignKeyAction::SetNull))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        children
+            .into_iter()
+            .filter(|child| matches!(child.foreign_key.on_delete, ForeignKeyAction::Cascade))
+            .collect(),
+    ))
+}
+
+fn collect_parent_delete_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Vec<PreparedDeleteCascadeChild>> {
+    let mut children = Vec::new();
+    for child_table in runtime.catalog.tables.values() {
+        if !child_table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+        {
+            continue;
+        }
+        for foreign_key in child_table
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+        {
+            let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+                table.primary_key_columns.as_slice()
+            } else {
+                foreign_key.referenced_columns.as_slice()
+            };
+            let foreign_key_columns_match = referenced_columns.len() == foreign_key.columns.len();
+            let parent_column_indexes = referenced_columns
+                .iter()
+                .map(|referenced_column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, referenced_column))
+                        .ok_or_else(|| DbError::internal("parent foreign-key column is missing"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let child_column_indexes = foreign_key
+                .columns
+                .iter()
+                .map(|column| {
+                    child_table
+                        .columns
+                        .iter()
+                        .position(|entry| identifiers_equal(&entry.name, column))
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "child foreign-key column {} is missing",
+                                column
+                            ))
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && !foreign_key.columns.is_empty()
+                        && foreign_key_columns_match
+                        && foreign_key.columns.len() == child_column_indexes.len()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
+            children.push(PreparedDeleteCascadeChild {
+                child_table: child_table.clone(),
+                foreign_key: foreign_key.clone(),
+                parent_column_indexes,
+                child_column_indexes,
+                child_index_name,
+                child_index_prefix_len,
+            });
+        }
+    }
+    Ok(children)
+}
+
+fn prepare_delete_children_and_indexes(
+    runtime: &EngineRuntime,
+    root_table: &crate::catalog::TableSchema,
+) -> Result<(DeleteChildrenByTable, TableIndexesByTable)> {
+    let mut delete_children_by_table = BTreeMap::new();
+    let mut table_indexes_by_table = BTreeMap::new();
+    let mut queue = VecDeque::from([root_table.name.clone()]);
+    let mut visited = HashSet::new();
+
+    while let Some(table_name) = queue.pop_front() {
+        if !visited.insert(table_name.clone()) {
+            continue;
+        }
+
+        let Some(table) = runtime.table_schema(&table_name) else {
+            return Err(DbError::internal(format!("table {table_name} is missing")));
+        };
+
+        let children = collect_parent_delete_children(runtime, table)?;
+        let child_names = children
+            .iter()
+            .map(|child| child.child_table.name.clone())
+            .collect::<Vec<_>>();
+        delete_children_by_table.insert(table_name.clone(), children);
+
+        let table_indexes = runtime
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        table_indexes_by_table.insert(table_name.clone(), table_indexes);
+
+        for child_name in child_names {
+            if !visited.contains(&child_name) {
+                queue.push_back(child_name);
+            }
+        }
+    }
+
+    Ok((delete_children_by_table, table_indexes_by_table))
+}
+
+fn matching_foreign_key_children_for_parent_rows(
+    runtime: &EngineRuntime,
+    _table: &crate::catalog::TableSchema,
+    parent_rows: &[StoredRow],
+    child: &PreparedDeleteCascadeChild,
+) -> Result<Vec<StoredRow>> {
+    let mut parent_keys = Vec::with_capacity(parent_rows.len());
+    for row in parent_rows {
+        let mut parent_key = Vec::with_capacity(child.parent_column_indexes.len());
+        let mut has_null = false;
+        for column_index in &child.parent_column_indexes {
+            let Some(value) = row.values.get(*column_index) else {
+                return Err(DbError::internal(format!(
+                    "parent column index {} is invalid",
+                    column_index
+                )));
+            };
+            if matches!(value, Value::Null) {
+                has_null = true;
+                break;
+            }
+            parent_key.push(value.clone());
+        }
+        if !has_null {
+            parent_keys.push(parent_key);
+        }
+    }
+    if parent_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(row_source) = runtime.visible_table_row_source(&child.child_table.name) else {
+        return Ok(Vec::new());
+    };
+
+    let Some(index_name) = child.child_index_name.as_deref() else {
+        return collect_matching_foreign_key_children(
+            runtime,
+            &row_source,
+            &child.child_table,
+            &parent_keys,
+            &child.child_column_indexes,
+        );
+    };
+    let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+        return collect_matching_foreign_key_children(
+            runtime,
+            &row_source,
+            &child.child_table,
+            &parent_keys,
+            &child.child_column_indexes,
+        );
+    };
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+        return collect_matching_foreign_key_children(
+            runtime,
+            &row_source,
+            &child.child_table,
+            &parent_keys,
+            &child.child_column_indexes,
+        );
+    };
+
+    let use_prefix_scan = child
+        .child_index_prefix_len
+        .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
+    let mut matching_children = BTreeMap::<i64, StoredRow>::new();
+    if use_prefix_scan {
+        let parent_key_refs = parent_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let row_ids = keys.row_ids_for_encoded_key_prefixes(&parent_key_refs)?;
+        for row_id in row_ids {
+            let Some(row) = row_source.row_by_id(row_id)? else {
+                continue;
+            };
+            let stored_row = materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
+            for parent_key in &parent_keys {
+                if foreign_key_child_matches_parent_key(
+                    &stored_row.values,
+                    &child.child_column_indexes,
+                    parent_key,
+                )? {
+                    matching_children.insert(stored_row.row_id, stored_row);
+                    break;
+                }
+            }
+        }
+    } else {
+        for parent_key in &parent_keys {
+            let row_ids = if child.foreign_key.columns.len() == 1 {
+                let Some(parent_value) = parent_key.first() else {
+                    continue;
+                };
+                keys.row_ids_for_value(parent_value)?
+            } else {
+                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+                    Row::new(parent_key.clone()).encode()?,
+                ))
+            };
+            for row_id in row_ids {
+                let Some(row) = row_source.row_by_id(row_id)? else {
+                    continue;
+                };
+                let stored_row =
+                    materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
+                if foreign_key_child_matches_parent_key(
+                    &stored_row.values,
+                    &child.child_column_indexes,
+                    parent_key,
+                )? {
+                    matching_children.insert(stored_row.row_id, stored_row);
+                }
+            }
+        }
+    }
+    Ok(matching_children.into_values().collect())
+}
+
+fn collect_matching_foreign_key_children(
+    runtime: &EngineRuntime,
+    row_source: &super::VisibleTableRowSource<'_>,
+    child_table: &crate::catalog::TableSchema,
+    parent_keys: &[Vec<Value>],
+    child_column_indexes: &[usize],
+) -> Result<Vec<StoredRow>> {
+    let mut parent_key_set = HashSet::with_capacity(parent_keys.len());
+    for parent_key in parent_keys {
+        parent_key_set.insert(foreign_key_parent_key(parent_key)?);
+    }
+    if parent_key_set.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut matching_children = BTreeMap::<i64, StoredRow>::new();
+    for row in row_source.rows() {
+        let row = row?;
+        let stored_row = materialize_foreign_key_child_row(runtime, child_table, row)?;
+        let child_key =
+            foreign_key_row_key_for_child_columns(&stored_row.values, child_column_indexes)?;
+        if let Some(child_key) = child_key {
+            if parent_key_set.contains(&child_key) {
+                matching_children.insert(stored_row.row_id, stored_row);
+            }
+        }
+    }
+    Ok(matching_children.into_values().collect())
+}
+
+fn foreign_key_parent_key(parent_key: &[Value]) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    for value in parent_key {
+        let value_key = encode_index_key(value)?;
+        let value_key_len = u32::try_from(value_key.len())
+            .map_err(|_| DbError::internal("foreign-key index key length exceeds u32"))?;
+        key.extend_from_slice(&value_key_len.to_le_bytes());
+        key.extend_from_slice(&value_key);
+    }
+    Ok(key)
+}
+
+fn foreign_key_row_key_for_child_columns(
+    child_row: &[Value],
+    child_column_indexes: &[usize],
+) -> Result<Option<Vec<u8>>> {
+    if child_column_indexes.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut child_key_values = Vec::with_capacity(child_column_indexes.len());
+    for child_column_index in child_column_indexes {
+        let Some(child_value) = child_row.get(*child_column_index) else {
+            return Err(DbError::internal(format!(
+                "child foreign-key column index {child_column_index} exceeded row width {}",
+                child_row.len()
+            )));
+        };
+        if matches!(child_value, Value::Null) {
+            return Ok(None);
+        }
+        child_key_values.push(child_value.clone());
+    }
+    if child_key_values.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    foreign_key_parent_key(&child_key_values).map(Some)
 }
 
 fn prepared_delete_has_referencing_child(
@@ -4507,17 +7172,35 @@ fn prepared_delete_has_referencing_child(
         return Ok(false);
     }
     if let Some(index_name) = &child.child_index_name {
+        let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+            return Ok(false);
+        };
         let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
             return Ok(false);
         };
-        if parent_values.len() == 1 {
-            return Ok(!keys.row_ids_for_value_set(parent_values[0])?.is_empty());
+        let use_prefix_scan = child
+            .child_index_prefix_len
+            .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
+        if use_prefix_scan {
+            let row_ids = keys.row_ids_for_encoded_key_prefix(
+                &parent_values
+                    .iter()
+                    .map(|value| (*value).clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            return row_ids_have_live_row(runtime, &child.child_table_name, row_ids);
         }
-        return Ok(!keys
-            .row_ids_for_key(&RuntimeBtreeKey::Encoded(
-                Row::new(parent_values.iter().map(|value| (*value).clone()).collect()).encode()?,
-            ))
-            .is_empty());
+        if parent_values.len() == 1 {
+            return row_id_set_has_live_row(
+                runtime,
+                &child.child_table_name,
+                keys.row_ids_for_value_set(parent_values[0])?,
+            );
+        }
+        let row_ids = keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+            Row::new(parent_values.iter().map(|value| (*value).clone()).collect()).encode()?,
+        ));
+        return row_ids_have_live_row(runtime, &child.child_table_name, row_ids);
     }
     let Some(row_source) = runtime.visible_table_row_source(&child.child_table_name) else {
         return Ok(false);
@@ -4567,11 +7250,23 @@ fn apply_runtime_index_update_for_row_change(
             else {
                 return Ok(false);
             };
-            if let Some(old_key) = old_key.as_ref() {
-                keys.remove_row_id(old_key, row_id)?;
+            let new_key_present = new_key.is_some();
+            match (old_key.as_ref(), new_key) {
+                (Some(old_key), Some(new_key)) => {
+                    if !keys.move_row_id(old_key, new_key.clone(), row_id)? {
+                        keys.remove_row_id(old_key, row_id)?;
+                        keys.insert_row_id(new_key, row_id)?;
+                    }
+                }
+                (Some(old_key), None) => {
+                    keys.remove_row_id(old_key, row_id)?;
+                }
+                (None, Some(new_key)) => {
+                    keys.insert_row_id(new_key, row_id)?;
+                }
+                (None, None) => {}
             }
-            if let Some(new_key) = new_key {
-                keys.insert_row_id(new_key, row_id)?;
+            if new_key_present {
                 if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                     covering.insert_row_values(row_id, values);
                 }
@@ -4636,38 +7331,209 @@ fn apply_runtime_index_update_for_row_change(
     }
 }
 
-fn apply_runtime_index_delete_for_row(
+fn apply_runtime_index_delete_for_rows(
     runtime: &mut EngineRuntime,
     table: &crate::catalog::TableSchema,
     index: &crate::catalog::IndexSchema,
-    row_id: i64,
-    row_values: &[Value],
+    rows: &[StoredRow],
+) -> Result<bool> {
+    apply_runtime_index_delete_for_rows_with_predicate(runtime, table, index, rows, None, None)
+}
+
+fn incremental_delete_indexes_by_row_id(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<Vec<String>> {
+    let mut stale_indexes = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let applied = match index.kind {
+            IndexKind::Btree => {
+                if let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+                {
+                    keys.mark_row_ids_deleted(row_ids.iter().copied());
+                    if let Some(covering) = covering.as_mut() {
+                        for row_id in row_ids {
+                            covering.remove_row_id(*row_id);
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            IndexKind::FullText => {
+                let row_ids = row_ids
+                    .iter()
+                    .map(|row_id| {
+                        u64::try_from(*row_id)
+                            .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(RuntimeIndex::FullText { index: fulltext }) =
+                    runtime.index_mut(&index.name)
+                {
+                    fulltext.delete_documents(row_ids);
+                    true
+                } else {
+                    false
+                }
+            }
+            IndexKind::Trigram => {
+                apply_trigram_delete_by_row_id(runtime, table, index, row_ids, row_source)?
+            }
+            IndexKind::Spatial => {
+                let rows = materialize_rows_for_delete(row_ids, row_source)?;
+                apply_runtime_index_delete_for_rows(runtime, table, index, &rows)?
+            }
+        };
+        if !applied {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+fn apply_trigram_delete_by_row_id(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<bool> {
+    let Some(position) = plain_single_text_index_column_position(index, table) else {
+        let rows = materialize_rows_for_delete(row_ids, row_source)?;
+        return apply_runtime_index_delete_for_rows(runtime, table, index, &rows);
+    };
+    let mut deletions = Vec::new();
+    for row_id in row_ids {
+        let row = row_source
+            .row_by_id(*row_id)?
+            .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during DELETE")))?;
+        let Some(Value::Text(text)) = row.values().get(position) else {
+            continue;
+        };
+        let row_id = u64::try_from(*row_id)
+            .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
+        deletions.push((row_id, text.clone()));
+    }
+    let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name) else {
+        return Ok(false);
+    };
+    trigram.queue_delete_documents(deletions);
+    Ok(true)
+}
+
+fn materialize_rows_for_delete(
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<Vec<StoredRow>> {
+    let mut rows = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        let row = row_source
+            .row_by_id(*row_id)?
+            .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during DELETE")))?;
+        rows.push(StoredRow {
+            row_id: *row_id,
+            values: row.values().to_vec(),
+        });
+    }
+    Ok(rows)
+}
+
+fn apply_runtime_index_delete_for_rows_with_predicate(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    rows: &[StoredRow],
+    pre_parsed_predicate: Option<&Expr>,
+    shared_predicate: Option<&Expr>,
 ) -> Result<bool> {
     match index.kind {
-        IndexKind::Btree => {
-            let key = compute_index_key(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+        IndexKind::FullText => {
+            let row_ids = rows
+                .iter()
+                .map(|row| {
+                    u64::try_from(row.row_id)
+                        .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
-            if let Some(key) = key.as_ref() {
-                keys.remove_row_id(key, row_id)?;
-            }
-            if let Some(covering) = covering.as_mut() {
-                covering.remove_row_id(row_id);
-            }
+            fulltext.delete_documents(row_ids);
             Ok(true)
         }
         IndexKind::Trigram => {
-            let text = trigram_index_text_for_row(runtime, index, table, row_values)?;
+            let predicate_expr = pre_parsed_predicate.or(shared_predicate);
+            let mut deletions = Vec::new();
+            for row in rows {
+                if let Some(text) = trigram_index_text_for_row_with_expr(
+                    runtime,
+                    index,
+                    table,
+                    &row.values,
+                    predicate_expr,
+                )? {
+                    let row_id = u64::try_from(row.row_id).map_err(|_| {
+                        DbError::internal(format!("row_id {} is invalid", row.row_id))
+                    })?;
+                    deletions.push((row_id, text));
+                }
+            }
             let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
-            if let Some(text) = text {
-                let row_id = u64::try_from(row_id)
-                    .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
-                trigram.queue_delete(row_id, &text);
+            trigram.queue_delete_documents(deletions);
+            Ok(true)
+        }
+        IndexKind::Btree => {
+            if index.predicate_sql.is_none() && !index.unique {
+                let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+                else {
+                    return Ok(false);
+                };
+                keys.mark_row_ids_deleted(rows.iter().map(|row| row.row_id));
+                if let Some(covering) = covering.as_mut() {
+                    for row in rows {
+                        covering.remove_row_id(row.row_id);
+                    }
+                }
+                return Ok(true);
+            }
+            let predicate_expr = pre_parsed_predicate.or(shared_predicate);
+            let prepared_keys = rows
+                .iter()
+                .map(|row| {
+                    let key = super::compute_index_key_with_predicate(
+                        runtime,
+                        index,
+                        table,
+                        &row.values,
+                        predicate_expr,
+                    )?;
+                    Ok((row.row_id, key))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            for (row_id, key) in prepared_keys {
+                if let Some(key) = key {
+                    keys.remove_row_id(&key, row_id)?;
+                }
+                if let Some(covering) = covering.as_mut() {
+                    covering.remove_row_id(row_id);
+                }
             }
             Ok(true)
         }
@@ -4676,20 +7542,205 @@ fn apply_runtime_index_delete_for_row(
             else {
                 return Ok(false);
             };
-            spatial.remove(row_id);
+            for row in rows {
+                spatial.remove(row.row_id);
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn apply_runtime_index_insert_for_row(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    row: &StoredRow,
+) -> Result<bool> {
+    match index.kind {
+        IndexKind::Btree => {
+            let key = compute_index_key(runtime, index, table, &row.values)?;
+            let covering_values = covering_payload_values_for_row(index, table, &row.values);
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(key) = key {
+                keys.insert_row_id(key, row.row_id)?;
+                if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                    covering.insert_row_values(row.row_id, values);
+                }
+            } else if let Some(covering) = covering.as_mut() {
+                covering.remove_row_id(row.row_id);
+            }
+            Ok(true)
+        }
+        IndexKind::Trigram => {
+            let text = trigram_index_text_for_row(runtime, index, table, &row.values)?;
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(text) = text {
+                let row_id = u64::try_from(row.row_id)
+                    .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))?;
+                trigram.queue_insert(row_id, &text);
+            }
+            Ok(true)
+        }
+        IndexKind::Spatial => {
+            let value = spatial_index_value_for_row(runtime, index, table, &row.values)?;
+            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(value) = value {
+                spatial
+                    .insert(row.row_id, value)
+                    .map_err(|error| DbError::constraint(error.to_string()))?;
+            }
             Ok(true)
         }
         IndexKind::FullText => {
+            let fields = full_text_fields_for_row(runtime, index, table, &row.values)?;
             let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
-            let row_id = u64::try_from(row_id)
-                .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
-            fulltext.delete_document(row_id);
+            let row_id = u64::try_from(row.row_id)
+                .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))?;
+            let refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+            fulltext.insert_document(row_id, &refs);
             Ok(true)
         }
     }
+}
+
+/// Apply per-row incremental index updates for a delete. Returns the names of
+/// indexes that could not be updated incrementally (and therefore need to be
+/// rebuilt on next access) as a deduplicated, catalog-stable-order list.
+///
+/// Indexes that successfully update incrementally stay in place — discarding
+/// them and rebuilding from scratch (the previous behavior) would force an
+/// expensive `rebuild_stale_indexes` pass at commit for indexes that are still
+/// correct, especially the fulltext and trigram search indexes whose
+/// incremental update is O(terms in document).
+fn incremental_delete_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+) -> Result<Vec<String>> {
+    incremental_delete_indexes_with_predicate(runtime, table, table_indexes, rows, None)
+}
+
+/// Same as [`incremental_delete_indexes`], but optionally accepts a pre-parsed
+/// predicate expression shared across all rows in the batch. The expression is
+/// parsed once instead of per-row.
+fn incremental_delete_indexes_with_predicate(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+    shared_predicate_expr: Option<&Expr>,
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        // Pre-parse this index's predicate once instead of re-parsing it for
+        // every row. `row_satisfies_index_predicate` re-parses via
+        // `parse_expression_sql` on every call, which dominated wall time for
+        // bulk DML on tables with partial indexes.
+        let per_index_predicate = if shared_predicate_expr.is_some() {
+            None
+        } else {
+            super::prepare_index_predicate_expr(index)?
+        };
+        let predicate_expr = per_index_predicate.as_ref().or(shared_predicate_expr);
+        if !apply_runtime_index_delete_for_rows_with_predicate(
+            runtime,
+            table,
+            index,
+            rows,
+            predicate_expr,
+            shared_predicate_expr,
+        )? {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+/// Apply per-row incremental index updates for an insert. Returns the names of
+/// indexes that could not be updated incrementally.
+///
+/// See [`incremental_delete_indexes`] for the rationale.
+#[allow(dead_code)]
+fn incremental_insert_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let mut failed = false;
+        for row in rows {
+            if !apply_runtime_index_insert_for_row(runtime, table, index, row)? {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+/// Apply per-row incremental index updates for an update of the form
+/// `old_row -> new_row`. Returns the names of indexes that could not be
+/// updated incrementally.
+///
+/// See [`incremental_delete_indexes`] for the rationale.
+#[allow(dead_code)]
+fn incremental_update_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    changes: &[(StoredRow, StoredRow)],
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let mut failed = false;
+        for (old_row, new_row) in changes {
+            if !apply_runtime_index_update_for_row_change(
+                runtime,
+                table,
+                index,
+                old_row.row_id,
+                &old_row.values,
+                &new_row.values,
+            )? {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
 }
 
 fn full_text_fields_for_row(
@@ -4719,7 +7770,23 @@ fn trigram_index_text_for_row(
     table: &crate::catalog::TableSchema,
     row_values: &[Value],
 ) -> Result<Option<String>> {
-    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+    trigram_index_text_for_row_with_expr(runtime, index, table, row_values, None)
+}
+
+fn trigram_index_text_for_row_with_expr(
+    runtime: &EngineRuntime,
+    index: &crate::catalog::IndexSchema,
+    table: &crate::catalog::TableSchema,
+    row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
+) -> Result<Option<String>> {
+    if !row_satisfies_index_predicate_with_expr(
+        runtime,
+        index,
+        table,
+        row_values,
+        pre_parsed_predicate,
+    )? {
         return Ok(None);
     }
     let value = compute_index_values(runtime, index, table, row_values)?
@@ -5091,43 +8158,138 @@ fn index_might_change_for_assignments(
     index: &crate::catalog::IndexSchema,
     assignment_columns: &[usize],
 ) -> bool {
-    if index.predicate_sql.is_some() || index.columns.is_empty() {
+    if index.columns.is_empty() {
         return true;
     }
-    let Some(indexed_columns) = index
-        .columns
+    let assignment_column_names = assignment_columns
         .iter()
-        .map(|column| {
-            if column.expression_sql.is_some() {
-                return None;
+        .filter_map(|column_index| table.columns.get(*column_index))
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    if let Some(predicate_sql) = index.predicate_sql.as_deref() {
+        let Ok(predicate) = parse_expression_sql(predicate_sql) else {
+            return true;
+        };
+        if expr_references_columns(&predicate, table, &assignment_column_names) {
+            return true;
+        }
+    }
+    for column in &index.columns {
+        if let Some(expression_sql) = column.expression_sql.as_deref() {
+            let Ok(expression) = parse_expression_sql(expression_sql) else {
+                return true;
+            };
+            if expr_references_columns(&expression, table, &assignment_column_names) {
+                return true;
             }
-            column.column_name.as_ref().and_then(|name| {
-                table
-                    .columns
+            continue;
+        }
+        let Some(column_name) = column.column_name.as_deref() else {
+            return true;
+        };
+        let Some(column_index) = table
+            .columns
+            .iter()
+            .position(|entry| identifiers_equal(&entry.name, column_name))
+        else {
+            return true;
+        };
+        if assignment_columns.contains(&column_index) {
+            return true;
+        }
+    }
+    for include_column in &index.include_columns {
+        let Some(column_index) = table
+            .columns
+            .iter()
+            .position(|entry| identifiers_equal(&entry.name, include_column))
+        else {
+            return true;
+        };
+        if assignment_columns.contains(&column_index) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_references_columns(
+    expr: &Expr,
+    table: &crate::catalog::TableSchema,
+    column_names: &[&str],
+) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Column {
+            table: expr_table,
+            column,
+        } => {
+            expr_table
+                .as_deref()
+                .is_none_or(|candidate| identifiers_equal(candidate, &table.name))
+                && column_names
                     .iter()
-                    .position(|entry| identifiers_equal(&entry.name, name))
-            })
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return true;
-    };
-    let Some(include_columns) = index
-        .include_columns
-        .iter()
-        .map(|name| {
-            table
-                .columns
-                .iter()
-                .position(|entry| identifiers_equal(&entry.name, name))
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return true;
-    };
-    assignment_columns.iter().any(|column_index| {
-        indexed_columns.contains(column_index) || include_columns.contains(column_index)
-    })
+                    .any(|candidate| identifiers_equal(candidate, column))
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_references_columns(expr, table, column_names)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_references_columns(left, table, column_names)
+                || expr_references_columns(right, table, column_names)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_columns(expr, table, column_names)
+                || expr_references_columns(low, table, column_names)
+                || expr_references_columns(high, table, column_names)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_references_columns(expr, table, column_names)
+                || items
+                    .iter()
+                    .any(|item| expr_references_columns(item, table, column_names))
+        }
+        Expr::InSubquery { .. } | Expr::CompareSubquery { .. } | Expr::ScalarSubquery(_) => true,
+        Expr::Exists(_) => true,
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references_columns(expr, table, column_names)
+                || expr_references_columns(pattern, table, column_names)
+                || escape
+                    .as_deref()
+                    .is_some_and(|escape| expr_references_columns(escape, table, column_names))
+        }
+        Expr::IsNull { expr, .. } => expr_references_columns(expr, table, column_names),
+        Expr::Function { args, .. } => args
+            .iter()
+            .any(|arg| expr_references_columns(arg, table, column_names)),
+        Expr::Aggregate { .. } | Expr::RowNumber { .. } | Expr::WindowFunction { .. } => true,
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_references_columns(expr, table, column_names))
+                || branches.iter().any(|(condition, result)| {
+                    expr_references_columns(condition, table, column_names)
+                        || expr_references_columns(result, table, column_names)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_references_columns(expr, table, column_names))
+        }
+        Expr::Row(items) => items
+            .iter()
+            .any(|item| expr_references_columns(item, table, column_names)),
+    }
 }
 
 fn assignment_targets_foreign_key_columns(
@@ -5225,6 +8387,505 @@ mod tests {
         runtime
             .execute_statement(&statement, &[], 4096)
             .expect("execute SQL");
+    }
+
+    fn query_sql(runtime: &mut EngineRuntime, sql: &str) -> QueryResult {
+        let statement = crate::sql::parser::parse_sql_statement(sql).expect("parse SQL");
+        runtime
+            .execute_statement(&statement, &[], 4096)
+            .expect("execute SQL")
+    }
+
+    #[test]
+    fn resident_row_changes_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=100_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = (1_i64..=70_i64)
+            .map(|row_id| (row_id, None))
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .visible_rows()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, (71_i64..=100_i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resident_row_changes_large_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=5000_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = [(100_i64, None), (4000_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        assert_eq!(table_data.row_count(), 4998);
+        assert!(table_data.row_by_id(100).is_none());
+        assert!(table_data.row_by_id(4000).is_none());
+        assert_eq!(
+            table_data.row_by_id(99).unwrap().values[0],
+            Value::Int64(99)
+        );
+        assert_eq!(
+            table_data.row_by_id(4001).unwrap().values[0],
+            Value::Int64(4001)
+        );
+    }
+
+    #[test]
+    fn resident_row_changes_large_small_pure_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=4096_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = [(2_i64, None), (4096_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        assert_eq!(table_data.row_count(), 4094);
+        assert!(table_data.row_by_id(2).is_none());
+        assert!(table_data.row_by_id(4096).is_none());
+        assert_eq!(table_data.row_by_id(1).unwrap().values[0], Value::Int64(1));
+        assert_eq!(
+            table_data.row_by_id(4095).unwrap().values[0],
+            Value::Int64(4095)
+        );
+    }
+
+    #[test]
+    fn resident_row_changes_medium_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=20_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = (1_i64..=9_i64)
+            .map(|row_id| (row_id, None))
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .visible_rows()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, (10_i64..=20_i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resident_row_changes_unsorted_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(vec![
+            StoredRow {
+                row_id: 10,
+                values: vec![Value::Int64(10)],
+            },
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 7,
+                values: vec![Value::Int64(7)],
+            },
+            StoredRow {
+                row_id: 3,
+                values: vec![Value::Int64(3)],
+            },
+        ]);
+        let row_changes = [(1_i64, None), (7_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .visible_rows()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![10, 3]);
+    }
+
+    #[test]
+    fn uuid_btree_index_uses_typed_runtime_keys() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies(id INT64 PRIMARY KEY, external_id UUID NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE UNIQUE INDEX idx_movies_external_id ON movies(external_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies(id, external_id) VALUES \
+             (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440000')), \
+             (2, UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'))",
+        );
+
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_movies_external_id") else {
+            panic!("expected runtime btree index");
+        };
+        let super::super::RuntimeBtreeKeys::UniqueUuid(entries, _) = keys else {
+            panic!("expected typed UUID runtime keys");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&[
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]));
+    }
+
+    #[test]
+    fn prepared_simple_delete_caches_cascade_children() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id UUID REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second'), (UUID_PARSE('550e8400-e29b-41d4-a716-446655440003'), 'Third')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'child')",
+        );
+
+        let statement = crate::sql::parser::parse_sql_statement(
+            "DELETE FROM movies WHERE id = CAST($1 AS UUID)",
+        )
+        .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert!(prepared.restrict_children.is_empty());
+        assert_eq!(prepared.delete_children.len(), 1);
+        assert!(runtime.can_reuse_prepared_simple_delete(&prepared));
+
+        runtime
+            .execute_prepared_simple_delete(
+                &prepared,
+                &[Value::Text(
+                    "550e8400-e29b-41d4-a716-446655440002".to_string(),
+                )],
+                4096,
+            )
+            .expect("execute prepared delete");
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT COUNT(*) FROM movies");
+        assert_eq!(remaining_movies.rows()[0].values()[0], Value::Int64(1));
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_reuses_cascade_cache_for_multiple_executes() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id INT64 REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE review_votes (id INT64 PRIMARY KEY, review_id INT64 REFERENCES reviews(id) ON DELETE CASCADE, score INT64 NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'A'), (2, 'B'), (3, 'C')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, 1, 'm1-r1'), (2, 1, 'm1-r2'), (3, 2, 'm2-r1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO review_votes VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4)",
+        );
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = $1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        assert!(prepared.delete_children_by_table.contains_key("movies"));
+        assert!(prepared.delete_children_by_table.contains_key("reviews"));
+        assert!(prepared
+            .delete_children_by_table
+            .contains_key("review_votes"));
+        assert!(prepared.table_indexes_by_table.contains_key("movies"));
+        assert!(prepared.table_indexes_by_table.contains_key("reviews"));
+        assert!(prepared.table_indexes_by_table.contains_key("review_votes"));
+
+        for movie_id in 1_i64..=3 {
+            let result = runtime
+                .execute_prepared_simple_delete(&prepared, &[Value::Int64(movie_id)], 4096)
+                .expect("execute prepared delete");
+            assert_eq!(result.affected_rows(), 1);
+        }
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT COUNT(*) FROM movies");
+        assert_eq!(remaining_movies.rows()[0].values()[0], Value::Int64(0));
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+        let remaining_votes = query_sql(&mut runtime, "SELECT COUNT(*) FROM review_votes");
+        assert_eq!(remaining_votes.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_keeps_stale_child_fk_index_name() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id UUID REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second'), (UUID_PARSE('550e8400-e29b-41d4-a716-446655440003'), 'Third')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'child')",
+        );
+
+        let fk_index_name = runtime
+            .catalog
+            .indexes
+            .values()
+            .find(|index| {
+                identifiers_equal(&index.table_name, "reviews")
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|column| identifiers_equal(column, "movie_id"))
+            })
+            .expect("reviews movie_id fk index")
+            .name
+            .clone();
+        runtime.indexes_mut().remove(&fk_index_name);
+        runtime
+            .catalog_mut()
+            .indexes
+            .get_mut(&fk_index_name)
+            .expect("reviews movie_id index schema")
+            .fresh = false;
+
+        let statement = crate::sql::parser::parse_sql_statement(
+            "DELETE FROM movies WHERE id = CAST($1 AS UUID)",
+        )
+        .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert_eq!(prepared.delete_children.len(), 1);
+        assert_eq!(
+            prepared.delete_children[0].child_index_name.as_deref(),
+            Some(fk_index_name.as_str())
+        );
+        assert_eq!(
+            prepared.child_index_hydration_targets(),
+            vec![("reviews", fk_index_name.as_str())]
+        );
+
+        runtime
+            .rebuild_index(&fk_index_name, 4096)
+            .expect("rebuild fk index");
+        runtime
+            .execute_prepared_simple_delete(
+                &prepared,
+                &[Value::Text(
+                    "550e8400-e29b-41d4-a716-446655440002".to_string(),
+                )],
+                4096,
+            )
+            .expect("execute prepared delete");
+
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_paged_parent_uses_tombstone_manifest() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'First'), (2, 'Second'), (3, 'Third')",
+        );
+
+        let rows = runtime
+            .table_data("movies")
+            .expect("movies table")
+            .rows
+            .as_ref()
+            .clone();
+        runtime
+            .tables_mut()
+            .insert("movies".to_string(), paged_row_source(rows));
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = $1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        let result = runtime
+            .execute_prepared_simple_delete(&prepared, &[Value::Int64(2)], 4096)
+            .expect("execute prepared delete");
+        assert_eq!(result.affected_rows(), 1);
+
+        let Some(TableRowSource::Paged(manifest)) = runtime.table_row_source("movies") else {
+            panic!("expected paged movies table");
+        };
+        assert!(manifest.tombstoned_row_ids.contains(&2));
+        assert!(manifest
+            .chunks
+            .iter()
+            .all(|chunk| chunk.overlay_payload.is_none()));
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT id FROM movies ORDER BY id");
+        let ids = remaining_movies
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![Value::Int64(1), Value::Int64(3)]);
+    }
+
+    #[test]
+    fn paged_int_arithmetic_update_updates_matching_rows_only() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies(\
+             id INT64 PRIMARY KEY, \
+             status TEXT NOT NULL, \
+             vote_count INT64 NOT NULL, \
+             collection TEXT NOT NULL DEFAULT '')",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_movies_status ON movies(status)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_movies_collection ON movies(collection) WHERE collection <> ''",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews(\
+             id INT64 PRIMARY KEY, \
+             movie_id INT64 REFERENCES movies(id))",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies(id, status, vote_count, collection) VALUES \
+             (1, 'Released', 10, ''), \
+             (2, 'Archived', 20, ''), \
+             (3, 'Released', 30, 'Series')",
+        );
+
+        let rows = runtime
+            .table_row_source("movies")
+            .unwrap()
+            .rows()
+            .map(|row| {
+                row.map(|row| StoredRow {
+                    row_id: row.row_id(),
+                    values: row.values().to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        runtime
+            .tables_mut()
+            .insert("movies".to_string(), paged_row_source(rows));
+
+        let update = crate::sql::parser::parse_sql_statement(
+            "UPDATE movies SET vote_count = vote_count + 1 WHERE status = 'Released'",
+        )
+        .expect("parse update");
+        let result = runtime.execute_statement(&update, &[], 4096).unwrap();
+        assert_eq!(result.affected_rows(), 2);
+        assert!(matches!(
+            runtime.table_row_source("movies"),
+            Some(TableRowSource::Paged(_))
+        ));
+
+        let selected = query_sql(
+            &mut runtime,
+            "SELECT id, vote_count FROM movies WHERE status = 'Released' ORDER BY id",
+        );
+        let values = selected
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                vec![Value::Int64(1), Value::Int64(11)],
+                vec![Value::Int64(3), Value::Int64(31)]
+            ]
+        );
     }
 
     #[test]
@@ -5330,6 +8991,7 @@ mod tests {
             name: "i".to_string(),
             column_indexes: vec![1],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: true,
@@ -5342,6 +9004,7 @@ mod tests {
             name: "i2".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -5350,10 +9013,28 @@ mod tests {
         let key = prepared_btree_index_key(&index2, &[Value::Int64(99)]).unwrap();
         assert_eq!(key, RuntimeBtreeKey::Int64(99));
 
+        let uuid = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        let index_uuid = PreparedBtreeIndex {
+            name: "uuid_idx".to_string(),
+            column_indexes: vec![0],
+            int64_key: false,
+            uuid_key: true,
+            has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
+            nullable: false,
+            unique: false,
+        };
+        let key = prepared_btree_index_key(&index_uuid, &[Value::Uuid(uuid)]).unwrap();
+        assert_eq!(key, RuntimeBtreeKey::Uuid(uuid));
+
         let index3 = PreparedBtreeIndex {
             name: "i3".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -5500,7 +9181,7 @@ mod tests {
             .apply_parent_delete_actions("parent", &parent, &[Value::Int64(7)], &[], 4096)
             .unwrap();
 
-        assert!(runtime.table_data("child").unwrap().rows.is_empty());
+        assert_eq!(runtime.table_data("child").unwrap().row_count(), 0);
     }
 
     #[test]
@@ -5717,6 +9398,14 @@ mod tests {
             runtime.table_row_source("child"),
             Some(TableRowSource::Paged(_))
         ));
+        let Some(TableRowSource::Paged(manifest)) = runtime.table_row_source("child") else {
+            panic!("expected paged child row source");
+        };
+        assert!(manifest.tombstoned_row_ids.contains(&1));
+        assert!(manifest
+            .chunks
+            .iter()
+            .all(|chunk| chunk.overlay_payload.is_none()));
         let remaining = runtime
             .table_row_source("child")
             .unwrap()
@@ -5726,6 +9415,68 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].row_id(), 2);
         assert_eq!(remaining[0].values(), &[Value::Int64(2), Value::Int64(8)]);
+    }
+
+    #[test]
+    fn apply_parent_delete_cascade_updates_child_indexes_incrementally() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(&mut runtime, "CREATE TABLE parent (id INT64 PRIMARY KEY)");
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE child (
+                id INT64 PRIMARY KEY,
+                parent_id INT64 NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL
+            )",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_child_parent ON child(parent_id)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX idx_child_tag ON child(tag)");
+        execute_sql(&mut runtime, "INSERT INTO parent VALUES (1), (2)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO child VALUES
+                (10, 1, 'drop'),
+                (11, 1, 'drop'),
+                (12, 2, 'keep')",
+        );
+
+        execute_sql(&mut runtime, "DELETE FROM parent WHERE id = 1");
+
+        let remaining = query_sql(&mut runtime, "SELECT id FROM child ORDER BY id");
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values(), &[Value::Int64(12)]);
+        for index_name in ["idx_child_parent", "idx_child_tag"] {
+            let index = runtime
+                .catalog
+                .indexes
+                .get(index_name)
+                .expect("child index schema");
+            assert!(index.fresh, "{index_name} should remain fresh");
+            assert!(
+                runtime.index(index_name).is_some(),
+                "{index_name} should remain resident"
+            );
+        }
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_child_parent") else {
+            panic!("expected child parent btree index");
+        };
+        assert!(keys.row_ids_for_value(&Value::Int64(1)).unwrap().is_empty());
+        assert_eq!(keys.row_ids_for_value(&Value::Int64(2)).unwrap(), vec![12]);
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_child_tag") else {
+            panic!("expected child tag btree index");
+        };
+        assert!(keys
+            .row_ids_for_value(&Value::Text("drop".to_string()))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            keys.row_ids_for_value(&Value::Text("keep".to_string()))
+                .unwrap(),
+            vec![12]
+        );
     }
 
     #[test]
@@ -5838,7 +9589,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
+                    Arc::new(entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );
@@ -6013,7 +9767,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
+                    Arc::new(entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );
@@ -6058,6 +9815,85 @@ mod tests {
             remaining[0].values(),
             &[Value::Int64(2), Value::Int64(8), Value::Int64(10)]
         );
+    }
+
+    #[test]
+    fn apply_parent_delete_cascade_uses_composite_child_index_prefix() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movie_tags (\
+             movie_id INT64 NOT NULL REFERENCES movies(id) ON DELETE CASCADE, \
+             tag_id INT64 NOT NULL, \
+             PRIMARY KEY (movie_id, tag_id))",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'First'), (2, 'Second')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movie_tags VALUES (1, 11), (1, 12), (2, 21)",
+        );
+
+        let exact_fk_index_name = runtime
+            .catalog
+            .indexes
+            .values()
+            .find(|index| {
+                identifiers_equal(&index.table_name, "movie_tags")
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|name| identifiers_equal(name, "movie_id"))
+            })
+            .expect("movie_tags fk index")
+            .name
+            .clone();
+        runtime.indexes_mut().remove(&exact_fk_index_name);
+        runtime.catalog_mut().indexes.remove(&exact_fk_index_name);
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = 1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        assert_eq!(prepared.delete_children.len(), 1);
+        let child = &prepared.delete_children[0];
+        assert_eq!(child.child_index_prefix_len, Some(1));
+        let child_index_name = child
+            .child_index_name
+            .as_deref()
+            .expect("child composite index should be selected");
+        let child_index_schema = runtime
+            .catalog
+            .indexes
+            .get(child_index_name)
+            .expect("child index schema");
+        assert_eq!(child_index_schema.columns.len(), 2);
+        assert!(child_index_schema.columns[0]
+            .column_name
+            .as_deref()
+            .is_some_and(|name| identifiers_equal(name, "movie_id")));
+
+        runtime
+            .execute_prepared_simple_delete(&prepared, &[Value::Int64(1)], 4096)
+            .expect("execute prepared delete");
+
+        let remaining = query_sql(&mut runtime, "SELECT COUNT(*) FROM movie_tags");
+        assert_eq!(remaining.rows()[0].values()[0], Value::Int64(1));
     }
 
     #[test]
@@ -6864,6 +10700,87 @@ mod apply_conflict_tests {
     }
 
     #[test]
+    fn apply_conflict_update_noop_does_not_mark_dirty() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t4".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.tables_mut().insert(
+            "t4".to_string(),
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
+            .into(),
+        );
+
+        let assignments = vec![crate::sql::ast::Assignment {
+            column_name: "val".to_string(),
+            expr: parse_expression_sql("t4.val").unwrap(),
+        }];
+        let res = runtime
+            .apply_conflict_update(
+                "t4",
+                1,
+                &[Value::Int64(1), Value::Int64(99)],
+                &assignments,
+                None,
+                &[],
+                4096,
+            )
+            .unwrap()
+            .expect("expected update result");
+        assert_eq!(res.values, vec![Value::Int64(1), Value::Int64(10)]);
+        assert_eq!(
+            runtime.table_data("t4").unwrap().rows[0].values,
+            vec![Value::Int64(1), Value::Int64(10)]
+        );
+        assert!(!runtime.dirty_tables.contains("t4"));
+    }
+
+    #[test]
     fn apply_conflict_update_unknown_column_error() {
         let mut runtime = EngineRuntime::empty(1);
         let table = crate::catalog::TableSchema {
@@ -6969,6 +10886,30 @@ mod dml_private_tests {
     }
 
     #[test]
+    fn compile_and_resolve_prepared_simple_value_casted_uuid_parameter() {
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Parameter(1)),
+            target_type: ColumnType::Uuid,
+        };
+        let src = compile_prepared_simple_value_source(&expr).unwrap();
+        let v = resolve_prepared_simple_value(
+            &src,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            Value::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])
+        );
+    }
+
+    #[test]
     fn resolve_prepared_simple_value_missing_param_error() {
         let src = PreparedSimpleValueSource::Parameter(2);
         let res = resolve_prepared_simple_value(&src, &[]);
@@ -6997,6 +10938,31 @@ mod dml_private_tests {
         match res.2 {
             Expr::Literal(Value::Int64(1)) => (),
             _ => panic!("expected literal 1"),
+        }
+    }
+
+    #[test]
+    fn simple_btree_lookup_filter_matches_casted_parameter() {
+        let expr = Expr::Binary {
+            left: Box::new(Expr::Column {
+                table: Some("movies".to_string()),
+                column: "id".to_string(),
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Cast {
+                expr: Box::new(Expr::Parameter(1)),
+                target_type: ColumnType::Uuid,
+            }),
+        };
+        let res = simple_btree_lookup_filter(&expr).unwrap();
+        assert_eq!(res.0, Some("movies"));
+        assert_eq!(res.1, "id");
+        match res.2 {
+            Expr::Cast { expr, target_type } => {
+                assert_eq!(*target_type, ColumnType::Uuid);
+                assert!(matches!(&**expr, Expr::Parameter(1)));
+            }
+            _ => panic!("expected UUID cast parameter"),
         }
     }
 
@@ -7055,6 +11021,7 @@ mod dml_private_tests {
             name: "i".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: true,
@@ -7072,6 +11039,7 @@ mod dml_private_tests {
             name: "e".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -7088,6 +11056,7 @@ mod dml_private_tests {
             name: "m".to_string(),
             column_indexes: vec![0, 1],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,

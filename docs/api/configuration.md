@@ -1,19 +1,25 @@
 # Configuration
 
-DecentDB can be configured at database creation and runtime.
+DecentDB is configured primarily when a database handle is created or opened.
+Runtime SQL PRAGMAs exist for compatibility and inspection, but durability,
+cache size, process coordination, encryption, and most storage behavior are
+open-time settings.
 
 ## Database Configuration
 
-Configuration is set when opening the database:
+Configuration is set when opening or creating the database:
 
 ```rust
-import decentdb/engine
+use decentdb::{Db, DbConfig};
 
-# With default settings
-let db = openDb("myapp.ddb")
+// With default settings
+let db = Db::open_or_create("myapp.ddb", DbConfig::default())?;
 
-# With custom cache size
-let db2 = openDb("myapp.ddb", cachePages = 4096)
+// With custom cache size
+let mut config = DbConfig::default();
+config.cache_size_mb = 16;
+let db2 = Db::open_or_create("myapp.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
 ```
 
 ### Cache Size
@@ -22,7 +28,9 @@ The page cache keeps frequently accessed pages in memory.
 
 **Configuration:**
 - CLI: `--cachePages=<n>` or `--cacheMb=<n>`
-- Rust API: `openDb(path, cachePages = n)`
+- Rust API: `DbConfig.cache_size_mb`
+- C ABI / binding option strings: `cache_size=<pages>`,
+  `cache_size=<n>MB`, or `cache_size=<n>GB`
 - Default durable/low-memory profile: 1024 pages (4MB with 4KB pages)
 - Explicit balanced profile: 4096 pages (16MB with 4KB pages)
 
@@ -55,15 +63,60 @@ use decentdb::DbConfig;
 let balanced = DbConfig::balanced();
 let low_memory = DbConfig::low_memory();
 let tuned = DbConfig::tuned_durable();
-# let _ = (balanced, low_memory, tuned);
+let embedded_fast = DbConfig::embedded_fast();
+# let _ = (balanced, low_memory, tuned, embedded_fast);
 ```
 
-All three keep full WAL sync. `tuned_durable` is explicit because it raises
-memory use and changes row-source/checkpoint behavior for hot read workloads.
+Named profiles keep full WAL sync unless the caller explicitly overrides
+`DbConfig.wal_sync_mode` or passes `wal_sync_mode` / `synchronous` in an option
+string. `embedded_fast` is the recommended opt-in profile for single-process
+embedded applications with a hot working set and repeated small writes.
+`tuned_durable` is the higher-memory benchmark/power-user profile. Both are
+explicit because they raise memory use and change row-source/checkpoint
+behavior.
+
+C ABI and binding option strings can use the same profiles:
+
+```text
+profile=embedded_fast
+profile=tuned_durable;cache_size=128MB
+```
+
+Explicit options in the same string override profile values. .NET connection
+strings expose this as `Performance Profile=embedded_fast`.
 
 ## Durability and Checkpointing
 
-DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by default for durable ACID writes.
+DecentDB uses a write-ahead log (WAL). The default `WalSyncMode::Full` performs
+a WAL sync before each commit is acknowledged, which is the durable ACID write
+path.
+
+Rust callers configure the WAL sync policy with `DbConfig.wal_sync_mode`:
+
+```rust
+use decentdb::{Db, DbConfig, WalSyncMode};
+
+let config = DbConfig {
+    wal_sync_mode: WalSyncMode::Full,
+    ..DbConfig::default()
+};
+let db = Db::open_or_create("app.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+C ABI and binding option strings accept:
+
+```text
+wal_sync_mode=full
+wal_sync_mode=normal
+wal_sync_mode=async_commit:10
+synchronous=full
+```
+
+`async_commit:<milliseconds>` acknowledges commits after their WAL frames are
+written and uses a background fsync thread. Use `Db::sync()` as an explicit
+durability barrier in that mode. Clean handle close also performs a final
+flush. The named durable profiles do not select async commit.
 
 ## Cross-Process WAL Coordination
 
@@ -101,7 +154,7 @@ plan_cache_max_bytes=<bytes>
 The plan cache options are additive: old binaries that do not set them
 get the new default behavior (connection-local plan caching enabled,
 default 256 KiB). To opt out, set `plan_cache_enabled=false`. See
-`design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194
+`design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194
 for the full contract.
 
 Use `required` for applications that must fail when cross-process protection is
@@ -161,55 +214,79 @@ but SQL-level PRAGMAs do not weaken durability for normal DML
 (`INSERT`/`UPDATE`/`DELETE`). `PRAGMA journal_mode` reports the engine's
 WAL-only mode, and `PRAGMA synchronous` accepts only no-op assignments that
 match the database's open-time WAL sync configuration. For high-throughput
-ingestion, use bulk-load durability modes instead:
-
-- CLI: `decentdb bulk-load --durability=full|deferred|none` (default: `deferred`)
-- Rust: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
+ingestion, use explicit transactions or the bulk-load API/CLI. Bulk-load
+durability still follows the database handle's open-time WAL sync mode.
 
 ### Checkpointing
 
 - Manual checkpoint: `decentdb checkpoint --db=my.ddb`
-- The engine configures sensible defaults at open (see `setCheckpointConfig` in the WAL module).
+- Programmatic checkpoint: `Db::checkpoint()` / `ddb_db_checkpoint`
+- Default size-triggered auto-checkpointing wakes after 4096 dirty page
+  versions or 64 MiB of WAL growth, gated by active readers and shared-handle
+  safety.
 
-From the CLI you can override checkpoint/reader behavior for a single `exec` invocation:
+Rust callers configure checkpoint policy with `DbConfig`:
 
-```bash
-decentdb exec --db=my.ddb \
-  --checkpointBytes=67108864 \
-  --readerWarnMs=60000 \
-  --readerTimeoutMs=300000 \
-  --forceTruncateOnTimeout \
-  --sql="SELECT 1"
+```rust
+use decentdb::{Db, DbConfig};
+
+let config = DbConfig {
+    wal_checkpoint_threshold_pages: 8192,
+    wal_checkpoint_threshold_bytes: 128 * 1024 * 1024,
+    checkpoint_timeout_sec: 30,
+    background_checkpoint_worker: true,
+    auto_checkpoint_on_open_mb: 16,
+    ..DbConfig::default()
+};
+
+let db = Db::open_or_create("my.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
 ```
 
-Note: if you pass *any* of the checkpoint/reader flags, the CLI overrides the engine defaults for that process (unset values become `0` / `false`).
+C ABI and binding option strings can set the size triggers:
+
+```text
+wal_autocheckpoint=4096
+wal_checkpoint_threshold_pages=8192
+wal_checkpoint_threshold_bytes=134217728
+```
+
+`wal_autocheckpoint=0` disables both page and byte threshold triggers for that
+handle. Checkpoints fold WAL frames into the database file and can truncate the
+WAL when no active readers need retained versions; committed data is already
+durable under the default full WAL sync mode.
 
 ## Bulk Load Configuration
 
-Configure bulk loading behavior:
+Configure Rust bulk loading behavior:
 
 ```rust
-var opts = defaultBulkLoadOptions()
+use decentdb::{BulkLoadOptions, Db, DbConfig, Value};
 
--- Rows per batch
-opts.batchSize = 10000
+let db = Db::open_or_create("bulk.ddb", DbConfig::default())?;
+let rows = vec![vec![Value::Int64(1), Value::Text("Ada".to_string())]];
+let options = BulkLoadOptions {
+    batch_size: 10_000,
+    sync_interval: 10,
+    disable_indexes: false,
+    checkpoint_on_complete: true,
+};
+db.bulk_load_rows("users", &["id", "name"], &rows, options)?;
+# Ok::<(), decentdb::DbError>(())
+```
 
--- Batches between fsync
-opts.syncInterval = 10
+The CLI exposes the same option names as camel-case flags:
 
--- Skip index updates during load
-opts.disableIndexes = true
-
--- Checkpoint after load completes
-opts.checkpointOnComplete = true
-
--- Durability mode
-opts.durability = dmDeferred  -- dmFull, dmDeferred, dmNone
+```bash
+decentdb bulk-load --db=bulk.ddb --table=users --input=users.csv \
+  --batchSize=10000 --syncInterval=10 --noCheckpoint
 ```
 
 ## Page Size
 
-DecentDB currently uses a fixed 4096-byte page size (this is part of the on-disk format).
+DecentDB supports 4096, 8192, and 16384-byte page sizes at database creation.
+The default is 4096 bytes. Existing database files keep their creation-time page
+size; changing it requires creating a new database and migrating data.
 
 ## Runtime Configuration
 
@@ -274,14 +351,9 @@ instead of being silently ignored. Examples include `read_uncommitted`,
 `ignore_check_constraints`, `defer_foreign_keys`, `journal_mode = OFF`, and
 `temp_store = MEMORY`.
 
-To override checkpoint/reader settings for a single `exec` invocation, use:
-- `--checkpointBytes`
-- `--checkpointMs`
-- `--readerWarnMs`
-- `--readerTimeoutMs`
-- `--forceTruncateOnTimeout`
-
-For embedded Rust usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
+Checkpoint policy is open-time engine configuration. The CLI `exec` command
+supports `--checkpoint` to run a manual checkpoint after execution, but it does
+not expose per-invocation reader timeout or checkpoint threshold flags.
 
 ### Lua Extension Trust
 
@@ -312,18 +384,19 @@ connections with explicit package-hash allowlists.
 
 ## Configuration File
 
-Create `~/.decentdb/config` for default settings:
+Some deployments keep wrapper-level defaults in `~/.decentdb/config`:
 
 ```
 # Default database path
 db = ~/myapp.ddb
 
-# Default cache size (either key is supported)
+# Default cache size used by custom wrappers around the CLI
 cacheMb = 16
 # cachePages = 4096
 ```
 
-Settings are overridden by command-line options.
+The current in-tree CLI does not read this file directly; treat this as an
+application-level convention unless your wrapper implements it.
 
 ## Performance Tuning
 
@@ -339,10 +412,12 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM large_table" --cacheMb=256
 ### For Write-Heavy Workloads
 
 ```rust
-var opts = defaultBulkLoadOptions()
-opts.durability = dmDeferred
-opts.disableIndexes = true
-opts.checkpointOnComplete = true
+let options = BulkLoadOptions {
+    batch_size: 50_000,
+    sync_interval: 10,
+    disable_indexes: false,
+    checkpoint_on_complete: true,
+};
 ```
 
 ### For Mixed Workloads
@@ -357,9 +432,9 @@ decentdb exec --db=my.ddb --sql="..."
 1. **Set cache size based on data size**
    - Rule of thumb: 10-20% of database size
 
-2. **Use deferred durability for bulk loads**
-   - Much faster for large imports
-   - Risk: may lose last batch on crash
+2. **Use explicit transactions or bulk load for large imports**
+   - Avoid per-row autocommit overhead
+   - Keep the default full WAL sync when crash durability matters
 
 3. **Checkpoint regularly**
    - Prevents WAL from growing too large
@@ -403,20 +478,22 @@ In-memory databases are fully transactional, but do not write to disk. Use `save
 # Larger cache (durability is fsync-on-commit by default)
 decentdb exec --db=prod.ddb --sql="..." --cacheMb=256
 
-# Optional: explicitly set checkpoint/reader policy for this invocation
-# (see note above about overriding defaults)
-decentdb exec --db=prod.ddb --sql="SELECT 1" --cacheMb=256 \
-  --checkpointBytes=67108864 --readerWarnMs=60000 --readerTimeoutMs=300000 --forceTruncateOnTimeout
+# Optional: run a manual checkpoint after the statement
+decentdb exec --db=prod.ddb --sql="SELECT 1" --cacheMb=256 --checkpoint
 ```
 
 ### Bulk Data Import
 
 ```rust
-var opts = defaultBulkLoadOptions()
-opts.batchSize = 50000
-opts.syncInterval = 5
-opts.disableIndexes = true
-cachePages = 8192  # 32MB
+let mut config = DbConfig::default();
+config.cache_size_mb = 32;
+
+let options = BulkLoadOptions {
+    batch_size: 50_000,
+    sync_interval: 5,
+    disable_indexes: false,
+    checkpoint_on_complete: true,
+};
 ```
 
 ## File Permissions

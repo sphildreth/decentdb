@@ -605,6 +605,142 @@ fn prepared_batch_insert() {
 }
 
 #[test]
+fn prepared_batch_insert_with_uuid_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (id INT64 PRIMARY KEY, external_id UUID NOT NULL)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_movies_external_id ON movies(external_id)")
+        .unwrap();
+
+    let mut txn = db.transaction().unwrap();
+    let stmt = txn
+        .prepare("INSERT INTO movies VALUES ($1, CAST($2 AS UUID))")
+        .unwrap();
+    for i in 1..=4 {
+        stmt.execute_in(
+            &mut txn,
+            &[
+                Value::Int64(i),
+                Value::Text(format!("550e8400-e29b-41d4-a716-44665544000{i}")),
+            ],
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let r = db
+        .execute("SELECT id FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440002')")
+        .unwrap();
+    assert_eq!(rows(&r), vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn prepared_select_with_cast_uuid_param_uses_uuid_pk() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, title TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second')",
+    )
+    .unwrap();
+
+    let stmt = db
+        .prepare("SELECT title FROM movies WHERE external_id = CAST($1 AS UUID)")
+        .unwrap();
+    let result = stmt
+        .execute(&[Value::Text(
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+        )])
+        .unwrap();
+
+    assert_eq!(rows(&result), vec![vec![Value::Text("Second".to_string())]]);
+}
+
+#[test]
+fn prepared_select_with_cast_uuid_param_and_alias_uses_uuid_pk() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, title TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second')",
+    )
+    .unwrap();
+
+    let stmt = db
+        .prepare("SELECT m.title FROM movies AS m WHERE m.external_id = CAST($1 AS UUID)")
+        .unwrap();
+    let result = stmt
+        .execute(&[Value::Text(
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+        )])
+        .unwrap();
+
+    assert_eq!(rows(&result), vec![vec![Value::Text("Second".to_string())]]);
+}
+
+#[test]
+fn prepared_update_with_cast_uuid_param_uses_uuid_pk() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, box INT64 NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 1)")
+        .unwrap();
+
+    let stmt = db
+        .prepare("UPDATE movies SET box = $1 WHERE external_id = CAST($2 AS UUID)")
+        .unwrap();
+    stmt.execute(&[
+        Value::Int64(7),
+        Value::Text("550e8400-e29b-41d4-a716-446655440002".to_string()),
+    ])
+    .unwrap();
+
+    let result = db
+        .execute("SELECT box FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440002')")
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec![Value::Int64(7)]]);
+}
+
+#[test]
+fn prepared_update_with_cast_uuid_param_reuses_in_explicit_transaction() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, box INT64 NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies VALUES \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 1), \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 2)",
+    )
+    .unwrap();
+
+    exec(&db, "BEGIN");
+    let stmt = db
+        .prepare("UPDATE movies SET box = $1 WHERE external_id = CAST($2 AS UUID)")
+        .unwrap();
+    stmt.execute(&[
+        Value::Int64(7),
+        Value::Text("550e8400-e29b-41d4-a716-446655440001".to_string()),
+    ])
+    .unwrap();
+    stmt.execute(&[
+        Value::Int64(8),
+        Value::Text("550e8400-e29b-41d4-a716-446655440002".to_string()),
+    ])
+    .unwrap();
+    exec(&db, "COMMIT");
+
+    let first = db
+        .execute("SELECT box FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440001')")
+        .unwrap();
+    assert_eq!(rows(&first), vec![vec![Value::Int64(7)]]);
+
+    let second = db
+        .execute("SELECT box FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440002')")
+        .unwrap();
+    assert_eq!(rows(&second), vec![vec![Value::Int64(8)]]);
+}
+
+#[test]
 fn prepared_delete_statement() {
     let db = mem_db();
     exec(&db, "CREATE TABLE pd (id INT PRIMARY KEY, val TEXT)");
@@ -613,6 +749,56 @@ fn prepared_delete_statement() {
     stmt.execute(&[Value::Int64(2)]).unwrap();
     let r = exec(&db, "SELECT COUNT(*) FROM pd");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(2));
+}
+
+#[test]
+fn prepared_delete_with_cascade_reuses_in_explicit_transaction() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE artists (id UUID PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    exec(
+        &db,
+        r#"CREATE TABLE albums (
+             id UUID PRIMARY KEY,
+             artist_id UUID NOT NULL
+               REFERENCES artists(id) ON DELETE CASCADE,
+             name TEXT NOT NULL
+           )"#,
+    );
+    exec(
+        &db,
+        "INSERT INTO artists VALUES \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'First'), \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second')",
+    );
+    exec(
+        &db,
+        "INSERT INTO albums VALUES \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440011'), UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'A'), \
+         (UUID_PARSE('550e8400-e29b-41d4-a716-446655440012'), UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'B')",
+    );
+
+    exec(&db, "BEGIN");
+    let stmt = db
+        .prepare("DELETE FROM artists WHERE id = CAST($1 AS UUID)")
+        .unwrap();
+    stmt.execute(&[Value::Text(
+        "550e8400-e29b-41d4-a716-446655440001".to_string(),
+    )])
+    .unwrap();
+    stmt.execute(&[Value::Text(
+        "550e8400-e29b-41d4-a716-446655440002".to_string(),
+    )])
+    .unwrap();
+    exec(&db, "COMMIT");
+
+    let artist_count = exec(&db, "SELECT COUNT(*) FROM artists");
+    assert_eq!(rows(&artist_count)[0][0], Value::Int64(0));
+
+    let album_count = exec(&db, "SELECT COUNT(*) FROM albums");
+    assert_eq!(rows(&album_count)[0][0], Value::Int64(0));
 }
 
 #[test]

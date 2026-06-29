@@ -110,7 +110,7 @@ the risk visible.
 
 ### References
 
-- `design/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
+- `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
 - `design/adr/0162-engine-owned-write-queue-strict-group-commit.md`
 - `design/adr/0163-operational-sys-metrics.md`
 - `docs/user-guide/write-concurrency.md`

@@ -375,7 +375,7 @@ pub struct DbConfig {
     pub tracing: crate::tracing::RuntimeTracingConfig,
 
     /// Connection-local plan cache configuration. See
-    /// `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+    /// `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
     /// ADR 0190-0193. Defaults to enabled with a conservative
     /// 256 KiB budget.
     pub plan_cache: crate::plan_cache::PlanCacheConfig,

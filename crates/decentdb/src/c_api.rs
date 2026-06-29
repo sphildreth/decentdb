@@ -12,7 +12,7 @@ use crate::error::{DbDiagnostic, DbError, DbErrorCode, Result};
 use crate::{
     evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig,
     ProcessCoordinationMode, QueryResult, QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions,
-    TableWatchOptions, Value,
+    TableWatchOptions, Value, WalSyncMode,
 };
 
 const DDB_OK: u32 = 0;
@@ -1348,6 +1348,27 @@ fn parse_process_coordination_option(value: &str) -> Result<ProcessCoordinationM
     }
 }
 
+fn parse_wal_sync_mode_option(value: &str, key: &str) -> Result<WalSyncMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(WalSyncMode::Full),
+        "normal" => Ok(WalSyncMode::Normal),
+        other if other.starts_with("async_commit") => {
+            let interval_ms = other
+                .strip_prefix("async_commit")
+                .and_then(|rest| rest.trim().strip_prefix(':'))
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+                .filter(|ms| *ms >= 1)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "invalid {key} async_commit value; expected async_commit:<ms>= {value}"
+                    ))
+                })?;
+            Ok(WalSyncMode::AsyncCommit { interval_ms })
+        }
+        _ => Err(DbError::sql(format!("invalid {key} value: {value}"))),
+    }
+}
+
 fn parse_u32_option(value: &str, key: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|_| {
         DbError::sql(format!(
@@ -1446,6 +1467,20 @@ fn parse_extension_trust_anchor_option(
     }
 }
 
+fn db_config_profile(profile: &str) -> Result<DbConfig> {
+    let normalized = profile.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "default" => Ok(DbConfig::default()),
+        "balanced" => Ok(DbConfig::balanced()),
+        "low_memory" | "lowmemory" => Ok(DbConfig::low_memory()),
+        "embedded_fast" | "embeddedfast" => Ok(DbConfig::embedded_fast()),
+        "tuned_durable" | "tuneddurable" | "tuned" => Ok(DbConfig::tuned_durable()),
+        _ => Err(DbError::sql(format!(
+            "unknown database profile '{profile}'; expected default, low_memory, balanced, embedded_fast, or tuned_durable"
+        ))),
+    }
+}
+
 fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
     let mut config = DbConfig::default();
     let Some(options) = options else {
@@ -1456,6 +1491,7 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
         return Ok(config);
     }
 
+    let mut parsed_options = Vec::new();
     for token in trimmed.split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace()) {
         let token = token.trim();
         if token.is_empty() {
@@ -1467,81 +1503,95 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             )));
         };
         let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
+        let value = value.trim().to_string();
+        parsed_options.push((key, value));
+    }
+
+    for (key, value) in &parsed_options {
+        if key == "profile" || key == "performance_profile" {
+            config = db_config_profile(value)?;
+        }
+    }
+
+    for (key, value) in parsed_options {
         match key.as_str() {
+            "profile" | "performance_profile" => {}
             "cache_size" | "cache_size_mb" => {
-                config.cache_size_mb = parse_cache_size_mb_option(value, config.page_size)?;
+                config.cache_size_mb = parse_cache_size_mb_option(&value, config.page_size)?;
             }
             "retain_paged_row_sources_after_commit" => {
                 config.retain_paged_row_sources_after_commit =
-                    parse_bool_option(value, key.as_str())?;
+                    parse_bool_option(&value, key.as_str())?;
             }
             "paged_row_storage" => {
-                config.paged_row_storage = parse_bool_option(value, key.as_str())?;
+                config.paged_row_storage = parse_bool_option(&value, key.as_str())?;
             }
             "persistent_pk_index" => {
-                config.persistent_pk_index = parse_bool_option(value, key.as_str())?;
+                config.persistent_pk_index = parse_bool_option(&value, key.as_str())?;
             }
             "wal_autocheckpoint" => {
-                let pages = parse_u32_option(value, key.as_str())?;
+                let pages = parse_u32_option(&value, key.as_str())?;
                 config.wal_checkpoint_threshold_pages = pages;
                 if pages == 0 {
                     config.wal_checkpoint_threshold_bytes = 0;
                 }
             }
             "wal_checkpoint_threshold_pages" => {
-                config.wal_checkpoint_threshold_pages = parse_u32_option(value, key.as_str())?;
+                config.wal_checkpoint_threshold_pages = parse_u32_option(&value, key.as_str())?;
             }
             "wal_checkpoint_threshold_bytes" => {
-                config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+                config.wal_checkpoint_threshold_bytes = parse_u64_option(&value, key.as_str())?;
             }
             "process_coordination" => {
-                config.process_coordination = parse_process_coordination_option(value)?;
+                config.process_coordination = parse_process_coordination_option(&value)?;
             }
             "process_coordination_timeout_ms" => {
-                config.process_coordination_timeout_ms = parse_u64_option(value, key.as_str())?;
+                config.process_coordination_timeout_ms = parse_u64_option(&value, key.as_str())?;
             }
             "write_queue_enabled" => {
-                config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
+                config.write_queue_enabled = parse_bool_option(&value, key.as_str())?;
             }
             "write_queue_capacity" => {
-                config.write_queue_capacity = parse_usize_option(value, key.as_str())?.max(1);
+                config.write_queue_capacity = parse_usize_option(&value, key.as_str())?.max(1);
             }
             "write_queue_default_timeout_ms" => {
-                config.write_queue_default_timeout_ms = parse_u64_option(value, key.as_str())?;
+                config.write_queue_default_timeout_ms = parse_u64_option(&value, key.as_str())?;
             }
             "write_queue_strict_group_commit" | "write_queue_group_commit" => {
-                config.write_queue_strict_group_commit = parse_bool_option(value, key.as_str())?;
+                config.write_queue_strict_group_commit = parse_bool_option(&value, key.as_str())?;
             }
             "write_queue_max_batch" => {
-                config.write_queue_max_batch = parse_usize_option(value, key.as_str())?.max(1);
+                config.write_queue_max_batch = parse_usize_option(&value, key.as_str())?.max(1);
             }
             "write_queue_max_group_delay_us" => {
-                config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
+                config.write_queue_max_group_delay_us = parse_u64_option(&value, key.as_str())?;
             }
             "encryption_key" | "tde_key" => {
                 config.encryption = Some(DbEncryptionConfig::from_key_bytes(value.as_bytes())?);
             }
             "encryption_key_hex" | "tde_key_hex" => {
                 config.encryption = Some(DbEncryptionConfig::from_key_bytes(parse_hex_option(
-                    value,
+                    &value,
                     key.as_str(),
                 )?)?);
             }
             "allow_extension" => {
                 config
                     .extension_trust_anchors
-                    .push(parse_extension_trust_anchor_option(value)?);
+                    .push(parse_extension_trust_anchor_option(&value)?);
             }
             "allow_unsigned_extensions" => {
                 config.extension_unsigned_development_mode =
-                    parse_bool_option(value, key.as_str())?;
+                    parse_bool_option(&value, key.as_str())?;
             }
             "plan_cache_enabled" => {
-                config.plan_cache.enabled = parse_bool_option(value, key.as_str())?;
+                config.plan_cache.enabled = parse_bool_option(&value, key.as_str())?;
             }
             "plan_cache_max_bytes" => {
-                config.plan_cache.max_size_bytes = parse_u64_option(value, key.as_str())?;
+                config.plan_cache.max_size_bytes = parse_u64_option(&value, key.as_str())?;
+            }
+            "wal_sync_mode" | "synchronous" => {
+                config.wal_sync_mode = parse_wal_sync_mode_option(&value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
@@ -1563,7 +1613,7 @@ fn options_arg(options: *const c_char) -> Result<Option<String>> {
 /// Creates a database with open-time configuration options.
 ///
 /// Options are a UTF-8 string of `key=value` pairs separated by whitespace,
-/// comma, or semicolon. Supported keys include `cache_size`,
+/// comma, or semicolon. Supported keys include `profile`, `cache_size`,
 /// `retain_paged_row_sources_after_commit`, `paged_row_storage`,
 /// `persistent_pk_index`, `wal_autocheckpoint`,
 /// `wal_checkpoint_threshold_pages`, `wal_checkpoint_threshold_bytes`,
@@ -2889,6 +2939,55 @@ pub extern "C" fn ddb_stmt_bind_int64_step_row_view(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_stmt_bind_text_step_row_view(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: *const c_char,
+    byte_len: usize,
+    out_values: *mut *const DdbValueView,
+    out_columns: *mut usize,
+    out_has_row: *mut u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(value.cast::<u8>(), byte_len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Text(text.to_string());
+        invalidate_stmt_result(stmt);
+        execute_stmt_if_needed(stmt)?;
+
+        let row_count = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?
+            .rows()
+            .len();
+        if stmt.next_row_index >= row_count {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            *out_ptr(out_columns, "out_columns")? = 0;
+            *out_ptr(out_values, "out_values")? = ptr::null();
+            return Ok(());
+        }
+
+        stmt.current_row = Some(stmt.next_row_index);
+        stmt.next_row_index += 1;
+        populate_stmt_row_views(stmt)?;
+
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        *out_ptr(out_columns, "out_columns")? = stmt.row_views.len();
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_stmt_bind_int64_step_i64_text_f64(
     stmt: *mut StmtHandle,
     index_1_based: usize,
@@ -4061,6 +4160,76 @@ mod tests {
     }
 
     #[test]
+    fn ffi_bind_text_step_row_view_returns_first_row() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let mut result = ptr::null_mut();
+        for sql in [
+            "CREATE TABLE lookup (id TEXT PRIMARY KEY, value INT64)",
+            "INSERT INTO lookup VALUES ('alpha', 7), ('beta', 11)",
+        ] {
+            let sql = CString::new(sql).expect("sql");
+            assert_eq!(
+                ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+
+        let sql = CString::new("SELECT id, value FROM lookup WHERE id = $1").expect("sql");
+        let mut stmt = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, sql.as_ptr(), &mut stmt), DDB_OK);
+
+        let param = CString::new("beta").expect("param");
+        let mut values = ptr::null();
+        let mut columns = 0_usize;
+        let mut has_row = 0_u8;
+        assert_eq!(
+            ddb_stmt_bind_text_step_row_view(
+                stmt,
+                1,
+                param.as_ptr(),
+                4,
+                &mut values,
+                &mut columns,
+                &mut has_row,
+            ),
+            DDB_OK
+        );
+        assert_eq!(has_row, 1);
+        assert_eq!(columns, 2);
+        assert!(!values.is_null());
+        let row = unsafe { std::slice::from_raw_parts(values, columns) };
+        assert_eq!(row[0].tag, DdbValueTag::Text as u32);
+        let text = unsafe { std::slice::from_raw_parts(row[0].data, row[0].len) };
+        assert_eq!(text, b"beta");
+        assert_eq!(row[1].tag, DdbValueTag::Int64 as u32);
+        assert_eq!(row[1].int64_value, 11);
+
+        let missing = CString::new("missing").expect("param");
+        assert_eq!(
+            ddb_stmt_bind_text_step_row_view(
+                stmt,
+                1,
+                missing.as_ptr(),
+                7,
+                &mut values,
+                &mut columns,
+                &mut has_row,
+            ),
+            DDB_OK
+        );
+        assert_eq!(has_row, 0);
+        assert_eq!(columns, 0);
+        assert!(values.is_null());
+
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
             "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;process_coordination=single_process_unsafe;process_coordination_timeout_ms=125;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000;encryption_key_hex=7464652d6b6579",
@@ -4083,6 +4252,32 @@ mod tests {
         assert_eq!(config.write_queue_max_batch, 9);
         assert_eq!(config.write_queue_max_group_delay_us, 1000);
         assert!(config.encryption.is_some());
+    }
+
+    #[test]
+    fn db_config_options_parse_named_profile_with_overrides() {
+        let config = db_config_from_options(Some(
+            "profile=embedded_fast;cache_size=64MB;process_coordination=single_process_unsafe",
+        ))
+        .expect("profile options should parse");
+
+        assert_eq!(config.cache_size_mb, 64);
+        assert!(config.retain_paged_row_sources_after_commit);
+        assert!(!config.paged_row_storage);
+        assert_eq!(config.wal_checkpoint_threshold_pages, 0);
+        assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert_eq!(
+            config.process_coordination,
+            ProcessCoordinationMode::SingleProcessUnsafe
+        );
+    }
+
+    #[test]
+    fn db_config_options_reject_unknown_profile() {
+        let err = db_config_from_options(Some("profile=fastest")).expect_err("unknown profile");
+        assert!(err
+            .to_string()
+            .contains("unknown database profile 'fastest'"));
     }
 
     #[test]

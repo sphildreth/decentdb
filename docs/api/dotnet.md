@@ -180,6 +180,7 @@ by the ADO.NET and EF Core providers:
 var csb = new DecentDBConnectionStringBuilder
 {
     DataSource = "/path/to/shop.ddb",
+    PerformanceProfile = "embedded_fast", // optional durable profile for hot embedded apps
     CacheSize = "64MB",        // optional native cache size
     RetainPagedRowSourcesAfterCommit = true,
     PagedRowStorage = false,
@@ -191,6 +192,15 @@ var csb = new DecentDBConnectionStringBuilder
 
 string connectionString = csb.ConnectionString;
 ```
+
+For a single-process embedded application with a hot working set, start with
+`PerformanceProfile = "embedded_fast"` instead of rediscovering individual
+storage knobs. It preserves durable WAL sync while increasing the cache,
+retaining hot row sources across commits, using the lower-overhead row-source
+layout for repeated writes, and disabling size-triggered auto-checkpoints. You
+can still override any individual option, for example `CacheSize = "64MB"`.
+Use `ProcessCoordination = "single_process_unsafe"` only when one OS process will
+open the database file.
 
 The EF Core provider also accepts the builder directly:
 
@@ -369,14 +379,16 @@ label ids; catalog metadata carries the human-readable label mapping.
 ## Maintenance
 
 ```csharp
-// Checkpoint (flush WAL)
+// Checkpoint committed WAL frames into the database file
 conn.Checkpoint();
 
 // Online backup
 conn.SaveAs("/path/to/backup.ddb");
 
-// File-backed vacuum/compaction helper
-await DecentDBMaintenance.VacuumAtomicAsync("/path/to/shop.ddb");
+// Binding-native file maintenance helpers
+await DecentDBMaintenance.CheckpointAsync("/path/to/shop.ddb");
+await DecentDBMaintenance.CompactAsync("/path/to/shop.ddb", "/path/to/shop.compact.ddb");
+await DecentDBMaintenance.VacuumAsync("/path/to/shop.ddb", createBackup: true);
 ```
 
 ## Sync SDK
@@ -494,6 +506,48 @@ var applyResult = await connection.Sync.ApplyChangesetAsync(changeset);
 ```
 
 ## Performance sanity guidance
+
+### Embedded performance profile
+
+Use an explicit performance profile when comparing DecentDB to a tuned SQLite
+connection. SQLite benchmark harnesses commonly set WAL mode, cache size,
+`mmap_size`, and temp-store PRAGMAs; the closest DecentDB .NET starting point is:
+
+```csharp
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/app.ddb",
+    PerformanceProfile = "embedded_fast",
+    CacheSize = "64MB",
+    ProcessCoordination = "single_process_unsafe", // only for one-process apps
+};
+```
+
+The named profile maps to the native `DbConfig::embedded_fast()` profile:
+durable WAL sync remains enabled, the cache is raised, hot row sources are
+retained after commits, paged row storage is disabled for cheaper repeated
+small writes, and size-triggered auto-checkpointing is disabled so bulk loads
+are not interrupted mid-flight.
+
+Native prepared statements are reusable, but each repeated execution must reset
+the cursor and clear old bindings unless you use one of the `Rebind*Execute` or
+`ExecuteBatch*` helpers:
+
+```csharp
+using var stmt = db.Prepare("UPDATE movies SET box_office = $1 WHERE id = $2");
+foreach (var movie in movies)
+{
+    stmt.Reset()
+        .ClearBindings()
+        .BindDecimal(1, movie.BoxOffice)
+        .BindGuid(2, movie.Id)
+        .StepRowsAffected();
+}
+```
+
+`PersistentPkIndex = true` can improve some reopened primary-key lookup patterns,
+but it adds write-time and file-size overhead. Benchmark it with your workload
+before enabling it globally; it is not part of the default embedded-fast profile.
 
 The in-tree `DecentDb.ShowCase` sample includes a `PERFORMANCE PATTERNS`
 section, but it should be read as a sanity-check aid rather than a benchmark

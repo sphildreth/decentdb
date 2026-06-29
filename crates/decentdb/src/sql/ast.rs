@@ -1368,15 +1368,18 @@ fn is_safe_query(
     tables: &mut BTreeSet<String>,
     inherited_ctes: &BTreeSet<String>,
 ) -> bool {
-    if query.recursive {
-        return false;
-    }
-    let local_ctes = query
+    let mut local_ctes = query
         .ctes
         .iter()
         .map(|cte| cte.name.clone())
         .collect::<BTreeSet<_>>();
     let mut available_ctes = inherited_ctes.clone();
+    if query.recursive {
+        for cte_name in &local_ctes {
+            available_ctes.insert(cte_name.clone());
+        }
+        local_ctes.clear();
+    }
     for cte in &query.ctes {
         if !is_safe_query(&cte.query, tables, &available_ctes) {
             return false;

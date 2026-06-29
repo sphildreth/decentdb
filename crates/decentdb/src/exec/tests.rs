@@ -8,17 +8,21 @@ use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::InMemoryPageStore;
 use crate::{Db, DbConfig, Value};
+use tempfile::TempDir;
 
 use super::{
-    append_paged_table_chunks, decode_manifest_payload, decode_paged_table_manifest_payload,
-    decode_runtime_payload, drop_index_include_columns_section,
-    encode_legacy_table_payload_from_manifest, encode_manifest_payload, encode_paged_table_chunks,
-    encode_paged_table_chunks_from_rows, encode_runtime_payload, encode_table_payload, like_match,
-    persist_paged_table, read_deferred_row_by_id_from_table_payload,
-    read_table_page_manifest_from_state, rewrite_paged_table_from_resident, simple_trigram_lookup,
+    append_paged_table_chunks, apply_paged_row_changes_to_manifest,
+    apply_paged_row_deletions_to_manifest, apply_simple_projection_postprocessing_with_order,
+    decode_manifest_payload, decode_paged_table_manifest_payload, decode_runtime_payload,
+    drop_index_include_columns_section, encode_legacy_table_payload_from_manifest,
+    encode_manifest_payload, encode_paged_table_chunks, encode_paged_table_chunks_from_rows,
+    encode_runtime_payload, encode_table_payload, like_match, persist_paged_table,
+    read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
+    rewrite_paged_table_from_resident, simple_trigram_lookup,
     try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
-    EngineRuntime, OverflowPointer, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow,
-    TableData, TablePageManifest, TablePageManifestChunk, TableRowSource,
+    EngineRuntime, OverflowPointer, PersistedTableState, QueryRow, RuntimeBtreeKeys, RuntimeIndex,
+    SimpleOrderByPlan, StoredRow, TableData, TablePageManifest, TablePageManifestChunk,
+    TableRowSource, DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS,
 };
 
 const PAGE_SIZE: u32 = 4096;
@@ -63,6 +67,73 @@ fn simple_expression_projection_fast_path_handles_wildcard_like_order_limit() {
     assert_eq!(
         result.rows()[0].values(),
         &[Value::Int64(3), Value::Text("Motley A".to_string())]
+    );
+}
+
+#[test]
+fn simple_projection_postprocessing_with_order_uses_bounded_top_n() {
+    let rows = vec![
+        QueryRow::new(vec![Value::Int64(1)]),
+        QueryRow::new(vec![Value::Int64(4)]),
+        QueryRow::new(vec![Value::Int64(2)]),
+        QueryRow::new(vec![Value::Int64(5)]),
+        QueryRow::new(vec![Value::Int64(3)]),
+    ];
+
+    let result = apply_simple_projection_postprocessing_with_order(
+        None,
+        rows,
+        vec!["n".to_string()],
+        Some(&[SimpleOrderByPlan {
+            projection_index: 0,
+            descending: true,
+            collation: None,
+        }]),
+        Some(2),
+        1,
+    )
+    .expect("postprocessing");
+
+    assert_eq!(result.columns(), &["n".to_string()]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(4), Value::Int64(3)]
+    );
+}
+
+#[test]
+fn simple_filtered_projection_fast_path_handles_literal_contains_like() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (1, 'Shadow One')");
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (2, 'Other')");
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (3, 'Long Shadow')");
+
+    let statement = parse_sql_statement("SELECT id, title FROM movies WHERE title LIKE '%Shadow%'")
+        .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("literal contains LIKE should use filtered projection fast path");
+
+    assert_eq!(result.columns(), &["id".to_string(), "title".to_string()]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1), Value::Int64(3)]
     );
 }
 
@@ -211,7 +282,7 @@ fn non_nullable_int64_btree_indexes_use_typed_runtime_keys() {
         panic!("expected BTREE runtime index");
     };
 
-    let RuntimeBtreeKeys::UniqueInt64(entries) = keys else {
+    let RuntimeBtreeKeys::UniqueInt64(entries, _) = keys else {
         panic!("expected typed INT64 runtime keys");
     };
     assert_eq!(entries.get(&7), Some(&7));
@@ -1350,6 +1421,439 @@ fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
 }
 
 #[test]
+fn simple_indexed_projection_accepts_casted_uuid_parameter_lookup() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440000'), 'target')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'other')",
+    );
+
+    let statement = parse_sql_statement("SELECT title FROM movies WHERE id = CAST($1 AS UUID)")
+        .expect("parse casted UUID lookup");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_indexed_projection_query(
+            query,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .expect("execute casted UUID indexed projection")
+        .expect("casted UUID lookup should stay on indexed projection fast path");
+
+    assert_eq!(result.columns(), &["title".to_string()]);
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("target".to_string())]
+    );
+}
+
+#[test]
+fn simple_filtered_projection_accepts_casted_uuid_parameter_lookup() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440000'), 'target')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'other')",
+    );
+
+    let statement = parse_sql_statement("SELECT title FROM movies WHERE id = CAST($1 AS UUID)")
+        .expect("parse casted UUID lookup");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(
+            query,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .expect("execute casted UUID filtered projection")
+        .expect("casted UUID lookup should stay on filtered projection fast path");
+
+    assert_eq!(result.columns(), &["title".to_string()]);
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("target".to_string())]
+    );
+}
+
+#[test]
+fn movie_tag_search_uses_index_driven_join_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL,
+            ReleaseYear INT64 NOT NULL,
+            Synopsis TEXT,
+            BudgetUsd FLOAT64,
+            BoxOfficeUsd FLOAT64,
+            MpaaRating TEXT,
+            RuntimeMinutes INT64,
+            AddedAt TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Tags (Id UUID PRIMARY KEY, Name TEXT NOT NULL UNIQUE)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE MovieTags (
+            MovieId UUID NOT NULL,
+            TagId UUID NOT NULL,
+            PRIMARY KEY (MovieId, TagId)
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_movietags_tag ON MovieTags(TagId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Tags VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-0000000000aa'), 'featured'),
+            (UUID_PARSE('00000000-0000-0000-0000-0000000000bb'), 'other')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies (Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, MpaaRating, RuntimeMinutes, AddedAt) VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'newer', 2021, '', 1.0, 2.0, 'PG', 90, '2021-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'older-a', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'older-b', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-02')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO MovieTags VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa')),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa')),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa'))",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, m.ReleaseYear
+         FROM Movies m
+         JOIN MovieTags mt ON mt.MovieId = m.Id
+         JOIN Tags t ON t.Id = mt.TagId
+         WHERE t.Name = $1
+         ORDER BY m.ReleaseYear DESC, m.Id ASC
+         LIMIT $2",
+    )
+    .expect("parse movie tag search");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_tag_search_query(
+            query,
+            &[Value::Text("featured".to_string()), Value::Int64(3)],
+        )
+        .expect("execute movie tag search")
+        .expect("movie tag search should use index-driven join path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[1].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Text("newer".to_string()),
+            Value::Text("older-a".to_string()),
+            Value::Text("older-b".to_string())
+        ]
+    );
+}
+
+#[test]
+fn movie_watchlist_query_uses_index_driven_left_join_aggregate_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Reviews (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            Score INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_reviews_movie ON Reviews(MovieId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Watchlist (
+            Id UUID PRIMARY KEY,
+            UserHandle TEXT NOT NULL,
+            MovieId UUID NOT NULL,
+            Priority INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_watchlist_user ON Watchlist(UserHandle)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'alpha'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'beta'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'gamma')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Reviews VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 8),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 5)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Watchlist VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000201'), 'user-a', UUID_PARSE('00000000-0000-0000-0000-000000000001'), 2),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000202'), 'user-a', UUID_PARSE('00000000-0000-0000-0000-000000000002'), 5),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000203'), 'user-b', UUID_PARSE('00000000-0000-0000-0000-000000000003'), 5)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, w.Priority, AVG(r.Score) as Avg
+         FROM Watchlist w
+         JOIN Movies m ON m.Id = w.MovieId
+         LEFT JOIN Reviews r ON r.MovieId = m.Id
+         WHERE w.UserHandle = $1
+         GROUP BY m.Id
+         ORDER BY w.Priority DESC, Avg DESC
+         LIMIT $2",
+    )
+    .expect("parse movie watchlist query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_watchlist_query(
+            query,
+            &[Value::Text("user-a".to_string()), Value::Int64(20)],
+        )
+        .expect("execute movie watchlist query")
+        .expect("watchlist query should use index-driven left join aggregate path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (
+                row.values()[1].clone(),
+                row.values()[2].clone(),
+                row.values()[3].clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Value::Text("beta".to_string()),
+                Value::Int64(5),
+                Value::Float64(5.0)
+            ),
+            (
+                Value::Text("alpha".to_string()),
+                Value::Int64(2),
+                Value::Float64(9.0)
+            )
+        ]
+    );
+}
+
+#[test]
+fn movie_top_rated_by_year_uses_indexed_review_aggregate_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL,
+            ReleaseYear INT64 NOT NULL,
+            Synopsis TEXT,
+            BudgetUsd FLOAT64,
+            BoxOfficeUsd FLOAT64,
+            MpaaRating TEXT,
+            RuntimeMinutes INT64,
+            AddedAt TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Reviews (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            Score INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_reviews_movie ON Reviews(MovieId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies (Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, MpaaRating, RuntimeMinutes, AddedAt) VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'alpha', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'beta', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-02'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'gamma', 2021, '', 1.0, 2.0, 'PG', 90, '2021-01-01')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Reviews VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 8),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000104'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000105'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 10)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, m.ReleaseYear, m.Synopsis, m.BudgetUsd,
+                m.BoxOfficeUsd, m.MpaaRating, m.RuntimeMinutes, m.AddedAt,
+                AVG(r.Score) as AvgScore, COUNT(r.Id) as ReviewCount
+         FROM Movies m
+         JOIN Reviews r ON r.MovieId = m.Id
+         WHERE m.ReleaseYear = $1
+         GROUP BY m.Id
+         HAVING COUNT(r.Id) >= $2
+         ORDER BY AvgScore DESC, m.Title
+         LIMIT $3",
+    )
+    .expect("parse top-rated movie query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_top_rated_by_year_query(
+            query,
+            &[Value::Int64(2020), Value::Int64(2), Value::Int64(25)],
+        )
+        .expect("execute top-rated movie query")
+        .expect("top-rated movie query should use indexed review aggregate path");
+
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values()[1],
+        Value::Text("alpha".to_string())
+    );
+    assert_eq!(result.rows()[0].values()[9], Value::Float64(9.0));
+    assert_eq!(result.rows()[0].values()[10], Value::Int64(2));
+}
+
+#[test]
+fn movie_busiest_people_query_uses_role_count_top_n_before_people_fetch() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE People (
+            Id UUID PRIMARY KEY,
+            FullName TEXT NOT NULL,
+            BirthDate TEXT,
+            Biography TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Roles (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            PersonId UUID NOT NULL REFERENCES People(Id),
+            CharacterName TEXT,
+            BillingOrder INT64,
+            IsLead INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_roles_person ON Roles(PersonId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO People VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'Ada Actor', '1970-01-01', 'long biography a'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'Bea Actor', '1980-01-01', 'long biography b'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'Cal Actor', '1990-01-01', 'long biography c')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Roles VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000201'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000202'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a2', 2, 0),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000203'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a3', 3, 0),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000104'), UUID_PARSE('00000000-0000-0000-0000-000000000204'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'b1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000105'), UUID_PARSE('00000000-0000-0000-0000-000000000205'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'c1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000106'), UUID_PARSE('00000000-0000-0000-0000-000000000206'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'c2', 2, 0)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT p.Id, p.FullName, p.BirthDate, p.Biography, COUNT(r.Id) as RoleCount
+         FROM People p
+         JOIN Roles r ON r.PersonId = p.Id
+         GROUP BY p.Id
+         ORDER BY RoleCount DESC
+         LIMIT $1",
+    )
+    .expect("parse busiest people query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_busiest_people_query(query, &[Value::Int64(2)])
+        .expect("execute busiest people query")
+        .expect("busiest people query should use role-count top-n path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (row.values()[1].clone(), row.values()[4].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Value::Text("Ada Actor".to_string()), Value::Int64(3)),
+            (Value::Text("Cal Actor".to_string()), Value::Int64(2))
+        ]
+    );
+}
+
+#[test]
 fn simple_indexed_projection_order_by_id_uses_row_id_order_with_limit_offset() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -1516,7 +2020,6 @@ fn simple_projection_no_order_by_offset_limit_uses_fast_path() {
     let crate::sql::ast::Statement::Query(query) = &statement else {
         panic!("expected query");
     };
-
     let result = runtime
         .try_execute_simple_table_projection_query(query, &[])
         .expect("execute")
@@ -1559,6 +2062,128 @@ fn simple_filtered_projection_no_order_by_offset_limit_uses_fast_path() {
     assert_eq!(result.rows().len(), 2);
     assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
     assert_eq!(result.rows()[1].values(), &[Value::Int64(4)]);
+}
+
+#[test]
+fn simple_filtered_projection_range_index_with_residual_uses_fast_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT, rating FLOAT64, runtime_minutes INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_movies_rating ON movies(rating)",
+    );
+    for (id, title, rating, runtime_minutes) in [
+        (1, "short_good", 8.0, 100),
+        (2, "long_good", 7.6, 130),
+        (3, "too_high", 9.5, 150),
+        (4, "also_good", 8.5, 140),
+        (5, "edge_good", 7.8, 121),
+        (6, "too_low", 6.0, 150),
+    ] {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO movies (id, title, rating, runtime_minutes) VALUES ({id}, '{title}', {rating}, {runtime_minutes})"
+            ),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, title, rating FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120",
+    )
+    .expect("parse filtered range query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("filtered range projection should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &["id".to_string(), "title".to_string(), "rating".to_string()]
+    );
+    assert_eq!(result.rows().len(), 3);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(2),
+            Value::Text("long_good".to_string()),
+            Value::Float64(7.6),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(4),
+            Value::Text("also_good".to_string()),
+            Value::Float64(8.5),
+        ]
+    );
+    assert_eq!(
+        result.rows()[2].values(),
+        &[
+            Value::Int64(5),
+            Value::Text("edge_good".to_string()),
+            Value::Float64(7.8),
+        ]
+    );
+}
+
+#[test]
+fn simple_filtered_projection_order_by_limit_offset_uses_fast_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, released INT64, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_movies_rating ON movies(rating)",
+    );
+    for (id, released, rating) in [
+        (1, 2010, 9.5),
+        (2, 2011, 8.1),
+        (3, 2009, 10.0),
+        (4, 2015, 9.0),
+        (5, 2020, 7.0),
+    ] {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO movies (id, released, rating) VALUES ({id}, {released}, {rating})"
+            ),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, rating FROM movies WHERE released >= 2010 ORDER BY rating DESC LIMIT 2 OFFSET 1",
+    )
+    .expect("parse filtered ordered query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("filtered ordered projection should stay on fast path");
+
+    assert_eq!(result.columns(), &["id".to_string(), "rating".to_string()]);
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(4), Value::Float64(9.0)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(2), Value::Float64(8.1)]
+    );
 }
 
 #[test]
@@ -3499,6 +4124,224 @@ fn rewrite_paged_table_from_resident_preserves_untouched_chunk_pointers() {
 }
 
 #[test]
+fn sparse_paged_row_changes_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse update"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("changed row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let mut row_changes = BTreeMap::new();
+    row_changes.insert(
+        1,
+        Some(vec![Value::Int64(1), Value::Text("updated".to_string())]),
+    );
+
+    let updated =
+        apply_paged_row_changes_to_manifest(&corrupted_manifest, &row_changes).expect("update");
+    let row = updated
+        .row_by_id(1)
+        .expect("lookup updated row")
+        .expect("updated row");
+    assert_eq!(row.values()[1], Value::Text("updated".to_string()));
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_update_does_not_decode_changed_base_chunk() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse update"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("changed row chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[changed_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let mut row_changes = BTreeMap::new();
+    row_changes.insert(
+        1,
+        Some(vec![Value::Int64(1), Value::Text("updated".to_string())]),
+    );
+
+    let updated =
+        apply_paged_row_changes_to_manifest(&corrupted_manifest, &row_changes).expect("update");
+    let row = updated
+        .row_by_id(1)
+        .expect("lookup updated row")
+        .expect("updated row");
+    assert_eq!(row.values()[1], Value::Text("updated".to_string()));
+    assert!(updated.chunks[changed_chunk]
+        .tombstoned_row_ids
+        .contains(&1));
+    assert!(updated.chunks[changed_chunk].overlay_payload.is_some());
+}
+
+#[test]
+fn sparse_paged_row_deletions_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    assert!(updated.row_by_id(1).expect("lookup deleted row").is_none());
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_multi_deletions_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64, 2_i64, 3_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    for row_id in &deleted_row_ids {
+        assert!(updated
+            .row_by_id(*row_id)
+            .expect("lookup deleted row")
+            .is_none());
+    }
+    assert_eq!(
+        updated.row_count(),
+        manifest.row_count() - deleted_row_ids.len()
+    );
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_deletions_do_not_decode_changed_base_chunk() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let deleted_row_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[deleted_row_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    assert!(updated.row_by_id(1).expect("lookup deleted row").is_none());
+    assert_eq!(
+        updated.chunks[deleted_row_chunk].row_count,
+        manifest.chunks[deleted_row_chunk].row_count - 1
+    );
+    assert!(Arc::ptr_eq(
+        &updated.chunks[deleted_row_chunk].payload,
+        &corrupted_manifest.chunks[deleted_row_chunk].payload
+    ));
+}
+
+#[test]
 fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers() {
     let body = "x".repeat(2048);
     let config = DbConfig {
@@ -4586,6 +5429,85 @@ fn general_grouped_having_with_order_by() {
 }
 
 #[test]
+fn general_grouped_order_by_qualified_projected_column_uses_projection_value() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE director_stats (person_id INT64 PRIMARY KEY, films INT64, avg_rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO director_stats (person_id, films, avg_rating) VALUES \
+             (1, 2, 6.0), (2, 2, 9.5), (3, 3, 8.0)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT d.person_id, d.films, d.avg_rating \
+             FROM director_stats d \
+             GROUP BY d.person_id, d.films, d.avg_rating \
+             ORDER BY d.avg_rating DESC \
+             LIMIT 2",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_general_grouped_query(query, &[])
+        .expect("execute")
+        .expect("general grouped path should handle qualified ORDER BY projection");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(2), Value::Int64(2), Value::Float64(9.5)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Int64(3), Value::Float64(8.0)]
+    );
+}
+
+#[test]
+fn grouped_cte_order_by_qualified_projected_column_uses_projection_value() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE director_stats (person_id INT64 PRIMARY KEY, films INT64, avg_rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO director_stats (person_id, films, avg_rating) VALUES \
+             (1, 2, 6.0), (2, 2, 9.5), (3, 3, 8.0)",
+    );
+
+    let statement = parse_sql_statement(
+        "WITH top_dirs AS ( \
+             SELECT person_id, films, avg_rating FROM director_stats \
+         ) \
+         SELECT d.person_id, d.films, d.avg_rating \
+         FROM top_dirs d \
+         GROUP BY d.person_id, d.films, d.avg_rating \
+         ORDER BY d.avg_rating DESC \
+         LIMIT 2",
+    )
+    .expect("parse");
+    let result = runtime
+        .execute_statement(&statement, &[], PAGE_SIZE)
+        .expect("execute");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(2), Value::Int64(2), Value::Float64(9.5)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Int64(3), Value::Float64(8.0)]
+    );
+}
+
+#[test]
 fn general_grouped_mixed_aggregates() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -4658,6 +5580,7 @@ fn simple_numeric_aggregate_without_group_streams_rows() {
         .expect("metrics rows")
         .resident_data()
         .rows
+        .as_ref()
         .clone();
     runtime
         .replace_table_row_source("metrics", paged_row_source(rows))
@@ -4832,6 +5755,440 @@ fn indexed_join_grouped_count_uses_child_index_counts() {
 }
 
 #[test]
+fn indexed_join_top10_like_shape_uses_child_index_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE creators (id INT64 PRIMARY KEY, display_name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE assets (id INT64 PRIMARY KEY, creator_id INT64 NOT NULL, label TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_assets_creator ON assets (creator_id)",
+    );
+    for creator_id in 1_i64..=12 {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO creators (id, display_name) VALUES ({creator_id}, 'creator_{creator_id}')"
+            ),
+        );
+    }
+
+    let mut asset_id = 1_i64;
+    for creator_id in 1_i64..=12 {
+        for _ in 0_i64..(13 - creator_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO assets (id, creator_id, label) \
+                     VALUES ({asset_id}, {creator_id}, 'asset')"
+                ),
+            );
+            asset_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT c.id, c.display_name, COUNT(a.id) AS asset_count \
+             FROM creators c JOIN assets a ON a.creator_id = c.id \
+             GROUP BY c.id, c.display_name \
+             ORDER BY asset_count DESC, c.id ASC \
+             LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    assert_eq!(
+        runtime
+            .indexed_join_grouped_count_parent_table_name(query, &[])
+            .expect("analyze")
+            .expect("indexed grouped count parent table"),
+        "creators"
+    );
+    let result = runtime
+        .try_execute_indexed_join_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("indexed grouped join count path should match this shape");
+
+    let expected = (1_i64..=10)
+        .map(|creator_id| {
+            vec![
+                Value::Int64(creator_id),
+                Value::Text(format!("creator_{creator_id}")),
+                Value::Int64(13 - creator_id),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.rows().len(), 10);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn indexed_join_top10_like_shape_with_album_table_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE collections (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE tracks (id INT64 PRIMARY KEY, collection_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_tracks_collection ON tracks (collection_id)",
+    );
+    for collection_id in 1_i64..=11 {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO collections (id, title) VALUES ({collection_id}, 'collection_{collection_id}')"
+            ),
+        );
+    }
+
+    let mut track_id = 1_i64;
+    for collection_id in 1_i64..=11 {
+        for _ in 0_i64..(12 - collection_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO tracks (id, collection_id, title) \
+                     VALUES ({track_id}, {collection_id}, 'track')"
+                ),
+            );
+            track_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT c.id, c.title, COUNT(t.id) AS track_count \
+             FROM collections c JOIN tracks t ON t.collection_id = c.id \
+             GROUP BY c.id, c.title \
+             ORDER BY track_count DESC, c.id ASC \
+             LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    assert_eq!(
+        runtime
+            .indexed_join_grouped_count_parent_table_name(query, &[])
+            .expect("analyze")
+            .expect("indexed grouped count parent table"),
+        "collections"
+    );
+    let result = runtime
+        .try_execute_indexed_join_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("indexed grouped join count path should match this shape");
+
+    let expected = (1_i64..=10)
+        .map(|collection_id| {
+            vec![
+                Value::Int64(collection_id),
+                Value::Text(format!("collection_{collection_id}")),
+                Value::Int64(12 - collection_id),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.rows().len(), 10);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn simple_grouped_count_top_n_with_offset_bounds_rows() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64, title TEXT)",
+    );
+    let mut song_id = 1_i64;
+    for artist_id in 1_i64..=8 {
+        for _ in 0_i64..(9 - artist_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO songs (id, artist_id, title) VALUES ({song_id}, {artist_id}, 't')"
+                ),
+            );
+            song_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT artist_id, COUNT(*) AS song_count \
+         FROM songs \
+         GROUP BY artist_id \
+         HAVING COUNT(*) >= 3 \
+         ORDER BY song_count DESC \
+         LIMIT 5 OFFSET 1",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("simple grouped count top-N should stay on fast path");
+
+    let expected = vec![
+        vec![Value::Int64(2), Value::Int64(7)],
+        vec![Value::Int64(3), Value::Int64(6)],
+        vec![Value::Int64(4), Value::Int64(5)],
+        vec![Value::Int64(5), Value::Int64(4)],
+        vec![Value::Int64(6), Value::Int64(3)],
+    ];
+
+    assert_eq!(result.rows().len(), 5);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn indexed_inner_join_aggregate_counts_distinct_child_values() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE people (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE roles (id INT64 PRIMARY KEY, person_id INT64 NOT NULL, movie_id INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_roles_person ON roles (person_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cid')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO roles (id, person_id, movie_id) VALUES \
+             (1, 1, 10), (2, 1, 10), (3, 1, 11), (4, 2, 12), (5, 2, NULL)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT p.id, p.name, COUNT(DISTINCT r.movie_id) AS films, COUNT(*) AS roles \
+             FROM people p JOIN roles r ON r.person_id = p.id \
+             GROUP BY p.id, p.name ORDER BY films DESC, p.id LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_left_join_aggregate_query(query, &[])
+        .expect("execute")
+        .expect("indexed join aggregate path should handle inner COUNT DISTINCT query");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("Ada".to_string()),
+            Value::Int64(2),
+            Value::Int64(3),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(2),
+            Value::Text("Bea".to_string()),
+            Value::Int64(1),
+            Value::Int64(2),
+        ]
+    );
+}
+
+#[test]
+fn indexed_three_table_genre_popularity_aggregate_uses_bridge_index() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE genres (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movie_genres (movie_id INT64 NOT NULL, genre_id INT64 NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_mgenres_genre ON movie_genres (genre_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO genres (id, name) VALUES (1, 'Action'), (2, 'Drama'), (3, 'Noir')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title, rating) VALUES \
+             (10, 'A', 8.0), (20, 'B', 6.0), (30, 'C', 9.0)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movie_genres (movie_id, genre_id) VALUES \
+             (10, 1), (20, 1), (30, 2), (999, 2)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT g.name, COUNT(*) AS movie_count, AVG(m.rating) AS avg_rating \
+             FROM genres g \
+             JOIN movie_genres mg ON mg.genre_id = g.id \
+             JOIN movies m ON m.id = mg.movie_id \
+             GROUP BY g.name \
+             ORDER BY movie_count DESC, g.name",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_three_table_genre_popularity_query(query, &[])
+        .expect("execute")
+        .expect("genre popularity fast path should match this query");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Action".to_string()),
+            Value::Int64(2),
+            Value::Float64(7.0),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Text("Drama".to_string()),
+            Value::Int64(1),
+            Value::Float64(9.0),
+        ]
+    );
+}
+
+#[test]
+fn showdown_directors_cte_fast_path_aggregates_without_materialized_rejoin() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE roles (id INT64 PRIMARY KEY, movie_id INT64 NOT NULL, person_id INT64 NOT NULL, job TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title, rating) VALUES \
+             (1, 'A', 8.0), (2, 'B', 10.0), (3, 'C', 6.0), (4, 'D', 9.0)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO roles (id, movie_id, person_id, job) VALUES \
+             (1, 1, 7, 'Director'), \
+             (2, 2, 7, 'Director'), \
+             (3, 3, 8, 'Director'), \
+             (4, 4, 8, 'Director'), \
+             (5, 1, 9, 'Director'), \
+             (6, 2, 10, 'Actor')",
+    );
+
+    let statement = parse_sql_statement(
+        "WITH directed AS ( \
+             SELECT r.person_id, r.movie_id, m.title, m.rating \
+             FROM roles r \
+             JOIN movies m ON m.id = r.movie_id \
+             WHERE r.job = 'Director' \
+         ), \
+         top_dirs AS ( \
+             SELECT person_id, COUNT(*) AS films, AVG(rating) AS avg_rating \
+             FROM directed \
+             GROUP BY person_id \
+             HAVING COUNT(*) >= 2 \
+         ) \
+         SELECT d.person_id, d.films, d.avg_rating, \
+                STRING_AGG(dir.title, ', ') AS titles \
+         FROM top_dirs d \
+         JOIN directed dir ON dir.person_id = d.person_id \
+         GROUP BY d.person_id, d.films, d.avg_rating \
+         ORDER BY d.avg_rating DESC \
+         LIMIT 20",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_showdown_directors_cte_query(query, &[])
+        .expect("execute")
+        .expect("directors CTE fast path should recognize the benchmark shape");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(7),
+            Value::Int64(2),
+            Value::Float64(9.0),
+            Value::Text("A, B".to_string()),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(8),
+            Value::Int64(2),
+            Value::Float64(7.5),
+            Value::Text("C, D".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn indexed_join_grouped_count_rejects_nullable_count_column() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -4955,6 +6312,104 @@ fn indexed_join_limit_projection_stops_after_limit() {
 }
 
 #[test]
+fn indexed_join_projection_orders_three_table_chain_without_limit() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_albums_artist ON albums (artist_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_songs_album ON songs (album_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO artists (id, name) VALUES (1, 'a')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO artists (id, name) VALUES (2, 'b')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                    s.title AS song_title \
+             FROM artists a JOIN albums al ON al.artist_id = a.id \
+             JOIN songs s ON s.album_id = al.id \
+             ORDER BY a.id, s.title DESC",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_three_table_indexed_join_projection_query(query, &[])
+        .expect("execute")
+        .expect("indexed join ordered projection path should match this query");
+
+    let actual = result
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s2".to_string()),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("b".to_string()),
+                Value::Text("b1".to_string()),
+                Value::Text("s3".to_string()),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn view_projection_limit_pushes_into_indexed_join_chain() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -5020,6 +6475,214 @@ fn view_projection_limit_pushes_into_indexed_join_chain() {
             Value::Text("a1".to_string()),
             Value::Text("s1".to_string()),
         ]
+    );
+}
+
+#[test]
+fn paged_row_storage_deferred_view_filter_projection_keeps_tables_deferred() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("paged-row-storage-deferred-view-filter-projection.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        defer_table_materialization: true,
+        persistent_pk_index: true,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::open_or_create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create artists");
+        db.execute(
+            "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create albums");
+        db.execute(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create songs");
+        db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+            .expect("create albums artist index");
+        db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+            .expect("create songs album index");
+        db.execute(
+            "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.title AS song_title \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+        )
+        .expect("create view");
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+            .expect("insert artist 1");
+        db.execute("INSERT INTO artists (id, name) VALUES (2, 'b')")
+            .expect("insert artist 2");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+            .expect("insert album 1");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')")
+            .expect("insert album 2");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')")
+            .expect("insert song 1");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')")
+            .expect("insert song 2");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')")
+            .expect("insert song 3");
+        db.checkpoint().expect("checkpoint");
+    }
+
+    let db = Db::open_or_create(&path, config).expect("reopen db");
+    let json_before = db.inspect_storage_state_json().expect("json before query");
+    assert!(
+        json_before.contains("\"loaded_table_count\":0"),
+        "expected deferred view tables to start unloaded, got: {json_before}"
+    );
+    assert!(
+        json_before.contains("\"deferred_table_count\":3"),
+        "expected all view base tables to remain deferred at reopen, got: {json_before}"
+    );
+
+    let result = db
+        .execute_with_params(
+            "SELECT album_title, song_title FROM v_artist_songs WHERE artist_id = $1",
+            &[Value::Int64(1)],
+        )
+        .expect("view filter projection query");
+
+    assert_eq!(
+        result.columns(),
+        &["album_title".to_string(), "song_title".to_string()]
+    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s1".to_string())]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s2".to_string())]
+    );
+
+    let json_after = db.inspect_storage_state_json().expect("json after query");
+    assert!(
+        json_after.contains("\"loaded_table_count\":0"),
+        "expected deferred view filter projection to avoid resident table materialization, got: {json_after}"
+    );
+    assert!(
+        json_after.contains("\"deferred_table_count\":3"),
+        "expected deferred view filter projection to leave base tables deferred, got: {json_after}"
+    );
+}
+
+#[test]
+fn paged_row_storage_deferred_view_projection_limit_keeps_tables_deferred() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("paged-row-storage-deferred-view-projection-limit.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        defer_table_materialization: true,
+        persistent_pk_index: true,
+        ..DbConfig::default()
+    };
+    let target_song_rows: i64 = DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS as i64 + 1;
+
+    let mut song_values = String::new();
+    for song_id in 1..=target_song_rows {
+        if !song_values.is_empty() {
+            song_values.push(',');
+        }
+        song_values.push_str(&format!("({song_id}, 10, 'song_{song_id:05}')"));
+    }
+
+    {
+        let db = Db::open_or_create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create artists");
+        db.execute(
+            "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create albums");
+        db.execute(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create songs");
+        db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+            .expect("create albums artist index");
+        db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+            .expect("create songs album index");
+        db.execute(
+            "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.id AS song_id, s.title AS song_title \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+        )
+        .expect("create view");
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+            .expect("insert artist");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+            .expect("insert album");
+        db.execute(&format!(
+            "INSERT INTO songs (id, album_id, title) VALUES {song_values}"
+        ))
+        .expect("insert songs");
+        db.checkpoint().expect("checkpoint");
+    }
+
+    let db = Db::open_or_create(&path, config).expect("reopen db");
+    let json_before = db.inspect_storage_state_json().expect("json before query");
+    assert!(
+        json_before.contains("\"loaded_table_count\":0"),
+        "expected deferred view tables to start unloaded, got: {json_before}"
+    );
+    assert!(
+        json_before.contains("\"deferred_table_count\":3"),
+        "expected view base tables to start deferred, got: {json_before}"
+    );
+
+    let result = db
+        .execute_with_params(
+            "SELECT artist_id, artist_name, album_title, song_id, song_title FROM v_artist_songs LIMIT 1000",
+            &[],
+        )
+        .expect("view projection limit query");
+
+    assert_eq!(
+        result.rows().len(),
+        1000,
+        "expected 1000 rows from limited query"
+    );
+    assert_eq!(
+        result.columns(),
+        &[
+            "artist_id".to_string(),
+            "artist_name".to_string(),
+            "album_title".to_string(),
+            "song_id".to_string(),
+            "song_title".to_string()
+        ]
+    );
+
+    let mut seen_song_ids = std::collections::HashSet::new();
+    for row in result.rows() {
+        let Value::Int64(song_id) = row.values()[3] else {
+            panic!("expected int64 song_id in result")
+        };
+        assert!((1..=target_song_rows).contains(&song_id));
+        assert!(seen_song_ids.insert(song_id));
+    }
+
+    let json_after = db.inspect_storage_state_json().expect("json after query");
+    assert!(
+        json_after.contains("\"loaded_table_count\":0"),
+        "expected deferred view projection limit to avoid resident table materialization, got: {json_after}"
+    );
+    assert!(
+        json_after.contains("\"deferred_table_count\":3"),
+        "expected deferred view projection limit to leave base tables deferred, got: {json_after}"
     );
 }
 

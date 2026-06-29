@@ -172,6 +172,7 @@ impl EngineRuntime {
             column_names,
             dependencies,
         };
+        self.cache_view_query(&view, statement.query.clone());
         if temporary {
             self.temp_views_mut().insert(view_name, view);
             self.bump_temp_schema_cookie();

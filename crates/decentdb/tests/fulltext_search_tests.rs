@@ -29,6 +29,34 @@ fn fulltext_match_and_bm25_rank_results() {
 }
 
 #[test]
+fn fulltext_match_bm25_limit_uses_same_top_row_as_full_query() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    create_docs(&db);
+
+    let limited = db
+        .execute(
+            "SELECT id, title, bm25('idx_docs_search') AS rank \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'rust OR database') \
+             ORDER BY rank DESC \
+             LIMIT 1",
+        )
+        .expect("limited fulltext query");
+    let full = db
+        .execute(
+            "SELECT id, title, bm25('idx_docs_search') AS rank \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'rust OR database') \
+             ORDER BY rank DESC",
+        )
+        .expect("full fulltext query");
+
+    assert_eq!(limited.columns(), &["id", "title", "rank"]);
+    assert_eq!(limited.rows().len(), 1);
+    assert_eq!(limited.rows()[0], full.rows()[0]);
+}
+
+#[test]
 fn fulltext_prefix_phrase_update_delete_and_verify_work() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
     create_docs(&db);
@@ -77,6 +105,63 @@ fn fulltext_prefix_phrase_update_delete_and_verify_work() {
         .expect("verify index");
     db.execute("ALTER INDEX idx_docs_search REBUILD")
         .expect("rebuild index");
+}
+
+#[test]
+fn fulltext_range_delete_removes_docs_from_match_search_and_bm25() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    create_docs(&db);
+    db.execute(
+        "INSERT INTO docs (id, title, body) VALUES \
+         (4, 'Delete Range', 'bulk delete coverage'), \
+         (5, 'Remaining Match', 'database search benchmark')",
+    )
+    .expect("insert extra docs");
+
+    db.execute("DELETE FROM docs WHERE id BETWEEN 2 AND 4")
+        .expect("delete range");
+
+    let match_after_delete = db
+        .execute(
+            "SELECT id \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'database') \
+             ORDER BY id",
+        )
+        .expect("database match query");
+    assert_eq!(ids(&match_after_delete), vec![1, 5]);
+
+    let bm25_after_delete = db
+        .execute(
+            "SELECT id, bm25('idx_docs_search') AS rank \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'database') \
+             ORDER BY id",
+        )
+        .expect("bm25 database query");
+    assert_eq!(ids(&bm25_after_delete), vec![1, 5]);
+    for row in bm25_after_delete.rows() {
+        match row.values().first() {
+            Some(Value::Int64(id)) if *id == 1 || *id == 5 => {}
+            other => panic!("expected remaining ids only, got {:?}", other),
+        }
+        let Value::Float64(rank) = row.values().get(1).expect("rank") else {
+            panic!("expected float rank");
+        };
+        assert!(*rank > 0.0);
+    }
+
+    let deleted_matches = db
+        .execute(
+            "SELECT id FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'extensions') \
+             ORDER BY id",
+        )
+        .expect("deleted row query");
+    assert!(deleted_matches.rows().is_empty());
+
+    db.execute("ALTER INDEX idx_docs_search VERIFY")
+        .expect("verify index");
 }
 
 #[test]

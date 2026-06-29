@@ -2,7 +2,7 @@
 
 DecentDB supports a PostgreSQL-like SQL subset.
 
-See also: [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md)
+See also: [Comparison Overview](comparison.md)
 
 ## Data Definition Language (DDL)
 
@@ -488,6 +488,15 @@ Supported scalar functions:
 - `DATETIME(value)` — parse/normalize a datetime string
 - `STRFTIME(format, value)` — format a datetime using `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%w`
 - `EXTRACT(field FROM value)` — extract `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND` from a TIMESTAMP column or datetime string
+- `DATE_TRUNC(part, value)` — truncate a timestamp to `year`, `month`, `day`, `hour`, `minute`, or `second`
+- `DATE_PART(part, value)` — alias-style extraction for date/time parts such as `year` and `doy`
+- `DATE_DIFF(part, start, end)` — difference between two date/time values in the requested part
+- `LAST_DAY(value)` — last day of the month for a date/time value
+- `NEXT_DAY(value, weekday)` — next named weekday after a date/time value
+- `MAKE_DATE(year, month, day)` — construct a date string
+- `MAKE_TIMESTAMP(year, month, day, hour, minute, second)` — construct a TIMESTAMP value
+- `TO_TIMESTAMP(value [, format])` — convert Unix seconds or supported formatted text to TIMESTAMP
+- `AGE(end, start)` — interval-style text difference between two date/time values
 - `CAST(value AS TIMESTAMP)` — convert an ISO 8601 string or int64 microseconds to a native TIMESTAMP
 
 **Other:**
@@ -552,6 +561,13 @@ SELECT '[10,20,30]' ->> 1;  -- Returns '20' (text)
 SELECT NOW(), CURRENT_DATE, CURRENT_TIME;
 SELECT EXTRACT(YEAR FROM '2026-02-24');  -- Returns 2026
 SELECT STRFTIME('%Y-%m-%d', CURRENT_TIMESTAMP);
+SELECT DATE_TRUNC('month', '2024-03-15 14:30:45');
+SELECT DATE_DIFF('day', '2024-03-10', '2024-03-15');
+SELECT LAST_DAY('2024-02-11');
+SELECT NEXT_DAY('2024-03-15', 'Monday');
+SELECT MAKE_DATE(2024, 3, 15);
+SELECT TO_TIMESTAMP(1710505800);
+SELECT AGE('2024-03-15', '2024-03-14');
 SELECT PRINTF('Hello %s, you are %d', name, age) FROM users;
 SELECT ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000) FROM places;
 SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
@@ -601,11 +617,12 @@ Supported:
 - `UNION ALL`
 - `UNION`
 - `INTERSECT`
-- `EXCEPT`
-
-Not supported:
 - `INTERSECT ALL`
+- `EXCEPT`
 - `EXCEPT ALL`
+
+`INTERSECT ALL` and `EXCEPT ALL` preserve duplicate counts using multiset
+semantics.
 
 ### JOINs
 
@@ -642,11 +659,18 @@ SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
 SELECT GROUP_CONCAT(name, ', ') FROM users;  -- Concatenate with separator
 SELECT STRING_AGG(name, ', ') FROM users;    -- Alias for GROUP_CONCAT
+SELECT STDDEV(amount), VARIANCE(amount) FROM orders;
+SELECT BOOL_AND(active), BOOL_OR(active) FROM users;
+SELECT ARRAY_AGG(id ORDER BY id) FROM users;
+SELECT MEDIAN(amount) FROM orders;
+SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount) FROM orders;
+SELECT PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY amount) FROM orders;
 
 -- DISTINCT aggregates: de-duplicate values before aggregating
 SELECT COUNT(DISTINCT category) FROM products;
 SELECT SUM(DISTINCT amount) FROM orders;
 SELECT AVG(DISTINCT score) FROM results;
+SELECT ARRAY_AGG(DISTINCT category ORDER BY category) FROM products;
 ```
 
 ### Window Functions
@@ -759,6 +783,7 @@ PRAGMA encoding;
 PRAGMA busy_timeout;
 PRAGMA locking_mode;
 PRAGMA temp_store;
+PRAGMA flush_plan_cache;
 PRAGMA table_info(users);
 PRAGMA table_xinfo(users);
 PRAGMA table_list;
@@ -768,6 +793,10 @@ PRAGMA index_xinfo(users_name_idx);
 PRAGMA foreign_key_list(orders);
 ```
 
+`PRAGMA wal_checkpoint(...)` flushes committed WAL frames into the database
+file. It does not run DecentDB's optional payload compaction pass; use the
+embedding API or CLI checkpoint command for that maintenance operation.
+
 Assignment behavior is constrained:
 
 - `page_size` and `cache_size` assignments are no-ops only when the assigned
@@ -776,10 +805,14 @@ Assignment behavior is constrained:
   `locking_mode = NORMAL`, and `temp_store = DEFAULT|FILE|0|1` are accepted as
   safe compatibility no-ops.
 - `synchronous = FULL|NORMAL|OFF` succeeds only when it matches the open-time
-  WAL sync mode; it is not a runtime durability downgrade.
+  WAL sync mode. `NORMAL` is also accepted for async-commit opens because that
+  is the SQLite compatibility bucket for non-full per-commit fsync behavior. It
+  is not a runtime durability downgrade.
 - `user_version` and `application_id` persist signed 32-bit transactional
   application metadata.
 - `busy_timeout` sets a connection-local default for queued writes.
+- `flush_plan_cache` flushes the connection-local plan cache; assignment accepts
+  only `PRAGMA flush_plan_cache = local`.
 - PRAGMAs that would imply dirty reads, disabled constraints, alternate journal
   modes, or in-memory temp storage are rejected.
 
@@ -1004,7 +1037,6 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 Not currently supported:
 - Window frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`)
 - Additional window functions (`NTILE`, `PERCENT_RANK`, `CUME_DIST`)
-- `INTERSECT ALL`, `EXCEPT ALL`
 - Stored procedures
 - Distributed transactions
 

@@ -2,11 +2,11 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use super::super::*;
-    use crate::exec::dml::PreparedSimpleInsert;
+    use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::ast::Statement;
     use crate::sql::parser::parse_sql_statement;
 
@@ -136,6 +136,93 @@ mod tests {
             "all value sources should be direct positional"
         );
         assert!(prepared.has_auto_increment);
+    }
+
+    #[test]
+    fn prepare_simple_insert_accepts_casted_uuid_positional_param() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "external_id".to_string(),
+                        column_type: crate::catalog::ColumnType::Uuid,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
+        );
+
+        let stmt = parse_sql_statement(
+            "INSERT INTO movies (id, external_id) VALUES ($1, CAST($2 AS UUID))",
+        )
+        .expect("parse insert");
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert");
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare insert")
+            .expect("simple insert");
+        assert_eq!(prepared.direct_positional_param_count, Some(2));
+        assert!(matches!(
+            &prepared.value_sources[1],
+            PreparedInsertValueSource::Cast {
+                target_type: crate::catalog::ColumnType::Uuid,
+                ..
+            }
+        ));
+
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[
+                    Value::Int64(1),
+                    Value::Text("550e8400-e29b-41d4-a716-446655440002".to_string()),
+                ],
+                4096,
+            )
+            .expect("execute casted insert");
+        let stored = runtime.table_data("movies").expect("table data");
+        assert_eq!(stored.rows.len(), 1);
+        assert!(matches!(stored.rows[0].values[1], Value::Uuid(_)));
     }
 
     #[test]
@@ -306,6 +393,335 @@ mod tests {
         assert_eq!(rows[0].values[0], Value::Int64(42));
         assert_eq!(rows[1].row_id, 43);
         assert_eq!(rows[1].values[0], Value::Int64(43));
+    }
+
+    #[test]
+    fn insert_and_update_returning_project_direct_columns() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "title".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "rating".to_string(),
+                        column_type: crate::catalog::ColumnType::Float64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
+        );
+
+        let insert = parse_sql_statement(
+            "INSERT INTO movies (id, title, rating) VALUES (1, 'RETURNING Test', 3.5) RETURNING id, title",
+        )
+        .expect("parse insert returning");
+        let insert_result = runtime
+            .execute_statement(&insert, &[], 4096)
+            .expect("execute insert returning");
+        assert_eq!(
+            insert_result.columns(),
+            &["id".to_string(), "title".to_string()]
+        );
+        assert_eq!(
+            insert_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Text("RETURNING Test".to_string())]
+        );
+
+        let update = parse_sql_statement(
+            "UPDATE movies SET rating = rating + 0.5 WHERE id = 1 RETURNING id, rating",
+        )
+        .expect("parse update returning");
+        let update_result = runtime
+            .execute_statement(&update, &[], 4096)
+            .expect("execute update returning");
+        assert_eq!(
+            update_result.columns(),
+            &["id".to_string(), "rating".to_string()]
+        );
+        assert_eq!(
+            update_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Float64(4.0)]
+        );
+        assert_eq!(
+            runtime.table_data("movies").expect("table data").rows[0].values[2],
+            Value::Float64(4.0)
+        );
+    }
+
+    #[test]
+    fn update_returning_arithmetic_noop_returns_expected_rows() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "title".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "rating".to_string(),
+                        column_type: crate::catalog::ColumnType::Float64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![
+                        Value::Int64(1),
+                        Value::Text("A".to_string()),
+                        Value::Float64(0.5),
+                    ],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![
+                        Value::Int64(2),
+                        Value::Text("B".to_string()),
+                        Value::Float64(1.5),
+                    ],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![
+                        Value::Int64(3),
+                        Value::Text("C".to_string()),
+                        Value::Float64(2.5),
+                    ],
+                },
+            ]))),
+        );
+        runtime.mark_table_dirty("movies");
+
+        let update = parse_sql_statement(
+            "UPDATE movies SET rating = rating + 0.0 WHERE id <= 3 RETURNING id, rating",
+        )
+        .expect("parse update returning");
+        let update_result = runtime
+            .execute_statement(&update, &[], 4096)
+            .expect("execute update returning");
+        assert_eq!(
+            update_result.columns(),
+            &["id".to_string(), "rating".to_string()]
+        );
+        assert_eq!(update_result.rows().len(), 3);
+        assert_eq!(
+            update_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Float64(0.5)]
+        );
+        assert_eq!(
+            update_result.rows()[1].values(),
+            &[Value::Int64(2), Value::Float64(1.5)]
+        );
+        assert_eq!(
+            update_result.rows()[2].values(),
+            &[Value::Int64(3), Value::Float64(2.5)]
+        );
+    }
+
+    #[test]
+    fn update_returning_arithmetic_restore_clears_resident_dirty_delta() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "rating".to_string(),
+                        column_type: crate::catalog::ColumnType::Float64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Float64(9.0)],
+            }]))),
+        );
+
+        let update = parse_sql_statement(
+            "UPDATE movies SET rating = rating + 1.0 WHERE id = 1 RETURNING id, rating",
+        )
+        .expect("parse update returning");
+        let update_result = runtime
+            .execute_statement(&update, &[], 4096)
+            .expect("execute update returning");
+        assert_eq!(
+            update_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Float64(10.0)]
+        );
+        assert!(runtime.dirty_tables.contains("movies"));
+        assert!(runtime.paged_mutations.contains_key("movies"));
+
+        let revert = parse_sql_statement("UPDATE movies SET rating = rating - 1.0 WHERE id = 1")
+            .expect("parse update revert");
+        let revert_result = runtime
+            .execute_statement(&revert, &[], 4096)
+            .expect("execute update revert");
+        assert_eq!(revert_result.rows().len(), 0);
+        assert_eq!(
+            runtime.table_data("movies").unwrap().rows[0].values[1],
+            Value::Float64(9.0)
+        );
+        assert!(!runtime.dirty_tables.contains("movies"));
+        assert!(!runtime.paged_mutations.contains_key("movies"));
+    }
+
+    #[test]
+    fn recursive_integer_series_cte_returns_expected_rows() {
+        let mut runtime = EngineRuntime::empty(1);
+        let statement = parse_sql_statement(
+            "
+            WITH RECURSIVE series(n) AS (
+                SELECT 1
+                UNION ALL
+                SELECT n + 1 FROM series WHERE n < 100
+            )
+            SELECT n FROM series
+            ",
+        )
+        .expect("parse recursive series CTE");
+        let result = runtime
+            .execute_statement(&statement, &[], 4096)
+            .expect("execute recursive series CTE");
+        assert_eq!(result.columns(), &["n".to_string()]);
+        assert_eq!(result.rows().len(), 100);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
+        assert_eq!(result.rows()[99].values(), &[Value::Int64(100)]);
     }
 
     #[test]
@@ -560,6 +976,196 @@ mod tests {
     }
 
     #[test]
+    fn rowid_noop_upsert_preserves_unassigned_columns() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "genres".to_string(),
+            crate::catalog::TableSchema {
+                name: "genres".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: true,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "name".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "description".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 2,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "genres".to_string(),
+            TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![
+                    Value::Int64(1),
+                    Value::Text("Action".to_string()),
+                    Value::Text("original".to_string()),
+                ],
+            }])
+            .into(),
+        );
+
+        let stmt = parse_sql_statement(
+            "INSERT INTO genres (id, name, description) VALUES (1, 'Action', 'changed') \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+        )
+        .expect("parse rowid upsert");
+        let result = runtime
+            .execute_statement(&stmt, &[], 4096)
+            .expect("execute rowid upsert");
+        assert_eq!(result.affected_rows(), 1);
+        let rows = &runtime.table_data("genres").expect("table data").rows;
+        assert_eq!(
+            rows[0].values,
+            vec![
+                Value::Int64(1),
+                Value::Text("Action".to_string()),
+                Value::Text("original".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rowid_noop_upsert_with_reordered_insert_columns_preserves_unassigned_columns() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "genres".to_string(),
+            crate::catalog::TableSchema {
+                name: "genres".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: true,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "name".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "description".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 2,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "genres".to_string(),
+            TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![
+                    Value::Int64(1),
+                    Value::Text("Action".to_string()),
+                    Value::Text("original".to_string()),
+                ],
+            }])
+            .into(),
+        );
+
+        let stmt = parse_sql_statement(
+            "INSERT INTO genres (description, id, name) VALUES ('changed', 1, 'Action') \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+        )
+        .expect("parse rowid upsert");
+        let result = runtime
+            .execute_statement(&stmt, &[], 4096)
+            .expect("execute rowid upsert");
+        assert_eq!(result.affected_rows(), 1);
+        let rows = &runtime.table_data("genres").expect("table data").rows;
+        assert_eq!(
+            rows[0].values,
+            vec![
+                Value::Int64(1),
+                Value::Text("Action".to_string()),
+                Value::Text("original".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn prepare_simple_delete_with_restrict_child_succeeds() {
         let mut runtime = EngineRuntime::empty(1);
         let parent = crate::catalog::TableSchema {
@@ -657,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_simple_delete_with_cascade_child_falls_back() {
+    fn prepare_simple_delete_with_cascade_child_succeeds() {
         let mut runtime = EngineRuntime::empty(1);
         let parent = crate::catalog::TableSchema {
             name: "parent".to_string(),
@@ -748,8 +1354,14 @@ mod tests {
 
         let prepared = runtime
             .prepare_simple_delete(&delete)
-            .expect("prepare delete");
-        assert!(prepared.is_none());
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert!(prepared.restrict_children.is_empty());
+        assert_eq!(
+            prepared.child_index_hydration_targets(),
+            Vec::<(&str, &str)>::new()
+        );
+        assert_eq!(prepared.affected_table_names(), vec!["parent", "child"]);
     }
 
     #[test]
@@ -1039,7 +1651,7 @@ mod tests {
         runtime.indexes_mut().insert(
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new()),
+                keys: RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new()),
                 covering: None,
             }),
         );
@@ -1212,7 +1824,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: RuntimeBtreeKeys::UniqueEncoded(parent_index_entries),
+                keys: RuntimeBtreeKeys::UniqueEncoded(
+                    Arc::new(parent_index_entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );

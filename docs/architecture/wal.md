@@ -17,21 +17,20 @@ All changes are written to the WAL before being applied to the main database fil
 ### File Format
 
 ```
-WAL File: [Frame1][Frame2]...[FrameN]
+WAL File: [32-byte WAL header][Frame1][Frame2]...[FrameN]
 
 Frame:
   [Type: 1 byte]
   [PageId: 4 bytes]
-  [PayloadLen: 4 bytes]
-  [Payload: N bytes]
-  [Checksum: 8 bytes]
-  [LSN: 8 bytes]
+  [Payload: fixed size for frame type]
+  [Trailer: 8 bytes, reserved]
 ```
 
 Frame Types:
 - **0 (PAGE)**: Modified page data
 - **1 (COMMIT)**: Transaction commit marker
 - **2 (CHECKPOINT)**: Checkpoint completion
+- **3 (PAGE_DELTA)**: Delta-encoded page update
 
 ### Logical Sequence Number (LSN)
 
@@ -49,12 +48,12 @@ Monotonically increasing ID for each frame:
    └─ Acquire write lock
 
 2. INSERT/UPDATE/DELETE
-   └─ Modify pages in cache
-   └─ Append PAGE frames to WAL (in memory)
+   └─ Modify pages in cache or runtime state
+   └─ Buffer full-page or delta WAL frames
 
 3. COMMIT
-   └─ Append COMMIT frame
-   └─ fsync WAL to disk
+   └─ Write buffered frames and COMMIT frame to WAL
+   └─ Sync WAL according to WalSyncMode
    └─ Release write lock
    └─ Return success
 
@@ -68,10 +67,10 @@ Monotonically increasing ID for each frame:
 
 When a page is modified:
 
-1. Copy original page to WAL buffer
-2. Apply changes to cached page
-3. Mark page as dirty
-4. On commit, write WAL buffer to disk
+1. Apply changes to the cached page or higher-level runtime state
+2. Buffer either a full-page frame or a page-delta frame
+3. On commit, write the buffered frames and commit marker to the WAL
+4. Sync according to the configured `WalSyncMode`
 
 ### Commit Durability
 
@@ -87,11 +86,24 @@ Guarantees data is on disk before commit returns.
 **NORMAL Mode:**
 ```
 write(WAL frames)
-fdatasync(WAL file)
+sync WAL data
 return success
 ```
 
-Slightly faster, still very safe.
+Reduced sync overhead compared with full metadata sync. This still performs a
+per-commit data sync and is not the same latency contract as SQLite
+`synchronous=NORMAL` in WAL mode.
+
+**ASYNC_COMMIT Mode:**
+```
+write(WAL frames)
+return success
+background flusher fsyncs on the configured interval
+```
+
+Higher throughput for embedded workloads that can tolerate losing the latest
+acknowledged commits inside the configured interval after an OS crash or power
+loss. Use `Db::sync()` as an explicit durability barrier.
 
 **DEFERRED Mode (Bulk Load):**
 ```
@@ -175,11 +187,12 @@ Readers don't acquire locks:
 ### Torn Write Detection
 
 Incomplete frames are detected via:
-- Checksum mismatch
-- Size mismatch (partial write)
+- WAL logical-end and frame-size validation
+- Size mismatch or incomplete frame body (partial write)
 - Invalid frame type
 
-Corrupt frames are skipped during recovery.
+Frames beyond the durable logical end are ignored during recovery; malformed
+frames inside the durable range are treated as corruption.
 
 ### Recovery Time
 
@@ -199,8 +212,8 @@ Copy committed pages from WAL to main database file.
 ### When to Checkpoint
 
 **Automatic:**
-- WAL reaches threshold size (default: 64MB)
-- Time since last checkpoint (configurable)
+- WAL reaches the configured page or byte threshold
+- a background checkpoint worker usually handles threshold-triggered work
 
 **Manual:**
 ```bash
@@ -210,13 +223,14 @@ decentdb checkpoint --db=my.ddb
 ### Checkpoint Process
 
 ```
-1. Block new write transactions
-2. Copy all committed pages to main DB
-3. Write CHECKPOINT frame to WAL
-4. Determine safe truncate point
+1. Acquire the checkpoint lock
+2. Determine the latest committed safe LSN
+3. Copy eligible committed pages to the main DB when no readers need older WAL
+4. Write a durable CHECKPOINT frame to WAL
+5. Determine safe truncate point
    (min snapshot LSN of all readers)
-5. Truncate WAL if possible
-6. Unblock writers
+6. Truncate WAL if possible
+7. Publish the new checkpoint generation
 ```
 
 ### Reader Coordination
@@ -268,7 +282,7 @@ The response includes `checkpoint_lsn` showing where the data was persisted.
 **Normal:**
 - Writes happen
 - Checkpoint triggers periodically
-- WAL stays bounded (2x checkpoint threshold)
+- WAL stays bounded around the configured checkpoint thresholds
 
 **With Active Readers:**
 - Readers hold old snapshots
@@ -291,21 +305,16 @@ decentdb info --db=my.ddb
 # Shows: WAL LSN, active readers
 ```
 
-### WAL Archive (Future)
-
-For very large databases, archived WAL segments could be:
-- Compressed
-- Stored remotely
-- Used for point-in-time recovery
-
 ## Configuration
 
 DecentDB supports safe SQLite-compatible PRAGMA probes for common WAL and
 configuration questions. `PRAGMA journal_mode` reports `wal`,
 `PRAGMA synchronous` reports the open-time sync mode, and
-`PRAGMA wal_checkpoint(...)` maps to DecentDB's safe checkpoint operation.
-Checkpoint and reader-retention policy are still configured through API/CLI
-settings; PRAGMA assignment does not weaken durability.
+`PRAGMA wal_checkpoint(...)` maps to a WAL-only checkpoint operation. The
+embedding API and CLI checkpoint command may also run optional payload
+compaction maintenance. Checkpoint and reader-retention policy are still
+configured through API/CLI settings; PRAGMA assignment does not weaken
+durability.
 
 ### Checkpointing
 
@@ -316,17 +325,20 @@ decentdb checkpoint --db=my.ddb
 # Or checkpoint after a specific exec
 decentdb exec --db=my.ddb --sql="CREATE INDEX ..." --checkpoint
 
-# Optional: override checkpoint/reader policy for this exec invocation
-# (note: passing any of these flags overrides the engine defaults)
-decentdb exec --db=my.ddb --sql="SELECT 1" \
-  --checkpointBytes=67108864 --readerWarnMs=60000 --readerTimeoutMs=300000 --forceTruncateOnTimeout
+# Native/binding option string example for threshold tuning.
+wal_checkpoint_threshold_bytes=67108864;wal_checkpoint_threshold_pages=4096
 ```
 
-For embedded Rust usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
+For embedded Rust usage, set `DbConfig::wal_checkpoint_threshold_pages` and
+`DbConfig::wal_checkpoint_threshold_bytes` before opening the database.
 
 ### Durability
 
-Commits are durable (fsync-on-commit) by default. For bulk ingestion, use `bulk-load --durability=full|deferred|none`.
+Commits are durable (full WAL sync on commit) by default. For regular SQL,
+choose `WalSyncMode::Normal` or `WalSyncMode::AsyncCommit` only when that
+durability tradeoff is acceptable. CLI bulk-load writes use the database
+handle's open-time WAL sync mode and expose batch, index-maintenance, and
+post-load checkpoint options.
 
 ## Best Practices
 
@@ -349,14 +361,15 @@ Commits are durable (fsync-on-commit) by default. For bulk ingestion, use `bulk-
    - Set up alerts if WAL > 100MB
    - Indicates reader or checkpoint issue
 
-5. **Use bulk-load durability intentionally**
-   - `deferred` (default): batch fsync for higher throughput
-   - `full`: fsync more aggressively
-   - `none` (unsafe): fastest, may lose recent batches on crash
+5. **Use bulk load intentionally**
+   - `--batchSize` controls application-level batch sizing
+   - `--disableIndexes` can reduce index-maintenance cost during load
+   - `--noCheckpoint` defers post-load checkpoint work until your maintenance
+     window
 
-6. **Checkpoint after DDL operations**
+6. **Checkpoint after large DDL or maintenance operations**
    - Use `--checkpoint` with CREATE INDEX to persist immediately
-   - Prevents loss if WAL file is accidentally deleted
+   - Keeps subsequent recovery and backup operations bounded
    - Example: `decentdb exec --db=my.ddb --sql="CREATE INDEX ..." --checkpoint`
 
 ## Troubleshooting
@@ -384,7 +397,8 @@ decentdb info --db=my.ddb
 
 **Solution:**
 - Checkpoint more frequently
-- Checkpoint more frequently (e.g. schedule `decentdb checkpoint`) or use a smaller `--checkpointBytes` policy in long-running embedded usage
+- Use smaller `wal_checkpoint_threshold_bytes` or
+  `wal_checkpoint_threshold_pages` values for long-running embedded usage
 - Monitor with: `decentdb stats --db=...`
 
 ### Corruption After Crash

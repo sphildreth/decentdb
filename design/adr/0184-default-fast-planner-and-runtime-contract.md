@@ -129,7 +129,7 @@ recovery rules, migration coverage, and benchmark proof.
 
 ### References
 
-- `design/WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`
+- `design/_archive/WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`
 - `design/FUTURE_WINS.md`
 - `design/BENCHMARKING_GUIDE.md`
 - `design/adr/0131-legacy-format-migrations.md`

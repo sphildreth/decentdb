@@ -9,6 +9,7 @@ namespace DecentDB.AdoNet;
 public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
 {
     private const string DataSourceKey = "Data Source";
+    private const string PerformanceProfileKey = "Performance Profile";
     private const string CacheSizeKey = "Cache Size";
     private const string LoggingKey = "Logging";
     private const string LogLevelKey = "LogLevel";
@@ -43,6 +44,25 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => TryGetValue(DataSourceKey, out var v) ? (string)v : string.Empty;
         set => this[DataSourceKey] = value;
+    }
+
+    /// <summary>
+    /// Named native performance profile: <c>default</c>, <c>low_memory</c>,
+    /// <c>balanced</c>, <c>embedded_fast</c>, or <c>tuned_durable</c>. Optional.
+    /// Explicit low-level options in the same connection string override profile values.
+    /// </summary>
+    public string? PerformanceProfile
+    {
+        get => TryGetValue(PerformanceProfileKey, out var v)
+            ? (string)v
+            : TryGetValue("Profile", out var alias)
+                ? (string)alias
+                : null;
+        set
+        {
+            if (value == null) Remove(PerformanceProfileKey);
+            else this[PerformanceProfileKey] = value;
+        }
     }
 
     /// <summary>
