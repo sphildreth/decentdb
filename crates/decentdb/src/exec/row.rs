@@ -3,27 +3,35 @@
 use std::sync::Arc;
 
 use crate::record::value::Value;
+use smallvec::SmallVec;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryRow {
-    values: Vec<Value>,
+    values: SmallVec<[Value; 4]>,
 }
 
 impl QueryRow {
     #[must_use]
     pub fn new(values: Vec<Value>) -> Self {
+        Self {
+            values: SmallVec::from_vec(values),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_small_values(values: SmallVec<[Value; 4]>) -> Self {
         Self { values }
     }
 
     #[must_use]
     pub fn values(&self) -> &[Value] {
-        &self.values
+        self.values.as_slice()
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryResult {
-    columns: Arc<[String]>,
+    columns: Option<Arc<[String]>>,
     rows: Vec<QueryRow>,
     affected_rows: u64,
     explain_lines: Vec<String>,
@@ -33,7 +41,7 @@ impl QueryResult {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            columns: Arc::from([]),
+            columns: None,
             rows: Vec::new(),
             affected_rows: 0,
             explain_lines: Vec::new(),
@@ -44,7 +52,7 @@ impl QueryResult {
     pub fn with_rows(columns: Vec<String>, rows: Vec<QueryRow>) -> Self {
         let affected_rows = rows.len() as u64;
         Self {
-            columns: Arc::from(columns),
+            columns: Some(Arc::from(columns)),
             rows,
             affected_rows,
             explain_lines: Vec::new(),
@@ -55,7 +63,7 @@ impl QueryResult {
     pub(crate) fn with_shared_columns(columns: Arc<[String]>, rows: Vec<QueryRow>) -> Self {
         let affected_rows = rows.len() as u64;
         Self {
-            columns,
+            columns: Some(columns),
             rows,
             affected_rows,
             explain_lines: Vec::new(),
@@ -63,9 +71,10 @@ impl QueryResult {
     }
 
     #[must_use]
+    #[inline(always)]
     pub fn with_affected_rows(affected_rows: u64) -> Self {
         Self {
-            columns: Arc::from([]),
+            columns: None,
             rows: Vec::new(),
             affected_rows,
             explain_lines: Vec::new(),
@@ -75,7 +84,7 @@ impl QueryResult {
     #[must_use]
     pub fn with_explain(lines: Vec<String>) -> Self {
         Self {
-            columns: Arc::from(["plan".to_string()]),
+            columns: Some(Arc::from(["plan".to_string()])),
             rows: lines
                 .iter()
                 .cloned()
@@ -88,7 +97,7 @@ impl QueryResult {
 
     #[must_use]
     pub fn columns(&self) -> &[String] {
-        self.columns.as_ref()
+        self.columns.as_deref().unwrap_or(&[])
     }
 
     #[must_use]

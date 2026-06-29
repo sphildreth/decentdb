@@ -5,24 +5,6 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- Trimmed row-id alias join keys from deferred SQL view projected reads so a
-  three-table inner-join view chain no longer decodes the join key column when
-  it equals the previous row's stored row id. The linear and generic deferred
-  view walkers now synthesize the join key from the row id directly, shrinking
-  per-table projections for `v_artist_songs`-style view shapes. This is a
-  general optimization, not a schema or view-name specific shortcut.
-- Fixed a planner index-detection gap where explicit `JOIN ... ON` syntax never
-  recognized usable join indexes, so cost-based `IndexedJoin` is now selected
-  for explicit inner equi-joins when a useful B-tree index exists (previously
-  such joins always fell back to `HashJoin`). `EXPLAIN` now surfaces the chosen
-  `IndexedJoin` operator with estimates for these shapes.
-- Added planner `EXPLAIN` regression tests for indexed-join selection,
-  hash-join selection without a useful index, and estimated rows/cost surfacing.
-
 ## [2.15.0] - [UNRELEASED]
 
 ### Added
@@ -95,6 +77,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small-scale deferred-view LIMIT fast-path threshold, bounding grouped Top-N
   postprocessing, exposing expanded-view pushdown metadata in `EXPLAIN`, and
   reducing inactive faulty-VFS wrapper overhead.
+- Trimmed row-id alias join keys from deferred SQL view projected reads so a
+  three-table inner-join view chain no longer decodes the join key column when
+  it equals the previous row's stored row id. The linear and generic deferred
+  view walkers now synthesize the join key from the row id directly, shrinking
+  per-table projections for `v_artist_songs`-style view shapes. This is a
+  general optimization, not a schema or view-name specific shortcut.
+- Fixed a planner index-detection gap where explicit `JOIN ... ON` syntax never
+  recognized usable join indexes, so cost-based `IndexedJoin` is now selected
+  for explicit inner equi-joins when a useful B-tree index exists (previously
+  such joins always fell back to `HashJoin`). `EXPLAIN` now surfaces the chosen
+  `IndexedJoin` operator with estimates for these shapes.
+- Added planner `EXPLAIN` regression tests for indexed-join selection,
+  hash-join selection without a useful index, and estimated rows/cost surfacing.
+- Completed the WIN01 read/query performance closeout: public
+  `embedded_compare` guardrails now pass for balanced, low-memory, and tuned
+  durable DecentDB profiles; rust-baseline full/huge peak RSS drops by more
+  than 25%; and the full/huge view-query gates exceed 2x improvement without
+  weakening WAL sync or durability semantics.
+- Accelerated the public prepared-insert and read hot paths with
+  transaction-local next-row-id caching, fewer redundant catalog writes,
+  append-only unique-index tombstone-cleanup avoidance, resident prepared
+  point/range reads, direct projected row-id/range result construction, and
+  narrow `SmallVec` query rows.
+- Updated the Future Wins roadmap so WIN01 is recorded as delivered context
+  instead of active backlog, leaving cross-binding cursor/row-view parity as
+  the next top-priority performance-adjacent roadmap item.
+
 
 ### Fixed
 

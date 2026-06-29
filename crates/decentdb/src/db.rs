@@ -112,7 +112,9 @@ pub struct Db {
 
 const AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT: usize = 4;
 const PREPARED_READ_ROW_SOURCE_MIN_ROWS: usize = 4_096;
+const PREPARED_READ_ROW_SOURCE_MIN_ROW_LIMIT: usize = 131_072;
 const PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB: usize = 8_192;
+const RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct ReadOnlyPagedRowSourceResidency {
@@ -608,6 +610,7 @@ impl PreparedStatement {
     ///
     /// The transaction may mutate `params` during execution; callers should
     /// treat parameter values as consumed once execution completes.
+    #[inline(always)]
     pub fn execute_in_mut(
         &self,
         txn: &mut SqlTransaction<'_>,
@@ -652,6 +655,7 @@ impl<'db> SqlTransaction<'db> {
     ///
     /// This avoids cloning positional values for `PreparedStatement::Insert`
     /// fast paths that consume all parameters directly.
+    #[inline(always)]
     pub fn execute_prepared_mut(
         &mut self,
         prepared: &PreparedStatement,
@@ -734,17 +738,44 @@ impl PreparedStatementBatch<'_, '_> {
                 .prepared_insert
                 .as_ref()
                 .ok_or_else(|| DbError::internal("missing prepared insert batch plan"))?;
-            let affected = self
-                .state
-                .runtime
-                .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
-                    prepared_insert.as_ref(),
-                    params,
-                    &mut self.prepared_insert_candidate,
-                    self.db.inner.config.page_size,
-                )?;
-            self.state.persistent_changed |=
-                Db::prepared_insert_changes_persistent_table(&self.state.runtime, prepared_insert);
+            if self.state.prepared_insert_last_next_row_id.is_none() {
+                self.state.prepared_insert_last_cache_key =
+                    Some(Db::prepared_statement_cache_key(self.prepared));
+                self.state.prepared_insert_last_plan = Some(Arc::clone(prepared_insert));
+                self.state.prepared_insert_last_next_row_id =
+                    Db::prepared_insert_current_next_row_id(
+                        &self.state.runtime,
+                        prepared_insert.as_ref(),
+                    )?;
+            }
+            let affected = if let Some(cached_next_row_id) =
+                self.state.prepared_insert_last_next_row_id.as_mut()
+            {
+                self.state
+                    .runtime
+                    .execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+                        prepared_insert.as_ref(),
+                        params,
+                        &mut self.prepared_insert_candidate,
+                        cached_next_row_id,
+                        self.db.inner.config.page_size,
+                    )?
+            } else {
+                self.state
+                    .runtime
+                    .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                        prepared_insert.as_ref(),
+                        params,
+                        &mut self.prepared_insert_candidate,
+                        self.db.inner.config.page_size,
+                    )?
+            };
+            if !self.state.persistent_changed {
+                self.state.persistent_changed |= Db::prepared_insert_changes_persistent_table(
+                    &self.state.runtime,
+                    prepared_insert,
+                );
+            }
             return Ok(affected);
         }
 
@@ -915,6 +946,9 @@ struct ExclusiveSqlTxnState<'a> {
     persistent_changed: bool,
     indexes_maybe_stale: bool,
     prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
+    prepared_insert_last_cache_key: Option<usize>,
+    prepared_insert_last_plan: Option<Arc<PreparedSimpleInsert>>,
+    prepared_insert_last_next_row_id: Option<i64>,
     prepared_insert_candidate: Vec<Value>,
 }
 
@@ -5555,9 +5589,9 @@ impl Db {
         if !self.inner.config.extension_unsigned_development_mode
             && self.inner.config.extension_trust_anchors.is_empty()
         {
-            if let Some(runtime) = self.try_resident_read_for_single_process_statement(
-                prepared.statement.as_ref(),
-                Some(prepared),
+            if let Some(runtime) = self.try_resident_read_for_prepared_table_statement(
+                prepared,
+                plan.table_name.as_str(),
             )? {
                 let result = runtime.execute_resolved_simple_row_id_projection_at_snapshot(
                     ResolvedSimpleRowIdProjectionRequest {
@@ -5573,12 +5607,7 @@ impl Db {
                 )?;
                 drop(runtime);
                 if let Some(result) = result {
-                    return self
-                        .finalize_row_source_autocommit_statement(
-                            prepared.statement.as_ref(),
-                            Ok(result),
-                        )
-                        .map(Some);
+                    return Ok(Some(result));
                 }
             }
         }
@@ -6117,13 +6146,8 @@ impl Db {
         {
             return Ok(result);
         }
-        {
-            let runtime = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_against_runtime(Some(prepared), &runtime)?;
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            self.validate_prepared_against_connection_state(prepared)?;
         }
         if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
             return Ok(result);
@@ -6181,6 +6205,7 @@ impl Db {
                 SqlTxnSlot::None => {}
             }
         }
+        self.validate_prepared_against_connection_state(prepared)?;
         let lw_start = if self.inner.tracing.config.lock_wait.enabled {
             Some(std::time::Instant::now())
         } else {
@@ -6225,11 +6250,6 @@ impl Db {
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(
-                prepared,
-                runtime.catalog.schema_cookie,
-                runtime.temp_schema_cookie,
-            )?;
             if matches!(
                 prepared.statement.as_ref(),
                 crate::sql::ast::Statement::Insert(insert)
@@ -6247,11 +6267,6 @@ impl Db {
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(
-                prepared,
-                runtime.catalog.schema_cookie,
-                runtime.temp_schema_cookie,
-            )?;
             self.statement_is_temp_only(&runtime, prepared.statement.as_ref())
         };
         if temp_only {
@@ -8559,11 +8574,15 @@ impl Db {
             persistent_changed: false,
             indexes_maybe_stale: false,
             prepared_insert_runtime_cache: HashMap::new(),
+            prepared_insert_last_cache_key: None,
+            prepared_insert_last_plan: None,
+            prepared_insert_last_next_row_id: None,
             prepared_insert_candidate: Vec::new(),
         })
     }
 
     fn commit_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<u64> {
+        Self::flush_exclusive_prepared_insert_next_row_id(&mut state)?;
         if !state.persistent_changed {
             self.sync_temp_state_from_runtime(&state.runtime)?;
             return Ok(state.base_lsn);
@@ -8610,6 +8629,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(state);
+        self.maybe_demote_wal_after_large_explicit_commit();
         self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(committed_lsn)
     }
@@ -8629,6 +8649,7 @@ impl Db {
         if rebuild_stale_indexes {
             runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let compacted_bytes = runtime.compact_dirty_resident_storage_after_transaction_commit();
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
@@ -8663,6 +8684,7 @@ impl Db {
             guard.redefer_all_persisted_paged_tables();
             self.release_freed_heap_after_paged_row_source_drop();
         }
+        self.release_freed_heap_after_runtime_compaction(compacted_bytes);
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -8670,6 +8692,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
+        self.maybe_demote_wal_after_large_explicit_commit();
         self.publish_reactive_commit(reactive_pending, committed_lsn);
 
         Ok(committed_lsn)
@@ -9386,10 +9409,16 @@ impl Db {
     }
 
     fn prepared_read_row_source_row_limit(&self) -> usize {
-        self.inner
+        let row_limit = self
+            .inner
             .config
             .cache_size_mb
-            .saturating_mul(PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB)
+            .saturating_mul(PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB);
+        if row_limit == 0 {
+            0
+        } else {
+            row_limit.max(PREPARED_READ_ROW_SOURCE_MIN_ROW_LIMIT)
+        }
     }
 
     fn try_load_prepared_read_row_sources_at_snapshot(
@@ -9680,6 +9709,35 @@ impl Db {
             return Ok(None);
         }
         Ok(Some(runtime))
+    }
+
+    fn try_resident_read_for_prepared_table_statement(
+        &self,
+        prepared: &PreparedStatement,
+        table_name: &str,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.inner.config.defer_table_materialization {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_against_runtime(Some(prepared), &runtime)?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        if runtime
+            .canonical_catalog_table_name(table_name)
+            .is_some_and(|canonical| runtime.table_row_source(&canonical).is_some())
+        {
+            Ok(Some(runtime))
+        } else {
+            Ok(None)
+        }
     }
 
     fn load_simple_write_row_sources_at_latest_snapshot(&self, names: &[&str]) -> Result<()> {
@@ -9995,6 +10053,34 @@ impl Db {
 
     fn release_freed_heap_after_paged_row_source_drop(&self) {
         if self.inner.config.paged_row_storage {
+            crate::wal::platform::release_freed_heap();
+        }
+    }
+
+    fn release_freed_heap_after_runtime_compaction(&self, freed_bytes: usize) {
+        if freed_bytes >= RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD {
+            crate::wal::platform::release_freed_heap();
+        }
+    }
+
+    fn maybe_demote_wal_after_large_explicit_commit(&self) {
+        let threshold = self.inner.config.wal_checkpoint_threshold_bytes;
+        if threshold == 0 {
+            return;
+        }
+        if self.inner.wal.latest_snapshot() < threshold {
+            return;
+        }
+        let target_bytes = threshold / 2;
+        if target_bytes == 0 {
+            return;
+        }
+        if matches!(
+            self.inner
+                .wal
+                .demote_resident_versions_if_reader_free(usize::try_from(target_bytes).unwrap_or(usize::MAX)),
+            Ok(demoted) if demoted > 0
+        ) {
             crate::wal::platform::release_freed_heap();
         }
     }
@@ -10745,6 +10831,23 @@ impl Db {
         ))
     }
 
+    fn validate_prepared_against_connection_state(
+        &self,
+        prepared: &PreparedStatement,
+    ) -> Result<()> {
+        let temp_schema_cookie = self
+            .inner
+            .temp_state
+            .lock()
+            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
+            .schema_cookie;
+        self.validate_prepared_schema_cookie(
+            prepared,
+            self.inner.catalog.schema_cookie()?,
+            temp_schema_cookie,
+        )
+    }
+
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         let (snapshot_reader, current_lsn, current_epoch) = self.begin_sql_snapshot()?;
 
@@ -10856,6 +10959,7 @@ impl Db {
                 "prepared statement belongs to a different database handle",
             ));
         }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         self.validate_prepared_schema_cookie(
             prepared,
             state.runtime.catalog.schema_cookie,
@@ -10902,6 +11006,14 @@ impl Db {
         params: &mut [Value],
         state: &mut ExclusiveSqlTxnState<'_>,
     ) -> Result<QueryResult> {
+        if !prepared.read_only {
+            if let Some(result) = self
+                .try_execute_last_prepared_insert_in_exclusive_state_mut(prepared, params, state)?
+            {
+                return Ok(result);
+            }
+        }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
             return Err(DbError::transaction(
                 "prepared statement belongs to a different database handle",
@@ -10934,6 +11046,9 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
             &mut state.prepared_insert_runtime_cache,
+            &mut state.prepared_insert_last_cache_key,
+            &mut state.prepared_insert_last_plan,
+            &mut state.prepared_insert_last_next_row_id,
             &mut state.prepared_insert_candidate,
         )? {
             return Ok(result);
@@ -10974,6 +11089,84 @@ impl Db {
         )
     }
 
+    fn prepared_insert_current_next_row_id(
+        runtime: &EngineRuntime,
+        prepared_insert: &PreparedSimpleInsert,
+    ) -> Result<Option<i64>> {
+        let Some(table_name) = prepared_insert.catalog_table_name.as_deref() else {
+            return Ok(None);
+        };
+        runtime
+            .catalog
+            .tables
+            .get(table_name)
+            .map(|table| Some(table.next_row_id))
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared_insert.table_name)))
+    }
+
+    fn flush_exclusive_prepared_insert_next_row_id(
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<()> {
+        let Some(next_row_id) = state.prepared_insert_last_next_row_id.take() else {
+            return Ok(());
+        };
+        let Some(prepared_insert) = state.prepared_insert_last_plan.as_ref() else {
+            state.prepared_insert_last_cache_key = None;
+            return Ok(());
+        };
+        let Some(table_name) = prepared_insert.catalog_table_name.as_deref() else {
+            return Ok(());
+        };
+        let catalog = Arc::make_mut(&mut state.runtime.catalog);
+        let table = catalog
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared_insert.table_name)))?;
+        table.next_row_id = next_row_id;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn try_execute_last_prepared_insert_in_exclusive_state_mut(
+        &self,
+        prepared: &PreparedStatement,
+        params: &mut [Value],
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<Option<QueryResult>> {
+        if state.indexes_maybe_stale {
+            return Ok(None);
+        }
+        let Some(cache_key) = state.prepared_insert_last_cache_key else {
+            return Ok(None);
+        };
+        if cache_key != Self::prepared_statement_cache_key(prepared) {
+            return Ok(None);
+        }
+        let Some(insert_plan) = state.prepared_insert_last_plan.as_ref() else {
+            return Ok(None);
+        };
+        let Some(cached_next_row_id) = state.prepared_insert_last_next_row_id.as_mut() else {
+            return Ok(None);
+        };
+
+        let affected = state
+            .runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+                insert_plan.as_ref(),
+                params,
+                &mut state.prepared_insert_candidate,
+                cached_next_row_id,
+                self.inner.config.page_size,
+            )?;
+        if !state.persistent_changed {
+            state.persistent_changed |= Self::prepared_insert_changes_persistent_table(
+                &state.runtime,
+                insert_plan.as_ref(),
+            );
+        }
+        Ok(Some(QueryResult::with_affected_rows(affected)))
+    }
+
     fn prepare_batch_in_exclusive_state<'txn, 'db>(
         &'db self,
         prepared: &'txn PreparedStatement,
@@ -10985,6 +11178,7 @@ impl Db {
                 "prepared statement belongs to a different database handle",
             ));
         }
+        Self::flush_exclusive_prepared_insert_next_row_id(state)?;
         self.validate_prepared_schema_cookie(
             prepared,
             state.runtime.catalog.schema_cookie,
@@ -11077,6 +11271,9 @@ impl Db {
         persistent_changed: &mut bool,
         indexes_maybe_stale: &mut bool,
         prepared_insert_runtime_cache: &mut HashMap<usize, Arc<PreparedSimpleInsert>>,
+        prepared_insert_last_cache_key: &mut Option<usize>,
+        prepared_insert_last_plan: &mut Option<Arc<PreparedSimpleInsert>>,
+        prepared_insert_last_next_row_id: &mut Option<i64>,
         prepared_insert_candidate: &mut Vec<Value>,
     ) -> Result<Option<QueryResult>> {
         let Some(insert_plan) = self.prepared_insert_plan_for_runtime_state(
@@ -11095,6 +11292,9 @@ impl Db {
             return Ok(None);
         }
 
+        let cache_key = Self::prepared_statement_cache_key(prepared);
+        *prepared_insert_last_cache_key = Some(cache_key);
+        *prepared_insert_last_plan = Some(Arc::clone(&insert_plan));
         let result = runtime
             .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
                 insert_plan.as_ref(),
@@ -11102,8 +11302,12 @@ impl Db {
                 prepared_insert_candidate,
                 self.inner.config.page_size,
             )?;
-        *persistent_changed |=
-            Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
+        *prepared_insert_last_next_row_id =
+            Self::prepared_insert_current_next_row_id(runtime, insert_plan.as_ref())?;
+        if !*persistent_changed {
+            *persistent_changed |=
+                Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
+        }
         Ok(Some(QueryResult::with_affected_rows(result)))
     }
 

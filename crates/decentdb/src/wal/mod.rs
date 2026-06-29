@@ -598,6 +598,23 @@ impl WalHandle {
         Ok((resident + sidecar_resident, on_disk + sidecar_on_disk))
     }
 
+    pub(crate) fn demote_resident_versions_if_reader_free(
+        &self,
+        target_bytes: usize,
+    ) -> Result<usize> {
+        if self.inner.reader_registry.active_reader_count()? > 0
+            || self.retained_snapshot_lsn().is_some()
+        {
+            return Ok(0);
+        }
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+        Ok(index.demote_high_page_ids_resident_bytes(target_bytes))
+    }
+
     fn materialize_latest_visible_locked(
         &self,
         index: &WalIndex,

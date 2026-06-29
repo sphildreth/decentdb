@@ -37,6 +37,7 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, NaiveDateTime, TimeZone,
     Timelike, Utc,
 };
+use smallvec::{smallvec, SmallVec};
 
 use crate::btree::cursor::BtreeCursor;
 use crate::btree::read::{
@@ -397,6 +398,15 @@ impl DeferredPagedRowLocatorCache {
             .map(|payload| payload.as_slice())
     }
 
+    fn verified_payload_arc(
+        &self,
+        pointer: OverflowPointer,
+        checksum: u32,
+    ) -> Option<&Arc<Vec<u8>>> {
+        self.verified_payloads
+            .get(&CachedPagedChunkPayloadKey::new(pointer, checksum))
+    }
+
     fn min_row_id(&self) -> Option<i64> {
         self.locators.keys().min().copied()
     }
@@ -524,6 +534,19 @@ impl TableData {
         self.cached_heap_bytes = 0;
     }
 
+    fn shrink_to_fit_if_unique(&mut self) -> usize {
+        let Some(rows) = Arc::get_mut(&mut self.rows) else {
+            return 0;
+        };
+        let old_capacity = rows.capacity();
+        rows.shrink_to_fit();
+        let freed = old_capacity
+            .saturating_sub(rows.capacity())
+            .saturating_mul(std::mem::size_of::<StoredRow>());
+        self.cached_heap_bytes = self.cached_heap_bytes.saturating_sub(freed);
+        freed
+    }
+
     pub(crate) fn mutate_visible_rows<F>(&mut self, mut f: F) -> Result<()>
     where
         F: FnMut(&mut StoredRow) -> Result<()>,
@@ -611,6 +634,51 @@ impl TableData {
             .map(|row| project_simple_projection_value_vec(&row.values, projection_indexes)))
     }
 
+    fn projected_query_row_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<QueryRow>> {
+        Ok(self
+            .row_by_id(row_id)
+            .map(|row| project_simple_projection_values(&row.values, projection_indexes)))
+    }
+
+    fn projected_query_rows_in_id_range(
+        &self,
+        low: i64,
+        high_exclusive: i64,
+        limit: usize,
+        offset: usize,
+        projection_indexes: &[usize],
+    ) -> Option<Vec<QueryRow>> {
+        if !self.rows_sorted_by_id || high_exclusive <= low {
+            return None;
+        }
+        let rows = self.rows.as_ref();
+        let start = rows.partition_point(|row| row.row_id < low);
+        let end = start + rows[start..].partition_point(|row| row.row_id < high_exclusive);
+        let mut skipped = 0usize;
+        let mut projected = Vec::with_capacity(limit.min(end.saturating_sub(start)));
+        for row in &rows[start..end] {
+            if self.is_row_tombstoned(row.row_id) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if projected.len() >= limit {
+                break;
+            }
+            projected.push(project_simple_projection_values(
+                &row.values,
+                projection_indexes,
+            ));
+        }
+        Some(projected)
+    }
+
     fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
     where
         F: FnMut(i64, Option<i64>) -> Result<()>,
@@ -690,6 +758,14 @@ impl TableData {
     fn push_fresh_row(&mut self, row: StoredRow) {
         let rows = Arc::make_mut(&mut self.rows);
         let old_capacity = rows.capacity();
+        if rows.len() == old_capacity {
+            let additional = if old_capacity < 1024 {
+                old_capacity.max(8)
+            } else {
+                old_capacity / 2
+            };
+            rows.reserve_exact(additional);
+        }
         let row_heap_bytes = Self::row_heap_bytes(&row);
         if rows
             .last()
@@ -930,7 +1006,7 @@ impl TablePageManifest {
             })
             .collect();
 
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(64);
         let mut base_row_entries = Vec::new();
         let mut overlay_row_entries = Vec::new();
 
@@ -1362,7 +1438,7 @@ impl TablePageManifest {
         let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
             return Ok(None);
         };
-        Row::decode_projection_with_overflow::<page::InMemoryPageStore>(
+        Row::decode_projection_sorted_unique_with_overflow::<page::InMemoryPageStore>(
             row_bytes,
             None,
             projection_indexes,
@@ -1852,6 +1928,43 @@ impl<'a> VisibleTableRowSource<'a> {
         }
     }
 
+    fn projected_query_row_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<QueryRow>> {
+        match self {
+            Self::Temp(data) => data.projected_query_row_by_id(row_id, projection_indexes),
+            Self::Base(source) => source.projected_query_row_by_id(row_id, projection_indexes),
+        }
+    }
+
+    fn projected_query_rows_in_id_range(
+        &self,
+        low: i64,
+        high_exclusive: i64,
+        limit: usize,
+        offset: usize,
+        projection_indexes: &[usize],
+    ) -> Option<Vec<QueryRow>> {
+        match self {
+            Self::Temp(data) => data.projected_query_rows_in_id_range(
+                low,
+                high_exclusive,
+                limit,
+                offset,
+                projection_indexes,
+            ),
+            Self::Base(source) => source.projected_query_rows_in_id_range(
+                low,
+                high_exclusive,
+                limit,
+                offset,
+                projection_indexes,
+            ),
+        }
+    }
+
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'a>>> {
         match self {
             Self::Temp(data) => Ok(data.visible_rows().nth(position).map(TableRowRef::Resident)),
@@ -1952,6 +2065,39 @@ impl TableRowSource {
         }
     }
 
+    fn projected_query_row_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<QueryRow>> {
+        match self {
+            Self::Resident(data) => data.projected_query_row_by_id(row_id, projection_indexes),
+            Self::Paged(manifest) => manifest
+                .projected_values_by_id(row_id, projection_indexes)
+                .map(|values| values.map(QueryRow::new)),
+        }
+    }
+
+    fn projected_query_rows_in_id_range(
+        &self,
+        low: i64,
+        high_exclusive: i64,
+        limit: usize,
+        offset: usize,
+        projection_indexes: &[usize],
+    ) -> Option<Vec<QueryRow>> {
+        match self {
+            Self::Resident(data) => data.projected_query_rows_in_id_range(
+                low,
+                high_exclusive,
+                limit,
+                offset,
+                projection_indexes,
+            ),
+            Self::Paged(_) => None,
+        }
+    }
+
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'_>>> {
         match self {
             Self::Resident(data) => {
@@ -1985,6 +2131,15 @@ impl TableRowSource {
         match self {
             Self::Resident(data) => data.approximate_heap_bytes(),
             Self::Paged(manifest) => manifest.approximate_heap_bytes(),
+        }
+    }
+
+    fn shrink_resident_to_fit_if_unique(&mut self) -> usize {
+        match self {
+            Self::Resident(data) => Arc::get_mut(data)
+                .map(TableData::shrink_to_fit_if_unique)
+                .unwrap_or(0),
+            Self::Paged(_) => 0,
         }
     }
 
@@ -2186,6 +2341,78 @@ fn visible_row_id_set_count(
 }
 
 impl RuntimeBtreeKeys {
+    fn shrink_row_id_vecs<'a>(row_ids: impl Iterator<Item = &'a mut Vec<i64>>) -> usize {
+        let mut freed = 0usize;
+        for row_ids in row_ids {
+            let old_capacity = row_ids.capacity();
+            row_ids.shrink_to_fit();
+            freed = freed.saturating_add(
+                old_capacity
+                    .saturating_sub(row_ids.capacity())
+                    .saturating_mul(std::mem::size_of::<i64>()),
+            );
+        }
+        freed
+    }
+
+    fn shrink_int64_map<V>(keys: &mut Int64Map<V>) -> usize {
+        let old_capacity = keys.capacity();
+        keys.shrink_to_fit();
+        old_capacity
+            .saturating_sub(keys.capacity())
+            .saturating_mul(std::mem::size_of::<(i64, V)>())
+    }
+
+    fn shrink_to_fit_if_unique(&mut self) -> usize {
+        match self {
+            Self::UniqueEncoded(_, _)
+            | Self::UniqueUuid(_, _)
+            | Self::NonUniqueEncoded(_, _)
+            | Self::NonUniqueUuid(_, _) => {
+                let mut freed = 0usize;
+                match self {
+                    Self::NonUniqueEncoded(keys, _) => {
+                        if let Some(keys) = Arc::get_mut(keys) {
+                            freed =
+                                freed.saturating_add(Self::shrink_row_id_vecs(keys.values_mut()));
+                        }
+                    }
+                    Self::NonUniqueUuid(keys, _) => {
+                        if let Some(keys) = Arc::get_mut(keys) {
+                            freed =
+                                freed.saturating_add(Self::shrink_row_id_vecs(keys.values_mut()));
+                        }
+                    }
+                    _ => {}
+                }
+                freed
+            }
+            Self::UniqueInt64(keys, _) => {
+                Arc::get_mut(keys).map(Self::shrink_int64_map).unwrap_or(0)
+            }
+            Self::NonUniqueInt64(keys, _) => {
+                let Some(keys) = Arc::get_mut(keys) else {
+                    return 0;
+                };
+                Self::shrink_int64_map(keys)
+                    .saturating_add(Self::shrink_row_id_vecs(keys.values_mut()))
+            }
+        }
+    }
+
+    fn push_non_unique_row_id(row_ids: &mut Vec<i64>, row_id: i64) {
+        let capacity = row_ids.capacity();
+        if row_ids.len() == capacity {
+            let additional = if capacity < 16 {
+                capacity.max(4)
+            } else {
+                capacity / 2
+            };
+            row_ids.reserve_exact(additional);
+        }
+        row_ids.push(row_id);
+    }
+
     fn visible_single(row_id: i64, deleted_row_ids: &BTreeSet<i64>) -> RuntimeRowIdSet<'_> {
         if deleted_row_ids.is_empty() {
             return RuntimeRowIdSet::Single(row_id);
@@ -2204,15 +2431,51 @@ impl RuntimeBtreeKeys {
         if deleted_row_ids.is_empty() {
             return RuntimeRowIdSet::Many(row_ids);
         }
-        let visible = row_ids
-            .iter()
-            .copied()
-            .filter(|row_id| !deleted_row_ids.contains(row_id))
-            .collect::<Vec<_>>();
+        let mut first_deleted = None;
+        for (index, row_id) in row_ids.iter().copied().enumerate() {
+            if deleted_row_ids.contains(&row_id) {
+                first_deleted = Some(index);
+                break;
+            }
+        }
+        let Some(first_deleted) = first_deleted else {
+            return RuntimeRowIdSet::Many(row_ids);
+        };
+
+        let mut visible = Vec::new();
+        for row_id in row_ids[..first_deleted].iter().copied() {
+            if !deleted_row_ids.contains(&row_id) {
+                visible.push(row_id);
+            }
+        }
+        for row_id in row_ids[first_deleted..].iter().copied() {
+            if !deleted_row_ids.contains(&row_id) {
+                visible.push(row_id);
+            }
+        }
         if visible.is_empty() {
             RuntimeRowIdSet::Empty
         } else {
             RuntimeRowIdSet::Owned(visible)
+        }
+    }
+
+    fn row_ids_for_row_id(&self, row_id: i64) -> RuntimeRowIdSet<'_> {
+        match self {
+            Self::UniqueInt64(keys, deleted) => keys
+                .get(&row_id)
+                .copied()
+                .map_or(RuntimeRowIdSet::Empty, |row_id| {
+                    Self::visible_single(row_id, deleted)
+                }),
+            Self::NonUniqueInt64(keys, deleted) => keys
+                .get(&row_id)
+                .map(|row_ids| Self::visible_many(row_ids.as_slice(), deleted))
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            Self::UniqueEncoded(..)
+            | Self::NonUniqueEncoded(..)
+            | Self::UniqueUuid(..)
+            | Self::NonUniqueUuid(..) => RuntimeRowIdSet::Empty,
         }
     }
 
@@ -2497,7 +2760,7 @@ impl RuntimeBtreeKeys {
                     }
                     keys.retain(|_, row_ids| !row_ids.is_empty());
                 }
-                keys.entry(key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(key).or_default(), row_id);
             }
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => {
                 if deleted.remove(&row_id) {
@@ -2522,7 +2785,7 @@ impl RuntimeBtreeKeys {
                     }
                     keys.retain(|_, row_ids| !row_ids.is_empty());
                 }
-                keys.entry(key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(key).or_default(), row_id);
             }
             (Self::UniqueUuid(keys, deleted), RuntimeBtreeKey::Uuid(key)) => {
                 if deleted.remove(&row_id) {
@@ -2547,7 +2810,7 @@ impl RuntimeBtreeKeys {
                     }
                     keys.retain(|_, row_ids| !row_ids.is_empty());
                 }
-                keys.entry(key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(key).or_default(), row_id);
             }
             _ => {
                 return Err(DbError::internal(
@@ -2577,7 +2840,7 @@ impl RuntimeBtreeKeys {
                 if keys.get(old_key).is_some_and(Vec::is_empty) {
                     keys.remove(old_key);
                 }
-                keys.entry(new_key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(new_key).or_default(), row_id);
                 Ok(true)
             }
             (
@@ -2592,7 +2855,7 @@ impl RuntimeBtreeKeys {
                 if keys.get(old_key).is_some_and(Vec::is_empty) {
                     keys.remove(old_key);
                 }
-                keys.entry(new_key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(new_key).or_default(), row_id);
                 Ok(true)
             }
             (
@@ -2607,7 +2870,7 @@ impl RuntimeBtreeKeys {
                 if keys.get(old_key).is_some_and(Vec::is_empty) {
                     keys.remove(old_key);
                 }
-                keys.entry(new_key).or_default().push(row_id);
+                Self::push_non_unique_row_id(keys.entry(new_key).or_default(), row_id);
                 Ok(true)
             }
             _ => Ok(false),
@@ -2797,6 +3060,27 @@ impl RuntimeCoveringPayloads {
         self.rows.remove(&row_id);
     }
 
+    fn shrink_to_fit(&mut self) -> usize {
+        let mut freed = 0usize;
+        let old_columns_capacity = self.columns.capacity();
+        self.columns.shrink_to_fit();
+        freed = freed.saturating_add(
+            old_columns_capacity
+                .saturating_sub(self.columns.capacity())
+                .saturating_mul(std::mem::size_of::<String>()),
+        );
+        for values in self.rows.values_mut() {
+            let old_capacity = values.capacity();
+            values.shrink_to_fit();
+            freed = freed.saturating_add(
+                old_capacity
+                    .saturating_sub(values.capacity())
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            );
+        }
+        freed
+    }
+
     fn project_row(&self, row_id: i64, offsets: &[usize]) -> Option<QueryRow> {
         let values = self.rows.get(&row_id)?;
         let mut projected = Vec::with_capacity(offsets.len());
@@ -2822,6 +3106,19 @@ pub(crate) enum RuntimeIndex {
     FullText {
         index: FullTextIndex,
     },
+}
+
+impl RuntimeIndex {
+    fn shrink_to_fit_if_unique(&mut self) -> usize {
+        match self {
+            Self::Btree { keys, covering } => keys.shrink_to_fit_if_unique().saturating_add(
+                covering
+                    .as_mut()
+                    .map_or(0, RuntimeCoveringPayloads::shrink_to_fit),
+            ),
+            Self::Trigram { .. } | Self::Spatial { .. } | Self::FullText { .. } => 0,
+        }
+    }
 }
 
 fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
@@ -3451,6 +3748,45 @@ impl EngineRuntime {
     pub(crate) fn index_mut(&mut self, name: &str) -> Option<&mut RuntimeIndex> {
         let map = Arc::make_mut(&mut self.indexes);
         map.get_mut(name).map(Arc::make_mut)
+    }
+
+    pub(crate) fn compact_dirty_resident_storage_after_transaction_commit(&mut self) -> usize {
+        if self.dirty_tables.is_empty() {
+            return 0;
+        }
+
+        let dirty_tables = self.dirty_tables.iter().cloned().collect::<Vec<_>>();
+        let mut freed = 0usize;
+        {
+            let tables = Arc::make_mut(&mut self.tables);
+            for table_name in &dirty_tables {
+                if let Some(row_source) = tables.get_mut(table_name) {
+                    freed = freed.saturating_add(row_source.shrink_resident_to_fit_if_unique());
+                }
+            }
+        }
+
+        let dirty_index_names = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| {
+                dirty_tables
+                    .iter()
+                    .any(|table_name| identifiers_equal(table_name, &index.table_name))
+            })
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        if !dirty_index_names.is_empty() {
+            let indexes = Arc::make_mut(&mut self.indexes);
+            for index_name in dirty_index_names {
+                if let Some(index) = indexes.get_mut(&index_name).and_then(Arc::get_mut) {
+                    freed = freed.saturating_add(index.shrink_to_fit_if_unique());
+                }
+            }
+        }
+
+        freed
     }
 
     fn cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
@@ -5926,12 +6262,9 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        if self.paged_mutations.contains_key(table_name) {
-            self.catalog_mut().table_stats.remove(table_name);
-            if let Some(delta) = self.paged_mutations.get_mut(table_name) {
-                delta.append_count += 1;
-                return;
-            }
+        if let Some(delta) = self.paged_mutations.get_mut(table_name) {
+            delta.append_count += 1;
+            return;
         }
         if self.dirty_tables.contains(table_name) {
             return;
@@ -13308,12 +13641,19 @@ impl EngineRuntime {
             return Ok(None);
         };
         let ctes = BTreeMap::new();
-        let limit = usize::try_from(self.eval_constant_i64(limit_expr, params, &ctes)?.max(0))
-            .unwrap_or(usize::MAX);
+        let limit_value = match simple_int64_constant_expr_value(limit_expr, params)? {
+            Some(value) => value,
+            None => self.eval_constant_i64(limit_expr, params, &ctes)?,
+        };
+        let limit = usize::try_from(limit_value.max(0)).unwrap_or(usize::MAX);
         let offset = query
             .offset
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .map(|expr| {
+                simple_int64_constant_expr_value(expr, params)?
+                    .map(Ok)
+                    .unwrap_or_else(|| self.eval_constant_i64(expr, params, &ctes))
+            })
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
@@ -13418,12 +13758,19 @@ impl EngineRuntime {
             return Ok(None);
         };
         let ctes = BTreeMap::new();
-        let limit = usize::try_from(self.eval_constant_i64(limit_expr, params, &ctes)?.max(0))
-            .unwrap_or(usize::MAX);
+        let limit_value = match simple_int64_constant_expr_value(limit_expr, params)? {
+            Some(value) => value,
+            None => self.eval_constant_i64(limit_expr, params, &ctes)?,
+        };
+        let limit = usize::try_from(limit_value.max(0)).unwrap_or(usize::MAX);
         let offset = query
             .offset
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .map(|expr| {
+                simple_int64_constant_expr_value(expr, params)?
+                    .map(Ok)
+                    .unwrap_or_else(|| self.eval_constant_i64(expr, params, &ctes))
+            })
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
@@ -16180,10 +16527,10 @@ impl EngineRuntime {
                 )? {
                     let mut rows = Vec::with_capacity(row_ids.len().min(64));
                     for row_id in row_ids {
-                        if let Some(values) =
-                            row_source.projected_values_by_id(row_id, &projection_indexes)?
+                        if let Some(row) =
+                            row_source.projected_query_row_by_id(row_id, &projection_indexes)?
                         {
-                            rows.push(QueryRow::new(values));
+                            rows.push(row);
                         }
                     }
                     return Ok(Some(QueryResult::with_rows(column_names, rows)));
@@ -16199,10 +16546,10 @@ impl EngineRuntime {
                 let take = limit.unwrap_or(usize::MAX);
                 let mut rows = Vec::with_capacity(take.min(ordered_row_ids.len()));
                 for row_id in ordered_row_ids.into_iter().skip(offset).take(take) {
-                    if let Some(values) =
-                        row_source.projected_values_by_id(row_id, &projection_indexes)?
+                    if let Some(row) =
+                        row_source.projected_query_row_by_id(row_id, &projection_indexes)?
                     {
-                        rows.push(QueryRow::new(values));
+                        rows.push(row);
                     }
                 }
                 return Ok(Some(QueryResult::with_rows(column_names, rows)));
@@ -16551,6 +16898,15 @@ impl EngineRuntime {
         }
 
         let take = limit.unwrap_or(usize::MAX);
+        if let Some(rows) = row_source.projected_query_rows_in_id_range(
+            start,
+            end_exclusive,
+            take,
+            offset,
+            projection_indexes,
+        ) {
+            return Ok(Some(QueryResult::with_rows(column_names, rows)));
+        }
         let max_probe_steps = if upper_bound.is_none() {
             Some(
                 row_source
@@ -16570,11 +16926,11 @@ impl EngineRuntime {
                 return Ok(None);
             }
             probe_steps = probe_steps.saturating_add(1);
-            if let Some(values) = row_source.projected_values_by_id(row_id, projection_indexes)? {
+            if let Some(row) = row_source.projected_query_row_by_id(row_id, projection_indexes)? {
                 if skipped < offset {
                     skipped += 1;
                 } else {
-                    rows.push(QueryRow::new(values));
+                    rows.push(row);
                 }
             }
             let Some(next_row_id) = row_id.checked_add(1) else {
@@ -19083,11 +19439,10 @@ impl EngineRuntime {
         &self,
         request: SimpleRowIdProjectionRequest<'_>,
     ) -> Result<Option<QueryResult>> {
-        if self
-            .visible_view(request.table_name, NameResolutionScope::Session)
-            .is_some()
-            || self.visible_table_is_temporary(request.table_name)
-        {
+        if let Some(view) = self.visible_view(request.table_name, NameResolutionScope::Session) {
+            return self.execute_simple_view_row_id_projection_at_snapshot(&request, view);
+        }
+        if self.visible_table_is_temporary(request.table_name) {
             return Ok(None);
         }
         let Some(table_schema) = self.table_schema(request.table_name) else {
@@ -19127,6 +19482,272 @@ impl EngineRuntime {
                 use_persistent_pk_index: request.use_persistent_pk_index,
             },
         )
+    }
+
+    fn execute_simple_view_row_id_projection_at_snapshot(
+        &self,
+        request: &SimpleRowIdProjectionRequest<'_>,
+        view: &ViewSchema,
+    ) -> Result<Option<QueryResult>> {
+        if view.temporary {
+            return Ok(None);
+        }
+        let view_query = self.cached_view_query(view)?;
+        if view_query.recursive
+            || !view_query.ctes.is_empty()
+            || !view_query.order_by.is_empty()
+            || view_query.limit.is_some()
+            || view_query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(view_select) = &view_query.body else {
+            return Ok(None);
+        };
+        if view_select.distinct
+            || !view_select.distinct_on.is_empty()
+            || !view_select.group_by.is_empty()
+            || view_select.having.is_some()
+            || view_select.filter.is_some()
+            || projection_has_aggregate_items(&view_select.projection)
+            || view_select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let Some(filter_source_expr) =
+            view_projection_expr_for_output_column(&view_select.projection, request.filter_column)
+        else {
+            return Ok(None);
+        };
+        let Expr::Column {
+            table: Some(filter_source_table),
+            column: filter_source_column,
+        } = &filter_source_expr
+        else {
+            return Ok(None);
+        };
+
+        let mut table_bindings = Vec::with_capacity(3);
+        let mut join_constraints = Vec::with_capacity(2);
+        if !flatten_inner_join_chain(
+            &view_select.from[0],
+            &mut table_bindings,
+            &mut join_constraints,
+        ) || table_bindings.len() < 2
+            || join_constraints.len() + 1 != table_bindings.len()
+        {
+            return Ok(None);
+        }
+
+        let mut table_schemas = Vec::with_capacity(table_bindings.len());
+        for binding in &table_bindings {
+            if self
+                .visible_view(binding.name, NameResolutionScope::Session)
+                .is_some()
+                || self.visible_table_is_temporary(binding.name)
+            {
+                return Ok(None);
+            }
+            let Some(schema) = self.table_schema(binding.name) else {
+                return Ok(None);
+            };
+            if !generated_columns_are_stored(schema) {
+                return Ok(None);
+            }
+            table_schemas.push(schema);
+        }
+
+        let Some(source_table_index) = table_bindings
+            .iter()
+            .position(|binding| identifiers_equal(binding.binding_name(), filter_source_table))
+        else {
+            return Ok(None);
+        };
+        if source_table_index != 0 {
+            return Ok(None);
+        }
+        let Some(source_rowid_column) = row_id_alias_column_name(table_schemas[source_table_index])
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(source_rowid_column, filter_source_column) {
+            return Ok(None);
+        }
+
+        let mut projections = Vec::with_capacity(request.projection_columns.len());
+        let mut column_names = Vec::with_capacity(request.projection_columns.len());
+        for projection_column in request.projection_columns {
+            let Some(view_expr) =
+                view_projection_expr_for_output_column(&view_select.projection, projection_column)
+            else {
+                return Ok(None);
+            };
+            let Expr::Column {
+                table: Some(base_table),
+                column: base_column,
+            } = view_expr
+            else {
+                return Ok(None);
+            };
+            let Some(table_index) = table_bindings
+                .iter()
+                .position(|binding| identifiers_equal(binding.binding_name(), &base_table))
+            else {
+                return Ok(None);
+            };
+            let Some(column_index) = schema_column_index(table_schemas[table_index], &base_column)
+            else {
+                return Ok(None);
+            };
+            projections.push(DeferredViewProjection {
+                table_index,
+                column_index,
+                is_rowid_alias: rowid_alias_column_index(table_schemas[table_index])
+                    == Some(column_index),
+            });
+            column_names.push((*projection_column).to_string());
+        }
+
+        let mut join_steps = Vec::with_capacity(join_constraints.len());
+        for current_table_index in 1..table_bindings.len() {
+            let Some(step) = self.deferred_view_join_step(
+                &table_bindings,
+                &table_schemas,
+                join_constraints[current_table_index - 1],
+                current_table_index,
+            )?
+            else {
+                return Ok(None);
+            };
+            join_steps.push(step);
+        }
+        let table_projections =
+            build_deferred_view_table_projections(&table_schemas, &projections, &join_steps);
+        let projection_indexes = build_deferred_view_projection_indexes(
+            &projections,
+            &table_projections,
+            "simple view row-id projection",
+        )?;
+        let linear_tail_can_move =
+            deferred_view_linear_tail_projection_can_move(&projection_indexes);
+
+        let mut join_keys = Vec::with_capacity(join_steps.len());
+        let mut key_projection_indexes = Vec::with_capacity(join_steps.len());
+        for step in &join_steps {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
+            else {
+                join_keys.clear();
+                key_projection_indexes.clear();
+                break;
+            };
+            join_keys.push(keys);
+            key_projection_indexes.push(join_key_projection_index(
+                step,
+                &table_projections[step.previous_table_index],
+            )?);
+        }
+
+        let mut table_readers = Vec::with_capacity(table_bindings.len());
+        for (binding, schema) in table_bindings.iter().zip(table_schemas.iter()) {
+            if let Some(source) = self.visible_table_row_source(binding.name) {
+                table_readers.push(DeferredViewTableRowReader::Source(source));
+                continue;
+            }
+            let Some(state) = self.persisted_table_state(binding.name) else {
+                return Ok(None);
+            };
+            let cache = self
+                .catalog
+                .table(binding.name)
+                .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+                .map(|cache| cache.as_ref());
+            if !deferred_rowid_lookup_available(
+                state,
+                schema,
+                request.use_persistent_pk_index,
+                cache,
+            ) {
+                return Ok(None);
+            }
+            table_readers.push(DeferredViewTableRowReader::Deferred {
+                state,
+                schema,
+                paged_locator_cache: cache,
+            });
+        }
+
+        let store = SnapshotPageStore {
+            pager: request.pager,
+            wal: request.wal,
+            snapshot_lsn: request.snapshot_lsn,
+        };
+        let mut chunk_payload_cache = HashMap::new();
+        let Some(source_row) = table_readers[source_table_index].read_projected_with_chunk_cache(
+            &store,
+            request.lookup_row_id,
+            request.use_persistent_pk_index,
+            &table_projections[source_table_index].projection_indexes,
+            &mut chunk_payload_cache,
+        )?
+        else {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        };
+
+        let mut rows = Vec::with_capacity(64);
+        let mut join_partial_rows = Vec::with_capacity(join_steps.len() + 1);
+        if let Some(stopped) = self.stream_deferred_view_linear_three_table_rows_from_root(
+            &store,
+            &table_readers,
+            &join_steps,
+            &join_keys,
+            &key_projection_indexes,
+            &table_projections,
+            &source_row,
+            request.use_persistent_pk_index,
+            &mut chunk_payload_cache,
+            &mut |root_row, row1, row2| {
+                let row = collect_deferred_view_query_row_from_linear_tail(
+                    root_row,
+                    row1,
+                    row2,
+                    &projection_indexes,
+                    "simple view row-id projection",
+                    linear_tail_can_move,
+                )?;
+                rows.push(row);
+                Ok(false)
+            },
+        )? {
+            let _ = stopped;
+            return Ok(Some(QueryResult::with_rows(column_names, rows)));
+        }
+
+        match self.stream_deferred_view_join_rows_from_root(
+            &store,
+            &table_readers,
+            &join_steps,
+            &join_keys,
+            &key_projection_indexes,
+            &table_projections,
+            source_row,
+            &mut join_partial_rows,
+            request.use_persistent_pk_index,
+            false,
+            &mut chunk_payload_cache,
+            &mut |partial| {
+                let values = collect_deferred_view_projection_values(
+                    partial,
+                    &projection_indexes,
+                    "simple view row-id projection",
+                )?;
+                rows.push(QueryRow::new(values));
+                Ok(false)
+            },
+        )? {
+            Some(_) => Ok(Some(QueryResult::with_rows(column_names, rows))),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn execute_resolved_simple_ordered_row_id_projection(
@@ -19195,10 +19816,10 @@ impl EngineRuntime {
         };
         let mut rows = Vec::with_capacity(row_ids.len().min(64));
         for row_id in row_ids {
-            if let Some(values) =
-                row_source.projected_values_by_id(row_id, request.projection_indexes)?
+            if let Some(row) =
+                row_source.projected_query_row_by_id(row_id, request.projection_indexes)?
             {
-                rows.push(QueryRow::new(values));
+                rows.push(row);
             }
         }
         Ok(Some(QueryResult::with_shared_columns(
@@ -19504,8 +20125,8 @@ impl EngineRuntime {
         let canonical_table_name = table_schema.name.as_str();
         if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
             let rows = row_source
-                .projected_values_by_id(request.lookup_row_id, request.projection_indexes)?
-                .map(|values| vec![QueryRow::new(values)])
+                .projected_query_row_by_id(request.lookup_row_id, request.projection_indexes)?
+                .map(|row| vec![row])
                 .unwrap_or_default();
             return Ok(Some(QueryResult::with_shared_columns(
                 Arc::clone(&request.column_names),
@@ -19956,8 +20577,8 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let mut table_bindings = Vec::new();
-        let mut join_constraints = Vec::new();
+        let mut table_bindings = Vec::with_capacity(3);
+        let mut join_constraints = Vec::with_capacity(2);
         if !flatten_inner_join_chain(
             &view_select.from[0],
             &mut table_bindings,
@@ -20036,9 +20657,12 @@ impl EngineRuntime {
             else {
                 return Ok(None);
             };
+            let is_rowid_alias =
+                rowid_alias_column_index(table_schemas[table_index]) == Some(column_index);
             projections.push(DeferredViewProjection {
                 table_index,
                 column_index,
+                is_rowid_alias,
             });
             column_names.push(
                 alias
@@ -20070,6 +20694,21 @@ impl EngineRuntime {
             &table_projections,
             "deferred view limit projection",
         )?;
+        let linear_tail_can_move =
+            deferred_view_linear_tail_projection_can_move(&projection_indexes);
+        let mut join_keys = Vec::with_capacity(join_steps.len());
+        let mut key_projection_indexes = Vec::with_capacity(join_steps.len());
+        for step in &join_steps {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
+            else {
+                return Ok(None);
+            };
+            join_keys.push(keys);
+            key_projection_indexes.push(join_key_projection_index(
+                step,
+                &table_projections[step.previous_table_index],
+            )?);
+        }
 
         let mut table_readers = Vec::with_capacity(table_bindings.len());
         for (binding, schema) in table_bindings.iter().zip(table_schemas.iter()) {
@@ -20100,7 +20739,9 @@ impl EngineRuntime {
             wal,
             snapshot_lsn,
         };
+        let mut chunk_payload_cache = HashMap::new();
         let mut rows = Vec::with_capacity(limit);
+        let mut join_partial_rows = Vec::with_capacity(join_steps.len() + 1);
         let mut offset_remaining = offset;
         let mut limit_remaining = limit;
         if let DeferredViewTableRowReader::Source(source) = &table_readers[0] {
@@ -20122,13 +20763,18 @@ impl EngineRuntime {
                     &store,
                     &table_readers,
                     &join_steps,
+                    &join_keys,
+                    &key_projection_indexes,
                     &table_projections,
                     &projection_indexes,
                     root_row,
                     &mut offset_remaining,
                     &mut limit_remaining,
                     &mut rows,
+                    &mut join_partial_rows,
+                    &mut chunk_payload_cache,
                     use_persistent_pk_index,
+                    linear_tail_can_move,
                 )? {
                     break;
                 }
@@ -20150,13 +20796,18 @@ impl EngineRuntime {
                         &store,
                         &table_readers,
                         &join_steps,
+                        &join_keys,
+                        &key_projection_indexes,
                         &table_projections,
                         &projection_indexes,
                         root_row,
                         &mut offset_remaining,
                         &mut limit_remaining,
                         &mut rows,
+                        &mut join_partial_rows,
+                        &mut chunk_payload_cache,
                         use_persistent_pk_index,
+                        linear_tail_can_move,
                     )
                 },
             )?;
@@ -20256,8 +20907,8 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        let mut table_bindings = Vec::new();
-        let mut join_constraints = Vec::new();
+        let mut table_bindings = Vec::with_capacity(3);
+        let mut join_constraints = Vec::with_capacity(2);
         if !flatten_inner_join_chain(
             &view_select.from[0],
             &mut table_bindings,
@@ -20344,9 +20995,12 @@ impl EngineRuntime {
             else {
                 return Ok(None);
             };
+            let is_rowid_alias =
+                rowid_alias_column_index(table_schemas[table_index]) == Some(column_index);
             projections.push(DeferredViewProjection {
                 table_index,
                 column_index,
+                is_rowid_alias,
             });
             column_names.push(
                 alias
@@ -20375,6 +21029,23 @@ impl EngineRuntime {
             &table_projections,
             "deferred view projection",
         )?;
+        let linear_tail_can_move =
+            deferred_view_linear_tail_projection_can_move(&projection_indexes);
+        let mut join_keys = Vec::with_capacity(join_steps.len());
+        let mut key_projection_indexes = Vec::with_capacity(join_steps.len());
+        for step in &join_steps {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
+            else {
+                join_keys.clear();
+                key_projection_indexes.clear();
+                break;
+            };
+            join_keys.push(keys);
+            key_projection_indexes.push(join_key_projection_index(
+                step,
+                &table_projections[step.previous_table_index],
+            )?);
+        }
 
         let mut table_readers = Vec::with_capacity(table_bindings.len());
         for (binding, schema) in table_bindings.iter().zip(table_schemas.iter()) {
@@ -20400,47 +21071,62 @@ impl EngineRuntime {
             });
         }
 
-        let filter_value = self.eval_expr(
-            value_expr,
-            &Dataset::empty(),
-            &[],
-            params,
-            &BTreeMap::new(),
-            None,
-        )?;
-        let Value::Int64(source_row_id) = filter_value else {
-            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        let source_row_id = match simple_int64_constant_expr_value(value_expr, params)? {
+            Some(value) => value,
+            None => {
+                let filter_value = self.eval_expr(
+                    value_expr,
+                    &Dataset::empty(),
+                    &[],
+                    params,
+                    &BTreeMap::new(),
+                    None,
+                )?;
+                let Value::Int64(value) = filter_value else {
+                    return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+                };
+                value
+            }
         };
         let store = SnapshotPageStore {
             pager,
             wal,
             snapshot_lsn,
         };
-        let Some(source_row) = table_readers[source_table_index].read_projected(
+        let mut chunk_payload_cache = HashMap::new();
+        let Some(source_row) = table_readers[source_table_index].read_projected_with_chunk_cache(
             &store,
             source_row_id,
             use_persistent_pk_index,
             &table_projections[source_table_index].projection_indexes,
+            &mut chunk_payload_cache,
         )?
         else {
             return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
         };
 
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(64);
+        let mut join_partial_rows = Vec::with_capacity(join_steps.len() + 1);
         if let Some(stopped) = self.stream_deferred_view_linear_three_table_rows_from_root(
             &store,
             &table_readers,
             &join_steps,
+            &join_keys,
+            &key_projection_indexes,
             &table_projections,
             &source_row,
             use_persistent_pk_index,
-            &mut |partial| {
-                let values = collect_deferred_view_projection_values_from_refs(
-                    partial,
+            &mut chunk_payload_cache,
+            &mut |root_row, row1, row2| {
+                let row = collect_deferred_view_query_row_from_linear_tail(
+                    root_row,
+                    row1,
+                    row2,
                     &projection_indexes,
                     "deferred view projection",
+                    linear_tail_can_move,
                 )?;
-                rows.push(QueryRow::new(values));
+                rows.push(row);
                 Ok(false)
             },
         )? {
@@ -20452,10 +21138,14 @@ impl EngineRuntime {
             &store,
             &table_readers,
             &join_steps,
+            &join_keys,
+            &key_projection_indexes,
             &table_projections,
             source_row,
+            &mut join_partial_rows,
             use_persistent_pk_index,
             false,
+            &mut chunk_payload_cache,
             &mut |partial| {
                 let values = collect_deferred_view_projection_values(
                     partial,
@@ -20477,15 +21167,23 @@ impl EngineRuntime {
         store: &S,
         table_row_readers: &[DeferredViewTableRowReader<'_>],
         join_steps: &[DeferredViewJoinStep],
+        join_keys: &[&RuntimeBtreeKeys],
+        key_projection_indexes: &[Option<usize>],
         table_projections: &[DeferredViewTableProjection],
         root_row: &StoredRow,
         use_persistent_pk_index: bool,
+        chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
         visit: &mut F,
     ) -> Result<Option<bool>>
     where
-        F: FnMut(&[&StoredRow; 3]) -> Result<bool>,
+        F: FnMut(&StoredRow, &StoredRow, StoredRow) -> Result<bool>,
     {
-        if table_row_readers.len() != 3 || join_steps.len() != 2 || table_projections.len() != 3 {
+        if table_row_readers.len() != 3
+            || join_steps.len() != 2
+            || table_projections.len() != 3
+            || join_keys.len() != 2
+            || key_projection_indexes.len() != 2
+        {
             return Ok(None);
         }
         let step0 = &join_steps[0];
@@ -20497,50 +21195,66 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let Some(RuntimeIndex::Btree { keys: keys0, .. }) = self.index(&step0.current_index_name)
-        else {
+        let [keys0, keys1] = join_keys else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys: keys1, .. }) = self.index(&step1.current_index_name)
-        else {
+        let [key0_projection_index, key1_projection_index] = key_projection_indexes else {
             return Ok(None);
         };
-        let key0_projection_index = join_key_projection_index(step0, &table_projections[0])?;
-        let key1_projection_index = join_key_projection_index(step1, &table_projections[1])?;
-        let key0 = deferred_view_join_key(root_row, key0_projection_index)?;
-        if matches!(key0.as_ref(), Value::Null) {
-            return Ok(Some(false));
-        }
+        let key0_row_ids = match *key0_projection_index {
+            Some(key0_projection_index) => {
+                let Some(key0_value) = root_row.values.get(key0_projection_index) else {
+                    return Err(DbError::internal(
+                        "deferred view linear join projection row is shorter than planned schema",
+                    ));
+                };
+                if matches!(key0_value, Value::Null) {
+                    return Ok(Some(false));
+                }
+                keys0.row_ids_for_value_set(key0_value)?
+            }
+            None => keys0.row_ids_for_row_id(root_row.row_id),
+        };
 
-        let stopped = keys0
-            .row_ids_for_value_set(key0.as_ref())?
+        let stopped = key0_row_ids
             .visit_until(|row1_id| {
-                let Some(row1) = table_row_readers[1].read_projected(
+                let Some(row1) = table_row_readers[1].read_projected_with_chunk_cache(
                     store,
                     row1_id,
                     use_persistent_pk_index,
                     &table_projections[1].projection_indexes,
+                    chunk_payload_cache,
                 )?
                 else {
                     return Ok(false);
                 };
-                let key1 = deferred_view_join_key(&row1, key1_projection_index)?;
-                if matches!(key1.as_ref(), Value::Null) {
-                    return Ok(false);
-                }
-                keys1
-                    .row_ids_for_value_set(key1.as_ref())?
+                let key1_row_ids = match *key1_projection_index {
+                    Some(key1_projection_index) => {
+                        let Some(key1_value) = row1.values.get(key1_projection_index) else {
+                            return Err(DbError::internal(
+                                "deferred view linear join projection row is shorter than planned schema",
+                            ));
+                        };
+                        if matches!(key1_value, Value::Null) {
+                            return Ok(false);
+                        }
+                        keys1.row_ids_for_value_set(key1_value)?
+                    }
+                    None => keys1.row_ids_for_row_id(row1.row_id),
+                };
+                key1_row_ids
                     .visit_until(|row2_id| {
-                        let Some(row2) = table_row_readers[2].read_projected(
+                        let Some(row2) = table_row_readers[2].read_projected_with_chunk_cache(
                             store,
                             row2_id,
                             use_persistent_pk_index,
                             &table_projections[2].projection_indexes,
+                            chunk_payload_cache,
                         )?
                         else {
                             return Ok(false);
                         };
-                        visit(&[root_row, &row1, &row2])
+                        visit(root_row, &row1, row2)
                     })
             })?;
         Ok(Some(stopped))
@@ -20632,22 +21346,65 @@ impl EngineRuntime {
         store: &S,
         table_row_readers: &[DeferredViewTableRowReader<'_>],
         join_steps: &[DeferredViewJoinStep],
+        join_keys: &[&RuntimeBtreeKeys],
+        key_projection_indexes: &[Option<usize>],
         table_projections: &[DeferredViewTableProjection],
-        projection_indexes: &[(usize, usize)],
+        projection_indexes: &[DeferredViewProjectionSource],
         root_row: StoredRow,
         offset_remaining: &mut usize,
         limit_remaining: &mut usize,
         rows: &mut Vec<QueryRow>,
+        partial_rows: &mut Vec<StoredRow>,
+        chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
         use_persistent_pk_index: bool,
+        linear_tail_can_move: bool,
     ) -> Result<bool> {
+        if let Some(stopped) = self.stream_deferred_view_linear_three_table_rows_from_root(
+            store,
+            table_row_readers,
+            join_steps,
+            join_keys,
+            key_projection_indexes,
+            table_projections,
+            &root_row,
+            use_persistent_pk_index,
+            chunk_payload_cache,
+            &mut |root_row, row1, row2| {
+                if *offset_remaining > 0 {
+                    *offset_remaining -= 1;
+                    return Ok(false);
+                }
+                if *limit_remaining == 0 {
+                    return Ok(true);
+                }
+                let row = collect_deferred_view_query_row_from_linear_tail(
+                    root_row,
+                    row1,
+                    row2,
+                    projection_indexes,
+                    "deferred view limit projection",
+                    linear_tail_can_move,
+                )?;
+                rows.push(row);
+                *limit_remaining = (*limit_remaining).saturating_sub(1);
+                Ok(*limit_remaining == 0)
+            },
+        )? {
+            return Ok(stopped);
+        }
+
         let Some(stopped) = self.stream_deferred_view_join_rows_from_root(
             store,
             table_row_readers,
             join_steps,
+            join_keys,
+            key_projection_indexes,
             table_projections,
             root_row,
+            partial_rows,
             use_persistent_pk_index,
             true,
+            chunk_payload_cache,
             &mut |partial| {
                 if *offset_remaining > 0 {
                     *offset_remaining -= 1;
@@ -20680,10 +21437,14 @@ impl EngineRuntime {
         store: &S,
         table_row_readers: &[DeferredViewTableRowReader<'_>],
         join_steps: &[DeferredViewJoinStep],
+        join_keys: &[&RuntimeBtreeKeys],
+        key_projection_indexes: &[Option<usize>],
         table_projections: &[DeferredViewTableProjection],
         root_row: StoredRow,
+        partial_rows: &mut Vec<StoredRow>,
         use_persistent_pk_index: bool,
         require_index: bool,
+        chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
         visit: &mut F,
     ) -> Result<Option<bool>>
     where
@@ -20700,6 +21461,7 @@ impl EngineRuntime {
             step_index: usize,
             partial_rows: &mut Vec<StoredRow>,
             use_persistent_pk_index: bool,
+            chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
             visit: &mut F,
         ) -> Result<Option<bool>>
         where
@@ -20716,17 +21478,25 @@ impl EngineRuntime {
                     "deferred view limit join row is shorter than the planned schema",
                 ));
             };
-            let key_value =
-                deferred_view_join_key(previous_row, key_projection_indexes[step_index])?;
-            if matches!(key_value.as_ref(), Value::Null) {
-                return Ok(Some(false));
-            }
             let current_table_index = step.current_table_index;
             let current_projection_indexes =
                 &table_projections[current_table_index].projection_indexes;
 
             let mut outcome = None;
-            let row_ids = keys.row_ids_for_value_set(key_value.as_ref())?;
+            let row_ids = match key_projection_indexes[step_index] {
+                Some(projection_index) => {
+                    let Some(key_value) = previous_row.values.get(projection_index) else {
+                        return Err(DbError::internal(
+                            "deferred view join row is shorter than planned schema",
+                        ));
+                    };
+                    if matches!(key_value, Value::Null) {
+                        return Ok(Some(false));
+                    }
+                    keys.row_ids_for_value_set(key_value)?
+                }
+                None => keys.row_ids_for_row_id(previous_row.row_id),
+            };
 
             let mut visit_row_id = |row_id| -> Result<Option<bool>> {
                 if partial_rows.len() != step.current_table_index {
@@ -20735,12 +21505,14 @@ impl EngineRuntime {
                     ));
                 }
 
-                let Some(joined_row) = table_row_readers[current_table_index].read_projected(
-                    store,
-                    row_id,
-                    use_persistent_pk_index,
-                    current_projection_indexes,
-                )?
+                let Some(joined_row) = table_row_readers[current_table_index]
+                    .read_projected_with_chunk_cache(
+                        store,
+                        row_id,
+                        use_persistent_pk_index,
+                        current_projection_indexes,
+                        chunk_payload_cache,
+                    )?
                 else {
                     return Ok(Some(false));
                 };
@@ -20755,6 +21527,7 @@ impl EngineRuntime {
                     step_index + 1,
                     partial_rows,
                     use_persistent_pk_index,
+                    chunk_payload_cache,
                     visit,
                 )?;
                 partial_rows.pop();
@@ -20803,39 +21576,31 @@ impl EngineRuntime {
             Ok(outcome.unwrap_or(Some(false)))
         }
 
-        let mut join_keys = Vec::with_capacity(join_steps.len());
-        let mut key_projection_indexes = Vec::with_capacity(join_steps.len());
-        for step in join_steps {
-            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
-            else {
-                if !require_index {
-                    return Ok(None);
-                }
-                return Err(DbError::internal(format!(
-                    "index {} is missing for deferred view limit join",
-                    step.current_index_name
-                )));
-            };
-            join_keys.push(keys);
-            let projection_index =
-                join_key_projection_index(step, &table_projections[step.previous_table_index])?;
-            key_projection_indexes.push(projection_index);
+        if join_keys.len() != join_steps.len() || key_projection_indexes.len() != join_steps.len() {
+            if !require_index {
+                return Ok(None);
+            }
+            return Err(DbError::internal(
+                "deferred view join metadata is missing while executing index-required join",
+            ));
         }
-
-        let mut partial_rows = Vec::with_capacity(join_steps.len() + 1);
+        partial_rows.clear();
         partial_rows.push(root_row);
-        walk_join_rows(
+        let result = walk_join_rows(
             store,
             table_row_readers,
             join_steps,
             table_projections,
-            &join_keys,
-            &key_projection_indexes,
+            join_keys,
+            key_projection_indexes,
             0,
-            &mut partial_rows,
+            partial_rows,
             use_persistent_pk_index,
+            chunk_payload_cache,
             visit,
-        )
+        );
+        partial_rows.clear();
+        result
     }
 
     pub(crate) fn try_execute_simple_deferred_paged_query(
@@ -20847,26 +21612,6 @@ impl EngineRuntime {
         snapshot_lsn: u64,
         use_persistent_pk_index: bool,
     ) -> Result<Option<QueryResult>> {
-        if let Some(result) = self.try_execute_simple_deferred_paged_grouped_count_query(
-            query,
-            params,
-            pager,
-            wal,
-            snapshot_lsn,
-        )? {
-            return Ok(Some(result));
-        }
-        if let Some(result) = self
-            .try_execute_simple_deferred_paged_grouped_numeric_aggregate_query(
-                query,
-                params,
-                pager,
-                wal,
-                snapshot_lsn,
-            )?
-        {
-            return Ok(Some(result));
-        }
         if let Some(result) = self.try_execute_simple_deferred_view_projection_limit_query(
             query,
             params,
@@ -20885,6 +21630,26 @@ impl EngineRuntime {
             snapshot_lsn,
             use_persistent_pk_index,
         )? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.try_execute_simple_deferred_paged_grouped_count_query(
+            query,
+            params,
+            pager,
+            wal,
+            snapshot_lsn,
+        )? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self
+            .try_execute_simple_deferred_paged_grouped_numeric_aggregate_query(
+                query,
+                params,
+                pager,
+                wal,
+                snapshot_lsn,
+            )?
+        {
             return Ok(Some(result));
         }
         if let Some(result) = self.try_execute_simple_deferred_rowid_join_projection_query(
@@ -29590,13 +30355,13 @@ where
         if is_tombstone {
             continue;
         }
-        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.contains(&row_id)) {
+        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.binary_search(&row_id).is_ok()) {
             continue;
         }
         if projection_indexes.is_empty() {
             visitor(row_id, &[])?;
         } else {
-            let values = Row::decode_projection_with_overflow::<
+            let values = Row::decode_projection_sorted_unique_with_overflow::<
                 crate::storage::page::InMemoryPageStore,
             >(row_bytes, None, projection_indexes)?;
             visitor(row_id, &values)?;
@@ -29632,7 +30397,7 @@ where
         if is_tombstone {
             continue;
         }
-        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.contains(&row_id)) {
+        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.binary_search(&row_id).is_ok()) {
             continue;
         }
         visible_count += 1;
@@ -29641,7 +30406,7 @@ where
                 return Ok((visible_count, true));
             }
         } else {
-            let values = Row::decode_projection_with_overflow::<
+            let values = Row::decode_projection_sorted_unique_with_overflow::<
                 crate::storage::page::InMemoryPageStore,
             >(row_bytes, None, projection_indexes)?;
             if visitor(row_id, &values)? {
@@ -29730,7 +30495,7 @@ where
         if projection_indexes.is_empty() {
             visitor(row_id, &[])?;
         } else {
-            let values = Row::decode_projection_with_overflow::<
+            let values = Row::decode_projection_sorted_unique_with_overflow::<
                 crate::storage::page::InMemoryPageStore,
             >(&row_bytes, None, projection_indexes)?;
             visitor(row_id, &values)?;
@@ -29783,7 +30548,7 @@ where
                 return Ok((visited, true));
             }
         } else {
-            let values = Row::decode_projection_with_overflow::<
+            let values = Row::decode_projection_sorted_unique_with_overflow::<
                 crate::storage::page::InMemoryPageStore,
             >(&row_bytes, None, projection_indexes)?;
             if visitor(row_id, &values)? {
@@ -30127,7 +30892,7 @@ where
 
         let base_payload = read_overflow(store, chunk.pointer)?;
         for row in decode_table_payload_rows(&base_payload)? {
-            if has_tombstones && chunk.tombstoned_row_ids.contains(&row.row_id) {
+            if has_tombstones && chunk.tombstoned_row_ids.binary_search(&row.row_id).is_ok() {
                 continue;
             }
             visitor(row.row_id, &row.values)?;
@@ -30197,7 +30962,7 @@ where
 
         let base_payload = read_overflow(store, chunk.pointer)?;
         for row in decode_table_payload_rows(&base_payload)? {
-            if has_tombstones && chunk.tombstoned_row_ids.contains(&row.row_id) {
+            if has_tombstones && chunk.tombstoned_row_ids.binary_search(&row.row_id).is_ok() {
                 continue;
             }
             visited_row_count = visited_row_count.saturating_add(1);
@@ -35442,6 +36207,22 @@ fn simple_bound_value_expr_is_constant(expr: &Expr) -> bool {
     }
 }
 
+fn simple_int64_constant_expr_value(expr: &Expr, params: &[Value]) -> Result<Option<i64>> {
+    match expr {
+        Expr::Literal(Value::Int64(value)) => Ok(Some(*value)),
+        Expr::Parameter(index) => {
+            let Some(value) = index.checked_sub(1).and_then(|index| params.get(index)) else {
+                return Err(DbError::sql(format!("missing parameter ${index}")));
+            };
+            match value {
+                Value::Int64(value) => Ok(Some(*value)),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 fn reverse_binary_op(op: BinaryOp) -> Option<BinaryOp> {
     match op {
         BinaryOp::Gt => Some(BinaryOp::Lt),
@@ -35597,6 +36378,7 @@ struct IndexedJoinPlan<'a> {
 struct DeferredViewProjection {
     table_index: usize,
     column_index: usize,
+    is_rowid_alias: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -35624,12 +36406,13 @@ enum DeferredViewTableRowReader<'a> {
 }
 
 impl<'a> DeferredViewTableRowReader<'a> {
-    fn read_projected<S: PageStore>(
+    fn read_projected_with_chunk_cache<S: PageStore>(
         &self,
         store: &S,
         row_id: i64,
         use_persistent_pk_index: bool,
         projection_indexes: &[usize],
+        chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
     ) -> Result<Option<StoredRow>> {
         match *self {
             Self::Source(source) => source
@@ -35646,16 +36429,39 @@ impl<'a> DeferredViewTableRowReader<'a> {
                 state,
                 schema,
                 paged_locator_cache,
-            } => read_deferred_projected_values_by_id(
-                store,
-                state,
-                schema,
-                row_id,
-                use_persistent_pk_index,
-                paged_locator_cache,
-                projection_indexes,
-            )
-            .map(|values| values.map(|values| StoredRow { row_id, values })),
+            } => {
+                if !projection_indexes.is_empty() && state.pointer.is_table_paged_manifest() {
+                    if let Some(cache) =
+                        paged_locator_cache.filter(|cache| cache.matches_state(state))
+                    {
+                        return cache
+                            .locators
+                            .get(&row_id)
+                            .copied()
+                            .map(|cached| {
+                                read_deferred_projected_values_by_cached_paged_locator_with_query_cache(
+                                    store,
+                                    cached,
+                                    cache.verified_payload_arc(cached.pointer, cached.checksum),
+                                    chunk_payload_cache,
+                                    projection_indexes,
+                                )
+                            })
+                            .transpose()
+                            .map(|values| values.map(|values| StoredRow { row_id, values }));
+                    }
+                }
+                read_deferred_projected_values_by_id(
+                    store,
+                    state,
+                    schema,
+                    row_id,
+                    use_persistent_pk_index,
+                    paged_locator_cache,
+                    projection_indexes,
+                )
+                .map(|values| values.map(|values| StoredRow { row_id, values }))
+            }
         }
     }
 }
@@ -35697,6 +36503,9 @@ fn build_deferred_view_table_projections(
         .map(|_| BTreeSet::new())
         .collect::<Vec<_>>();
     for projection in projections {
+        if projection.is_rowid_alias {
+            continue;
+        }
         required_columns[projection.table_index].insert(projection.column_index);
     }
     for step in join_steps {
@@ -35712,13 +36521,30 @@ fn build_deferred_view_table_projections(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DeferredViewProjectionSource {
+    RowId {
+        table_index: usize,
+    },
+    Projected {
+        table_index: usize,
+        projected_index: usize,
+    },
+}
+
 fn build_deferred_view_projection_indexes(
     projections: &[DeferredViewProjection],
     table_projections: &[DeferredViewTableProjection],
     context: &str,
-) -> Result<Vec<(usize, usize)>> {
+) -> Result<Vec<DeferredViewProjectionSource>> {
     let mut projection_indexes = Vec::with_capacity(projections.len());
     for projection in projections {
+        if projection.is_rowid_alias {
+            projection_indexes.push(DeferredViewProjectionSource::RowId {
+                table_index: projection.table_index,
+            });
+            continue;
+        }
         let projected_index = table_projections[projection.table_index]
             .position(projection.column_index)
             .ok_or_else(|| {
@@ -35727,7 +36553,10 @@ fn build_deferred_view_projection_indexes(
                     projection.column_index
                 ))
             })?;
-        projection_indexes.push((projection.table_index, projected_index));
+        projection_indexes.push(DeferredViewProjectionSource::Projected {
+            table_index: projection.table_index,
+            projected_index,
+        });
     }
     Ok(projection_indexes)
 }
@@ -35753,35 +36582,31 @@ fn join_key_projection_index(
         })
 }
 
-/// Extracts a join key value for `row`. When `projection_index` is `None` the
-/// key is the row's row-id alias, so the value is synthesized from `row_id`
-/// without decoding any column.
-fn deferred_view_join_key(
-    row: &StoredRow,
-    projection_index: Option<usize>,
-) -> Result<std::borrow::Cow<'_, Value>> {
-    match projection_index {
-        None => Ok(std::borrow::Cow::Owned(Value::Int64(row.row_id))),
-        Some(index) => row
-            .values
-            .get(index)
-            .map(std::borrow::Cow::Borrowed)
-            .ok_or_else(|| {
-                DbError::internal("deferred view join row is shorter than planned schema")
-            }),
-    }
-}
-
 fn collect_deferred_view_projection_values(
     partial_rows: &[StoredRow],
-    projection_indexes: &[(usize, usize)],
+    projection_indexes: &[DeferredViewProjectionSource],
     context: &str,
 ) -> Result<Vec<Value>> {
-    if projection_indexes.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut values = Vec::with_capacity(projection_indexes.len());
-    for (table_index, projected_index) in projection_indexes.iter().copied() {
+    if projection_indexes.is_empty() {
+        return Ok(values);
+    }
+    for source in projection_indexes.iter().copied() {
+        let (table_index, projected_index) = match source {
+            DeferredViewProjectionSource::RowId { table_index } => {
+                let Some(row) = partial_rows.get(table_index) else {
+                    return Err(DbError::internal(format!(
+                        "{context} row is shorter than planned schema",
+                    )));
+                };
+                values.push(Value::Int64(row.row_id));
+                continue;
+            }
+            DeferredViewProjectionSource::Projected {
+                table_index,
+                projected_index,
+            } => (table_index, projected_index),
+        };
         let Some(row) = partial_rows.get(table_index) else {
             return Err(DbError::internal(format!(
                 "{context} row is shorter than planned schema",
@@ -35797,27 +36622,263 @@ fn collect_deferred_view_projection_values(
     Ok(values)
 }
 
-fn collect_deferred_view_projection_values_from_refs(
-    partial_rows: &[&StoredRow],
-    projection_indexes: &[(usize, usize)],
-    context: &str,
-) -> Result<Vec<Value>> {
-    if projection_indexes.is_empty() {
-        return Ok(Vec::new());
+fn deferred_view_linear_tail_projection_can_move(
+    projection_indexes: &[DeferredViewProjectionSource],
+) -> bool {
+    let mut previous = None;
+    for source in projection_indexes {
+        let DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index,
+        } = *source
+        else {
+            continue;
+        };
+        if previous.is_some_and(|previous| projected_index <= previous) {
+            return false;
+        }
+        previous = Some(projected_index);
     }
+    true
+}
+
+fn collect_deferred_view_query_row_from_linear_tail(
+    root_row: &StoredRow,
+    row1: &StoredRow,
+    row2: StoredRow,
+    projection_indexes: &[DeferredViewProjectionSource],
+    context: &str,
+    row2_can_move: bool,
+) -> Result<QueryRow> {
+    if row2_can_move && projection_indexes.len() == 4 {
+        if let [DeferredViewProjectionSource::RowId { table_index: 0 }, DeferredViewProjectionSource::Projected {
+            table_index: 0,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 1,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 0,
+        }] = projection_indexes
+        {
+            let Some(root_value) = root_row.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let Some(row1_value) = row1.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let mut row2_values = row2.values.into_iter();
+            let Some(row2_value) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            return Ok(QueryRow::from_small_values(smallvec![
+                Value::Int64(root_row.row_id),
+                root_value.clone(),
+                row1_value.clone(),
+                row2_value,
+            ]));
+        }
+    }
+
+    if row2_can_move && projection_indexes.len() == 3 {
+        if let [DeferredViewProjectionSource::Projected {
+            table_index: 1,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 1,
+        }] = projection_indexes
+        {
+            let Some(row1_value) = row1.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let mut row2_values = row2.values.into_iter();
+            let Some(row2_first) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let Some(row2_second) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            return Ok(QueryRow::from_small_values(smallvec![
+                row1_value.clone(),
+                row2_first,
+                row2_second,
+            ]));
+        }
+    }
+
+    collect_deferred_view_projection_values_from_linear_tail(
+        root_row,
+        row1,
+        row2,
+        projection_indexes,
+        context,
+        row2_can_move,
+    )
+    .map(QueryRow::new)
+}
+
+fn collect_deferred_view_projection_values_from_linear_tail(
+    root_row: &StoredRow,
+    row1: &StoredRow,
+    row2: StoredRow,
+    projection_indexes: &[DeferredViewProjectionSource],
+    context: &str,
+    row2_can_move: bool,
+) -> Result<Vec<Value>> {
+    if row2_can_move && projection_indexes.len() == 4 {
+        if let [DeferredViewProjectionSource::RowId { table_index: 0 }, DeferredViewProjectionSource::Projected {
+            table_index: 0,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 1,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 0,
+        }] = projection_indexes
+        {
+            let Some(root_value) = root_row.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let Some(row1_value) = row1.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let mut row2_values = row2.values.into_iter();
+            let Some(row2_value) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            return Ok(vec![
+                Value::Int64(root_row.row_id),
+                root_value.clone(),
+                row1_value.clone(),
+                row2_value,
+            ]);
+        }
+    }
+
+    if row2_can_move && projection_indexes.len() == 3 {
+        if let [DeferredViewProjectionSource::Projected {
+            table_index: 1,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 0,
+        }, DeferredViewProjectionSource::Projected {
+            table_index: 2,
+            projected_index: 1,
+        }] = projection_indexes
+        {
+            let Some(row1_value) = row1.values.first() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let mut row2_values = row2.values.into_iter();
+            let Some(row2_first) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            let Some(row2_second) = row2_values.next() else {
+                return Err(DbError::internal(format!(
+                    "{context} projection row is shorter than planned schema",
+                )));
+            };
+            return Ok(vec![row1_value.clone(), row2_first, row2_second]);
+        }
+    }
+
+    let row2_row_id = row2.row_id;
+    let mut row2_values = row2.values;
+    let mut row2_removed = 0usize;
     let mut values = Vec::with_capacity(projection_indexes.len());
-    for (table_index, projected_index) in projection_indexes.iter().copied() {
-        let Some(row) = partial_rows.get(table_index) else {
-            return Err(DbError::internal(format!(
-                "{context} row is shorter than planned schema",
-            )));
-        };
-        let Some(value) = row.values.get(projected_index) else {
-            return Err(DbError::internal(format!(
-                "{context} projection row is shorter than planned schema",
-            )));
-        };
-        values.push(value.clone());
+    for source in projection_indexes.iter().copied() {
+        match source {
+            DeferredViewProjectionSource::RowId { table_index } => {
+                let row_id = match table_index {
+                    0 => root_row.row_id,
+                    1 => row1.row_id,
+                    2 => row2_row_id,
+                    _ => {
+                        return Err(DbError::internal(format!(
+                            "{context} row is shorter than planned schema",
+                        )));
+                    }
+                };
+                values.push(Value::Int64(row_id));
+            }
+            DeferredViewProjectionSource::Projected {
+                table_index,
+                projected_index,
+            } => match table_index {
+                0 => {
+                    let Some(value) = root_row.values.get(projected_index) else {
+                        return Err(DbError::internal(format!(
+                            "{context} projection row is shorter than planned schema",
+                        )));
+                    };
+                    values.push(value.clone());
+                }
+                1 => {
+                    let Some(value) = row1.values.get(projected_index) else {
+                        return Err(DbError::internal(format!(
+                            "{context} projection row is shorter than planned schema",
+                        )));
+                    };
+                    values.push(value.clone());
+                }
+                2 if row2_can_move => {
+                    let Some(adjusted_index) = projected_index.checked_sub(row2_removed) else {
+                        return Err(DbError::internal(format!(
+                            "{context} projection row is shorter than planned schema",
+                        )));
+                    };
+                    if adjusted_index >= row2_values.len() {
+                        return Err(DbError::internal(format!(
+                            "{context} projection row is shorter than planned schema",
+                        )));
+                    }
+                    values.push(row2_values.remove(adjusted_index));
+                    row2_removed = row2_removed.saturating_add(1);
+                }
+                2 => {
+                    let Some(value) = row2_values.get(projected_index) else {
+                        return Err(DbError::internal(format!(
+                            "{context} projection row is shorter than planned schema",
+                        )));
+                    };
+                    values.push(value.clone());
+                }
+                _ => {
+                    return Err(DbError::internal(format!(
+                        "{context} row is shorter than planned schema",
+                    )));
+                }
+            },
+        }
     }
     Ok(values)
 }
@@ -36385,10 +37446,11 @@ fn push_projection_index(indexes: &mut Vec<usize>, index: usize) -> usize {
 }
 
 fn project_simple_projection_values(values: &[Value], projection_indexes: &[usize]) -> QueryRow {
-    QueryRow::new(project_simple_projection_value_vec(
-        values,
-        projection_indexes,
-    ))
+    let mut projected = SmallVec::<[Value; 4]>::with_capacity(projection_indexes.len());
+    for index in projection_indexes {
+        projected.push(values[*index].clone());
+    }
+    QueryRow::from_small_values(projected)
 }
 
 fn project_resolved_simple_join_row(
@@ -37311,7 +38373,7 @@ fn decode_projected_values_by_locator_from_payload<S: PageStore>(
     let row_bytes = payload
         .get(start..end)
         .ok_or_else(|| DbError::corruption("row locator exceeded payload length"))?;
-    Row::decode_projection_with_overflow(row_bytes, store, projection_indexes)
+    Row::decode_projection_sorted_unique_with_overflow(row_bytes, store, projection_indexes)
 }
 
 fn read_deferred_row_by_locator_from_table_payload<S: PageStore>(
@@ -37419,6 +38481,45 @@ fn read_deferred_projected_values_by_cached_paged_locator<S: PageStore>(
     )
 }
 
+fn read_deferred_projected_values_by_cached_paged_locator_with_query_cache<S: PageStore>(
+    store: &S,
+    cached: CachedPagedRowLocator,
+    verified_payload: Option<&Arc<Vec<u8>>>,
+    chunk_payload_cache: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
+    projection_indexes: &[usize],
+) -> Result<Vec<Value>> {
+    if let Some(payload) = verified_payload {
+        return decode_projected_values_by_locator_from_payload(
+            Some(store),
+            payload.as_slice(),
+            cached.locator,
+            projection_indexes,
+        );
+    }
+    let key = CachedPagedChunkPayloadKey::new(cached.pointer, cached.checksum);
+    if let Some(payload) = chunk_payload_cache.get(&key) {
+        return decode_projected_values_by_locator_from_payload(
+            Some(store),
+            payload.as_slice(),
+            cached.locator,
+            projection_indexes,
+        );
+    }
+
+    let payload = Arc::new(read_overflow(store, cached.pointer)?);
+    if crc32c_parts(&[payload.as_slice()]) != cached.checksum {
+        return Err(DbError::corruption("paged table chunk checksum mismatch"));
+    }
+    let values = decode_projected_values_by_locator_from_payload(
+        Some(store),
+        payload.as_slice(),
+        cached.locator,
+        projection_indexes,
+    )?;
+    chunk_payload_cache.insert(key, payload);
+    Ok(values)
+}
+
 fn read_deferred_projected_values_by_locator_from_table_payload<S: PageStore>(
     store: &S,
     state: PersistedTableState,
@@ -37443,8 +38544,12 @@ fn read_deferred_projected_values_by_locator_from_table_payload<S: PageStore>(
     let mut cursor = OverflowPayloadCursor::new(store, pointer);
     cursor.skip(locator.byte_offset as usize)?;
     let row_bytes = cursor.read_vec(locator.byte_len as usize)?;
-    Row::decode_projection_with_overflow(row_bytes.as_slice(), Some(store), projection_indexes)
-        .map(Some)
+    Row::decode_projection_sorted_unique_with_overflow(
+        row_bytes.as_slice(),
+        Some(store),
+        projection_indexes,
+    )
+    .map(Some)
 }
 
 fn read_deferred_projected_values_by_locator_from_paged_table_payload<S: PageStore>(

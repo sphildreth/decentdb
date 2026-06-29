@@ -103,6 +103,28 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) compiled_index_state_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedInsertApplyMode {
+    preserve_stored_row: bool,
+    update_catalog_next_row_id: bool,
+}
+
+impl PreparedInsertApplyMode {
+    const fn update_catalog(preserve_stored_row: bool) -> Self {
+        Self {
+            preserve_stored_row,
+            update_catalog_next_row_id: true,
+        }
+    }
+
+    const fn caller_tracks_next_row_id() -> Self {
+        Self {
+            preserve_stored_row: false,
+            update_catalog_next_row_id: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleUpdate {
     pub(crate) table_name: String,
@@ -1940,15 +1962,101 @@ impl EngineRuntime {
         .map(|result| result.0)
     }
 
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        cached_next_row_id: &mut i64,
+        page_size: u32,
+    ) -> Result<u64> {
+        let table_name = prepared.table_name.as_str();
+        let mut next_row_id = *cached_next_row_id;
+        candidate.clear();
+
+        if params.len() < prepared.columns.len() {
+            return Err(DbError::sql(format!(
+                "prepared insert expected {} parameters but received {}",
+                prepared.columns.len(),
+                params.len()
+            )));
+        }
+
+        if prepared.has_auto_increment {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let mut value = std::mem::replace(param, Value::Null);
+
+                if column.auto_increment {
+                    match value {
+                        Value::Null => {
+                            value = Value::Int64(next_row_id);
+                            next_row_id += 1;
+                        }
+                        Value::Int64(explicit) => {
+                            if explicit >= next_row_id {
+                                next_row_id = explicit + 1;
+                            }
+                        }
+                        _ => {
+                            return Err(DbError::constraint(format!(
+                                "auto-increment column {}.{} requires INT64 values",
+                                table_name, column.name
+                            )));
+                        }
+                    }
+                }
+
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
+            }
+        } else {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let value = std::mem::replace(param, Value::Null);
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
+            }
+        }
+
+        let (affected, _stored_row, new_next_row_id) = self
+            .apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+                prepared,
+                std::mem::take(candidate),
+                next_row_id,
+                params,
+                page_size,
+                PreparedInsertApplyMode::caller_tracks_next_row_id(),
+            )?;
+        *cached_next_row_id = new_next_row_id;
+        Ok(affected)
+    }
+
     fn apply_prepared_simple_insert_candidate(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        candidate: Vec<Value>,
+        next_row_id: i64,
+        params: &[Value],
+        page_size: u32,
+        preserve_stored_row: bool,
+    ) -> Result<(u64, Option<StoredRow>)> {
+        self.apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+            prepared,
+            candidate,
+            next_row_id,
+            params,
+            page_size,
+            PreparedInsertApplyMode::update_catalog(preserve_stored_row),
+        )
+        .map(|(affected, stored_row, _next_row_id)| (affected, stored_row))
+    }
+
+    fn apply_prepared_simple_insert_candidate_with_next_row_id_mode(
         &mut self,
         prepared: &PreparedSimpleInsert,
         candidate: Vec<Value>,
         mut next_row_id: i64,
         params: &[Value],
         page_size: u32,
-        preserve_stored_row: bool,
-    ) -> Result<(u64, Option<StoredRow>)> {
+        apply_mode: PreparedInsertApplyMode,
+    ) -> Result<(u64, Option<StoredRow>, i64)> {
         let table_name = prepared.table_name.as_str();
 
         if prepared.use_generic_validation {
@@ -1985,20 +2093,25 @@ impl EngineRuntime {
                 !prepared.use_generic_validation,
             )?;
         }
-        let preserved_stored_row = preserve_stored_row.then(|| stored_row.clone());
+        let preserved_stored_row = apply_mode.preserve_stored_row.then(|| stored_row.clone());
+        let update_catalog_next_row_id = apply_mode.update_catalog_next_row_id;
         if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
-            self.catalog_table_exact_mut(catalog_table_name)
-                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-                .next_row_id = next_row_id;
+            if update_catalog_next_row_id {
+                self.catalog_table_exact_mut(catalog_table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                    .next_row_id = next_row_id;
+            }
             self.append_owned_stored_row_to_catalog_table_row_source(
                 catalog_table_name,
                 stored_row,
                 page_size,
             )?;
         } else {
-            self.catalog_table_mut(table_name)
-                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-                .next_row_id = next_row_id;
+            if update_catalog_next_row_id {
+                self.catalog_table_mut(table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                    .next_row_id = next_row_id;
+            }
             self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
         }
         if prepared.use_generic_index_updates {
@@ -2009,7 +2122,7 @@ impl EngineRuntime {
         } else {
             self.mark_table_row_appended(table_name);
         }
-        Ok((1, preserved_stored_row))
+        Ok((1, preserved_stored_row, next_row_id))
     }
 
     fn catalog_table_exact_mut(&mut self, table_name: &str) -> Option<&mut TableSchema> {
@@ -5728,6 +5841,13 @@ fn apply_prepared_insert_index_updates(
     } else {
         None
     };
+    let unique_tombstone_cleanup_required =
+        prepared.insert_indexes.iter().any(|index| index.unique)
+            && prepared
+                .catalog_table_name
+                .as_deref()
+                .and_then(|table_name| runtime.tables.get(table_name))
+                .is_none_or(|row_source| row_source.has_tombstoned_rows());
     for index in &prepared.insert_indexes {
         if index.int64_key {
             let [column_index] = index.column_indexes.as_slice() else {
@@ -5755,7 +5875,7 @@ fn apply_prepared_insert_index_updates(
             } else {
                 None
             };
-            if index.unique {
+            if index.unique && unique_tombstone_cleanup_required {
                 remove_tombstoned_unique_btree_entries_for_key(
                     runtime,
                     &prepared.table_name,
@@ -5813,7 +5933,7 @@ fn apply_prepared_insert_index_updates(
             } else {
                 None
             };
-            if index.unique {
+            if index.unique && unique_tombstone_cleanup_required {
                 remove_tombstoned_unique_btree_entries_for_key(
                     runtime,
                     &prepared.table_name,
@@ -5861,7 +5981,7 @@ fn apply_prepared_insert_index_updates(
         } else {
             None
         };
-        if index.unique {
+        if index.unique && unique_tombstone_cleanup_required {
             remove_tombstoned_unique_btree_entries_for_key(
                 runtime,
                 &prepared.table_name,
