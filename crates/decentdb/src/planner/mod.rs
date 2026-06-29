@@ -773,16 +773,32 @@ fn join_side_index_name(
     binding: TableBindingRef<'_>,
     constraint: &Expr,
 ) -> Option<String> {
-    for expr in flattened_join_predicate_columns(constraint) {
-        let Some(column_ref) = qualified_column_ref_expr(expr) else {
+    for predicate in flattened_join_predicate_columns(constraint) {
+        // `flattened_join_predicate_columns` only splits AND-chains, so each
+        // remaining predicate is an individual equality (or other comparison).
+        // Decompose the equality into its two column operands so a usable join
+        // index on either side is detected.
+        let Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } = predicate
+        else {
             continue;
         };
-        if matches_table_binding(binding, column_ref.table) {
+        for operand in [left.as_ref(), right.as_ref()] {
+            let Some(column_ref) = qualified_column_ref_expr(operand) else {
+                continue;
+            };
+            if !matches_table_binding(binding, column_ref.table) {
+                continue;
+            }
             if let Some(index_name) = catalog.indexes.values().find_map(|index| {
                 if !identifiers_equal(&index.table_name, binding.name)
                     || index.columns.len() != 1
                     || index.predicate_sql.is_some()
                     || !index.fresh
+                    || index.kind != IndexKind::Btree
                 {
                     return None;
                 }
@@ -2503,6 +2519,126 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Filter((namenormalized = 'MOTLEYCRUE')")),
             "expected rendered plan to retain visible outer filter, got: {lines:?}"
+        );
+    }
+
+    fn catalog_with_two_table_join(indexed: bool, with_stats: bool) -> CatalogState {
+        let mut catalog = CatalogState::empty(0);
+        catalog.tables.insert(
+            "artists".to_string(),
+            TableSchema {
+                name: "artists".to_string(),
+                temporary: false,
+                columns: vec![test_column("id", true), test_column("name", false)],
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        catalog.tables.insert(
+            "albums".to_string(),
+            TableSchema {
+                name: "albums".to_string(),
+                temporary: false,
+                columns: vec![test_column("id", true), test_column("artist_id", false)],
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        if indexed {
+            catalog.indexes.insert(
+                "idx_albums_artist".to_string(),
+                IndexSchema {
+                    name: "idx_albums_artist".to_string(),
+                    table_name: "albums".to_string(),
+                    kind: IndexKind::Btree,
+                    unique: false,
+                    columns: vec![IndexColumn {
+                        column_name: Some("artist_id".to_string()),
+                        expression_sql: None,
+                    }],
+                    include_columns: Vec::new(),
+                    predicate_sql: None,
+                    full_text: None,
+                    fresh: true,
+                },
+            );
+        }
+        if with_stats {
+            catalog.table_stats.insert(
+                "artists".to_string(),
+                crate::catalog::TableStats { row_count: 10_000 },
+            );
+            catalog.table_stats.insert(
+                "albums".to_string(),
+                crate::catalog::TableStats { row_count: 50_000 },
+            );
+            catalog.index_stats.insert(
+                "idx_albums_artist".to_string(),
+                crate::catalog::IndexStats {
+                    entry_count: 50_000,
+                    distinct_key_count: 10_000,
+                },
+            );
+        }
+        catalog
+    }
+
+    #[test]
+    fn explain_plan_chooses_indexed_join_when_useful_index_exists() {
+        let catalog = catalog_with_two_table_join(true, true);
+        let statement = parse_sql_statement(
+            "SELECT artists.name FROM artists JOIN albums ON albums.artist_id = artists.id",
+        )
+        .expect("parse");
+
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("IndexedJoin("),
+            "expected an indexed join when a useful join index exists, got: {lines:?}"
+        );
+        assert!(
+            rendered.contains("estRows=") && rendered.contains("estCost="),
+            "expected estimated rows and cost on the join plan, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explain_plan_chooses_hash_join_without_useful_index() {
+        let catalog = catalog_with_two_table_join(false, true);
+        let statement = parse_sql_statement(
+            "SELECT artists.name FROM artists JOIN albums ON albums.artist_id = artists.id",
+        )
+        .expect("parse");
+
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.contains("IndexedJoin("),
+            "expected no indexed join when no useful index exists, got: {lines:?}"
+        );
+        assert!(
+            rendered.contains("HashJoin("),
+            "expected a hash join for an equi-join without a useful index, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explain_plan_exposes_estimates_on_operators() {
+        let catalog = catalog_with_two_table_join(true, true);
+        let statement =
+            parse_sql_statement("SELECT name FROM artists WHERE id = 5").expect("parse");
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("estRows=") && rendered.contains("estCost="),
+            "expected EXPLAIN to surface estRows and estCost, got: {lines:?}"
         );
     }
 

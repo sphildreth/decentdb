@@ -565,6 +565,7 @@ pub struct PreparedStatementBatch<'txn, 'db> {
     prepared: &'txn PreparedStatement,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     direct_positional: bool,
+    prepared_insert_candidate: Vec<Value>,
 }
 
 /// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
@@ -736,9 +737,10 @@ impl PreparedStatementBatch<'_, '_> {
             let affected = self
                 .state
                 .runtime
-                .execute_prepared_simple_insert_positional_params_in_place(
+                .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
                     prepared_insert.as_ref(),
                     params,
+                    &mut self.prepared_insert_candidate,
                     self.db.inner.config.page_size,
                 )?;
             self.state.persistent_changed |=
@@ -913,6 +915,7 @@ struct ExclusiveSqlTxnState<'a> {
     persistent_changed: bool,
     indexes_maybe_stale: bool,
     prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
+    prepared_insert_candidate: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -8556,6 +8559,7 @@ impl Db {
             persistent_changed: false,
             indexes_maybe_stale: false,
             prepared_insert_runtime_cache: HashMap::new(),
+            prepared_insert_candidate: Vec::new(),
         })
     }
 
@@ -10930,6 +10934,7 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
             &mut state.prepared_insert_runtime_cache,
+            &mut state.prepared_insert_candidate,
         )? {
             return Ok(result);
         }
@@ -11008,6 +11013,7 @@ impl Db {
             prepared,
             prepared_insert,
             direct_positional,
+            prepared_insert_candidate: Vec::new(),
         })
     }
 
@@ -11071,6 +11077,7 @@ impl Db {
         persistent_changed: &mut bool,
         indexes_maybe_stale: &mut bool,
         prepared_insert_runtime_cache: &mut HashMap<usize, Arc<PreparedSimpleInsert>>,
+        prepared_insert_candidate: &mut Vec<Value>,
     ) -> Result<Option<QueryResult>> {
         let Some(insert_plan) = self.prepared_insert_plan_for_runtime_state(
             prepared,
@@ -11088,11 +11095,13 @@ impl Db {
             return Ok(None);
         }
 
-        let result = runtime.execute_prepared_simple_insert_positional_params_in_place(
-            insert_plan.as_ref(),
-            params,
-            self.inner.config.page_size,
-        )?;
+        let result = runtime
+            .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+                insert_plan.as_ref(),
+                params,
+                prepared_insert_candidate,
+                self.inner.config.page_size,
+            )?;
         *persistent_changed |=
             Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
         Ok(Some(QueryResult::with_affected_rows(result)))

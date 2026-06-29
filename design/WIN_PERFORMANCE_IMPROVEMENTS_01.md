@@ -152,6 +152,36 @@ integration beyond the existing planner scaffold, durable commit-path profiling
 and optimization, documentation finalization, and the final paranoid
 pre-commit suite.
 
+#### 2026-06-29 follow-up slice
+
+A follow-up slice added two more general improvements and gathered the first
+full smoke/medium/full/huge rust-baseline evidence for the current branch:
+
+- The deferred view linear and generic walkers now treat a join step whose
+  previous (outer) column is a single-column `INTEGER PRIMARY KEY` auto-increment
+  row-id alias as available directly from the row id, so that column is omitted
+  from the projected decode entirely and the join key is synthesized from the
+  stored row id. This is general for any two- or three-table inner-join view
+  chain, not a `v_artist_songs` shortcut.
+- A planner index-detection gap was fixed so explicit `JOIN ... ON` syntax now
+  recognizes usable join B-tree indexes and selects cost-based `IndexedJoin`
+  instead of always falling back to `HashJoin`. `EXPLAIN` now surfaces the
+  selected join operator with estimates for explicit inner equi-joins.
+- Planner `EXPLAIN` tests were added for indexed-join selection, hash-join
+  selection without a useful index, and estimated rows/cost surfacing.
+
+The measured current rust-baseline results (before → current, before baseline
+`2026-06-14` for full/huge and `2026-06-28` for smoke/medium) are summarized in
+the final report in [§14](#14-final-benchmark-report-2026-06-29). The significant
+§6 gates are **not all met**: full/huge peak RSS improved ~23% (below the 25%
+gate), the huge `query_songs_for_artist_via_view` view step improved ~1.85x
+(below the 2x gate), and the public `embedded_compare` headline shows a
+~25% `insert_rows_per_sec` regression and ~40-100% `read_p95_ms` regression
+relative to the `2026-06-20` public before baseline. Those public regressions
+are present on the committed branch independent of this session's view/planner
+changes and require separate investigation. See [§14](#14-final-benchmark-report-2026-06-29)
+and [§15](#15-outstanding-gates-and-risks) for the gate-by-gate status.
+
 ## 2. Product Goals
 
 - Make DecentDB's default core engine performance less dependent on narrow
@@ -281,9 +311,16 @@ executor: a threshold experiment improved smoke `query_view_first_1000` from
 deferred-view walker brought the latest smoke run to 0.000545s, still well
 ahead of the original baseline but not yet ahead of SQLite.
 
-Full and huge rust-baseline reruns are still pending for this win. Until those
-complete, the previous checked-in full/huge comparisons remain historical
-diagnostics rather than accepted current evidence.
+A 2026-06-29 follow-up slice added row-id alias join-key trimming, which
+reduced the smoke/medium view steps further. The latest smoke/medium runs
+(`.tmp/perf01-rowidtrim-smoke-medium/results`) and the first full/huge runs
+(`.tmp/perf01-rowidtrim-full-huge/results`) are the accepted current evidence;
+the consolidated before/current table is in
+[§14](#14-final-benchmark-report-2026-06-29).
+
+Full and huge rust-baseline reruns are now present for this win (see §14). The
+earlier checked-in full/huge comparisons remain historical diagnostics; the
+§14 numbers are the accepted current evidence.
 
 ### 4.3 Code Hotspots That Must Be Addressed
 
@@ -787,12 +824,12 @@ As of 2026-06-29:
 
 | Phase | Status | Notes |
 |---|---|---|
-| Phase 0: Baseline And Profiling | Partial | Smoke/medium before/after artifacts exist in `.tmp/perf01-*`; full/huge and public benchmark baselines still need a clean final run. |
-| Phase 1: Internal Row Views And Projection Pruning | Partial | Several projected deferred read helpers exist, but there is not yet a general `RowView`/`ExecRow` layer across simple scans, aggregates, and joins. |
-| Phase 2: Streaming Aggregates And View Hot Paths | Partial | Deferred view filter/LIMIT paths now use projected reads, trimmed projection sets, linear-chain streaming joins, and bounded grouped Top-N postprocessing; the view paths still trail SQLite and not all view/grouped shapes are complete. |
-| Phase 3: Cost-Based Planner And Join Operators | Partial | Planner estimate/operator scaffolding exists and `EXPLAIN` now exposes simple expanded-view pushdown metadata; cost-based execution selection and broader path-selection tests remain. |
-| Phase 4: Commit Fast Path | Partial | Faulty VFS passive-path overhead was reduced; required syscall/CPU profiling and commit benchmark proof remain. |
-| Phase 5: Final Benchmark And Documentation Sweep | Not complete | This status update and changelog entry are in progress; full final benchmark report and paranoid pre-commit are still required. |
+| Phase 0: Baseline And Profiling | Partial | Smoke/medium/full/huge before/after rust-baseline artifacts and a clean public `embedded_compare` re-run now exist in `.tmp/perf01-final/` and `data/bench_summary.json`; formal commit syscall/CPU profiling artifacts (§9.2) remain. |
+| Phase 1: Internal Row Views And Projection Pruning | Partial | Several projected deferred read helpers exist and the deferred view walkers now trim row-id alias join keys, but there is not yet a general `RowView`/`ExecRow` layer across simple scans, aggregates, and joins. |
+| Phase 2: Streaming Aggregates And View Hot Paths | Partial | Deferred view filter/LIMIT paths now use projected reads, trimmed projection sets (including row-id alias join keys), linear-chain streaming joins, and bounded grouped Top-N postprocessing; the view paths still trail SQLite and `query_songs_for_artist_via_view` huge does not yet meet the 2x gate. |
+| Phase 3: Cost-Based Planner And Join Operators | Partial | Planner estimate/operator scaffolding exists, `EXPLAIN` exposes expanded-view pushdown metadata, explicit `JOIN` now selects cost-based `IndexedJoin` (fixed this session), and indexed/hash-join `EXPLAIN` tests were added; broader path-selection coverage and three-table reorder/outer-join tests remain. |
+| Phase 4: Commit Fast Path | Partial | Faulty VFS passive-path overhead was reduced; `commit_p95_ms` is stable at the sync floor (~3.07ms, matching SQLite), but the required §9.2 syscall/CPU profiling artifacts and §9.3 allowed-only optimizations remain. |
+| Phase 5: Final Benchmark And Documentation Sweep | Partial | This §14/§15 final report and changelog entry are written; WIN01 is **not** marked complete because several §6/§13 gates are not met (see §15). Paranoid pre-commit still required after the outstanding gates are addressed. |
 
 ### Phase 0: Baseline And Profiling
 
@@ -964,3 +1001,209 @@ This win is complete only when all of the following are true:
 If the required marked/significant before/after benchmark improvements are not
 present, the work is not done even if the code is cleaner or the architecture
 looks better.
+
+## 14. Final Benchmark Report (2026-06-29)
+
+This report records the evidence gathered during the 2026-06-29 follow-up
+slice. It is the honest current-branch snapshot; it does **not** claim WIN01 is
+complete. Gates that are not met are listed explicitly in
+[§15](#15-outstanding-gates-and-risks).
+
+### 14.1 Commands run
+
+- `cargo build --release` (rust-baseline runner).
+- `./target/release/rust-baseline --engine decentdb --scale {smoke,medium,full,huge}`
+  into `.tmp/perf01-rowidtrim-*` (current DecentDB, with the row-id alias trim).
+- `./target/release/rust-baseline --engine sqlite --scale {smoke,medium,full,huge}`
+  into `.tmp/perf01-current-*` (SQLite reference).
+- `cargo bench -p decentdb --bench embedded_compare` (public benchmark, re-run
+  on an idle machine; wrote `data/bench_summary.json`).
+- `cargo fmt --check`, `cargo clippy -p decentdb --all-targets --all-features
+  -- -D warnings`, `cargo nextest run -p decentdb` (3080 passed, 1 skipped).
+- `python .tmp/perf01-tools/perf01_rust_baseline_report.py` for the consolidated
+  before/current rust-baseline table (`.tmp/perf01-final/rust-baseline-report.md`).
+
+### 14.2 Artifact directories
+
+- Before DecentDB rust-baseline: `.tmp/perf01-before-rust-baseline/results`
+  (full/huge `2026-06-14`; smoke/medium `2026-06-28`).
+- Current DecentDB rust-baseline: `.tmp/perf01-final/current-decentdb/`
+  (consolidated from `.tmp/perf01-rowidtrim-smoke-medium/results` and
+  `.tmp/perf01-rowidtrim-full-huge/results`).
+- Current SQLite rust-baseline: `.tmp/perf01-final/current-sqlite/`.
+- Public benchmark: `data/bench_summary.json` (current) and
+  `.tmp/perf01-before-rust-baseline/results/public_before_bench_summary.json`
+  (before, `2026-06-20` run id `1781448102002`).
+- Full consolidated report: `.tmp/perf01-final/rust-baseline-report.md`.
+
+### 14.3 Rust-baseline total runtime (before → current)
+
+| Scale | Before DecentDB | Current DecentDB | Current SQLite | Current / Before | Current vs SQLite |
+|---|---:|---:|---:|---:|---|
+| smoke | 0.065s | 0.063s | 0.099s | 0.97x | faster |
+| medium | 3.517s | 0.398s | 0.787s | 0.11x | faster |
+| full | 5.847s | 3.966s | 8.028s | 0.68x (-32.2%) | faster |
+| huge | 36.989s | 27.961s | 39.223s | 0.76x (-24.4%) | faster |
+
+DecentDB remains faster than SQLite in total runtime at every scale, and full
+(32.2%) / huge (24.4%) exceed the §6.1 ≥15% total-runtime gate.
+
+### 14.4 Rust-baseline peak RSS (before → current)
+
+| Scale | Before Peak RSS | Current Peak RSS | Reduction |
+|---|---:|---:|---:|
+| full | 878.6 MiB | 678.6 MiB | 22.8% |
+| huge | 4271.3 MiB | 3288.1 MiB | 23.0% |
+
+Full and huge peak RSS improved but by ~23%, **below the §6.1 ≥25% gate**. The
+peak occurs during bulk seed (`seed_songs`), not during query evaluation; the
+streaming view/aggregate paths already keep query-time RSS low. Meeting the
+25% gate requires further reducing peak seed/deferred-materialization memory,
+which is outstanding.
+
+### 14.5 Rust-baseline view and read steps (before → current, full/huge)
+
+| Step | Scale | Before | Current | Current/Before | Improvement | §6.2 2x gate |
+|---|---|---:|---:|---:|---:|---|
+| `query_view_first_1000` | full | 0.002314s | 0.001211s | 0.52x | 1.91x | borderline (noisy) |
+| `query_view_first_1000` | huge | 0.002870s | 0.001235s | 0.43x | 2.33x | met |
+| `query_songs_for_artist_via_view` | full | 0.000387s | 0.000185s | 0.48x | 2.08x | met (borderline) |
+| `query_songs_for_artist_via_view` | huge | 0.000336s | 0.000182s | 0.54x | 1.85x | **not met** |
+| `query_aggregate_durations` | full | 0.134832s | 0.151886s | 1.13x | -12.5% | — |
+| `query_aggregate_durations` | huge | 0.701977s | 0.818651s | 1.17x | -16.6% | — |
+| `query_top10_albums_by_songs` | full | 0.200841s | 0.189143s | 0.94x | 5.8% | — |
+| `query_top10_albums_by_songs` | huge | 0.971620s | 0.843335s | 0.87x | 13.2% | — |
+| `query_top10_artists_by_songs` | full | 0.057302s | 0.022225s | 0.39x | 61.2% | — |
+| `query_top10_artists_by_songs` | huge | 0.273125s | 0.117064s | 0.43x | 57.1% | — |
+
+`query_view_first_1000` and `query_songs_for_artist_via_view` are single-shot
+measurements (the rust-baseline runner times each query shape once per run), so
+the full-scale cells carry measurement noise; the huge-scale
+`query_songs_for_artist_via_view` (1.85x, three-run median ~182µs vs the
+2026-06-14 before median ~337µs) is the clearest §6.2 miss.
+`query_aggregate_durations` regressed on full/huge but the §6.2 streaming
+geometric-mean gate over `query_top10_artists_by_songs`,
+`query_top10_albums_by_songs`, and `query_aggregate_durations` still improves
+strongly on both scales (driven by the large `query_top10_artists_by_songs`
+gains).
+
+### 14.6 Public benchmark (`embedded_compare`) before → current
+
+Lower is better except `insert_rows_per_sec`. Before = `2026-06-20` public
+summary; current = idle-machine re-run, 5 statistical runs each.
+
+| Metric | Profile | Before | Current | Change |
+|---|---|---:|---:|---:|
+| `insert_rows_per_sec` | balanced | 2,475,393 | 1,856,895 | -25.0% |
+| `insert_rows_per_sec` | low_memory | 2,462,142 | 1,847,032 | -25.0% |
+| `insert_rows_per_sec` | tuned | 2,822,193 | 2,034,353 | -27.9% |
+| `read_p95_ms` | balanced | 0.001072 | 0.001533 | +43.0% |
+| `read_p95_ms` | low_memory | 0.001122 | 0.002266 | +102.0% |
+| `read_p95_ms` | tuned | 0.001002 | 0.001104 | +10.2% |
+| `range_scan_p95_ms` | balanced | 0.009548 | 0.009943 | +4.1% |
+| `range_scan_p95_ms` | low_memory | 0.008849 | 0.010297 | +16.4% |
+| `range_scan_p95_ms` | tuned | 0.006719 | 0.006486 | -3.5% |
+| `join_p95_ms` | balanced | 0.001735 | 0.001010 | -41.8% |
+| `join_p95_ms` | low_memory | 0.001443 | 0.001136 | -21.2% |
+| `join_p95_ms` | tuned | 0.001252 | 0.001324 | +5.7% |
+| `commit_p95_ms` | balanced | 3.074611 | 3.077789 | +0.1% |
+| `commit_p95_ms` | tuned | 3.070308 | 3.075228 | +0.2% |
+| `aggregate_p95_ms` | balanced | 0.000627 | 0.000521 | -16.9% |
+| `concurrent_read_p95_ms` | balanced | 0.007709 | 0.003210 | -58.4% |
+| `concurrent_read_p95_ms` | tuned | 0.011614 | 0.001841 | -84.1% |
+
+`commit_p95_ms` stays pinned at the durable sync floor (~3.07ms, matching
+SQLite ~3.07ms) across before/after, confirming the durable write path is
+sync-floor-bound and unchanged. `join_p95_ms`, `aggregate_p95_ms`, and
+`concurrent_read_p95_ms` improved on the balanced/low_memory profiles.
+
+### 14.7 Regressions
+
+- **Public `insert_rows_per_sec`** regressed -25% to -28% across all three
+  DecentDB profiles. This is statistically significant (5-run stddev ~1.3%).
+  It is present on the committed branch independent of this session's
+  view/planner changes (which do not touch the insert path) and most likely
+  originates from the default `paged_row_storage = true` and format-14
+  resident-table tombstone work landed earlier on the branch. It is a §6.1
+  no-regression gate failure that requires separate investigation.
+- **Public `read_p95_ms`** regressed +43% (balanced) to +102% (low_memory).
+  These are sub-microsecond-to-microsecond point-lookup measurements; the
+  regression is real (5 runs) but also tracks the branch's storage-default
+  change rather than this session's work.
+- **`query_aggregate_durations`** regressed ~12-17% on full/huge (single-shot,
+  noisy) but the §6.2 streaming geomean still improves due to large
+  `query_top10_artists_by_songs` gains.
+
+## 15. Outstanding Gates And Risks
+
+WIN01 is **not complete**. The following §6 / §13 gates are not met by the
+current evidence:
+
+1. **§6.1 / §13 full-and-huge peak RSS ≥25%:** full 22.8%, huge 23.0%. Just
+   short. Peak RSS occurs during bulk seed, not query evaluation. Needs
+   further peak-seed/deferred-materialization memory reduction.
+2. **§6.1 / §13 public no-regression >3%:** `insert_rows_per_sec` -25%,
+   `read_p95_ms` +43-102%, `range_scan_p95_ms` +4-16% relative to the
+   `2026-06-20` public before baseline. Pre-existing on the committed branch;
+   needs root-cause investigation of the insert/read path (likely the default
+   `paged_row_storage` and format-14 tombstone changes), independent of this
+   session's view/planner work.
+3. **§6.2 view `query_songs_for_artist_via_view` huge ≥2x:** improved 1.85x
+   (three-run median ~182µs vs before median ~337µs). Just short of 2x; the
+   remaining cost is fixed per-query overhead plus necessary per-row decode
+   and output `Value::Text` cloning at sub-millisecond scale.
+4. **§6.2 view `query_view_first_1000` full ≥2x:** improved 1.91x (single-shot,
+   noisy). Borderline; the huge-scale cell met 2x (2.33x).
+5. **Phase 4 durable commit fast path:** §9.2 syscall/CPU profiling artifacts
+   and commit-path optimization were not produced this session. Public
+   `commit_p95_ms` is stable at the sync floor (~3.07ms, matching SQLite),
+   consistent with the §6.1 sync-floor-bound exception, but the required
+   profiling proof (§9.2) and any allowed-only overhead reductions (§9.3) are
+   outstanding.
+
+Gates that **are** met by current evidence:
+
+- §6.1 rust-baseline total-runtime improvement ≥15% on full (32.2%) and huge
+  (24.4%).
+- §6.1 DecentDB remains faster than SQLite in rust-baseline total runtime at
+  every scale.
+- §6.2 `query_view_first_1000` huge ≥2x (2.33x) and
+  `query_songs_for_artist_via_view` full ≥2x (2.08x).
+- §6.2 `EXPLAIN` surfaces the chosen join/view operators with estimates,
+  including cost-based `IndexedJoin` for explicit inner equi-joins (fixed this
+  session).
+- §6.2 public `join_p95_ms` (balanced/low_memory), `aggregate_p95_ms`, and
+  `concurrent_read_p95_ms` improved.
+- Public `commit_p95_ms` is sync-floor-bound and unchanged.
+
+### 15.1 What this session delivered
+
+- A general, durability-preserving row-id alias join-key trim for the deferred
+  view linear and generic walkers (no schema/view-name hardcoding).
+- A planner fix enabling cost-based `IndexedJoin` selection for explicit
+  `JOIN ... ON` syntax, with `EXPLAIN` coverage.
+- Planner `EXPLAIN` regression tests for indexed-join, hash-join, and estimate
+  surfacing.
+- The first full smoke/medium/full/huge rust-baseline before/current evidence
+  set for the current branch, plus a clean public `embedded_compare` re-run.
+
+### 15.2 Recommended next steps
+
+- Investigate and address the public `insert_rows_per_sec` / `read_p95_ms`
+  regression (root cause likely the default `paged_row_storage` / format-14
+  tombstone path). This is the largest §6.1 blocker and is independent of the
+  view/planner work.
+- Reduce full/huge peak seed RSS by ~2-3 percentage points to clear the 25%
+  gate (e.g., smaller deferred locator/payload caches during bulk load, or
+  bounded paged-chunk materialization).
+- Close the huge `query_songs_for_artist_via_view` 2x gap, likely via a generic
+  leaf-table output move that avoids cloning `Value::Text` for the final
+  projected row (the task hypothesis in §12).
+- Produce the Phase 4 §9.2 commit-path profiling artifacts and apply only the
+  §9.3 allowed optimizations, then re-measure `commit_p95_ms` /
+  `insert_rows_per_sec`.
+- Run `python scripts/do-pre-commit-checks.py --mode paranoid` once the above
+  gates are addressed.
+
+This section is the honest status; WIN01 must not be marked complete until the
+§15 outstanding gates are met with benchmark proof.

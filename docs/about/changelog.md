@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Trimmed row-id alias join keys from deferred SQL view projected reads so a
+  three-table inner-join view chain no longer decodes the join key column when
+  it equals the previous row's stored row id. The linear and generic deferred
+  view walkers now synthesize the join key from the row id directly, shrinking
+  per-table projections for `v_artist_songs`-style view shapes. This is a
+  general optimization, not a schema or view-name specific shortcut.
+- Fixed a planner index-detection gap where explicit `JOIN ... ON` syntax never
+  recognized usable join indexes, so cost-based `IndexedJoin` is now selected
+  for explicit inner equi-joins when a useful B-tree index exists (previously
+  such joins always fell back to `HashJoin`). `EXPLAIN` now surfaces the chosen
+  `IndexedJoin` operator with estimates for these shapes.
+- Added planner `EXPLAIN` regression tests for indexed-join selection,
+  hash-join selection without a useful index, and estimated rows/cost surfacing.
+
 ## [2.15.0] - [UNRELEASED]
 
 ### Added
