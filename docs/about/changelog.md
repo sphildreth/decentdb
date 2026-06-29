@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backlog: core read/query performance, cross-binding cursor parity,
   Postgres-backed local-first sync, migration workflow, Doctor/advisors, JSONB,
   hybrid search, and packaging/ORM adoption work.
+- Improved deferred SQL view execution for paged row storage by caching parsed
+  view queries, pruning decoded base-table columns for view filter/LIMIT paths,
+  streaming indexed view joins without materializing intermediate row vectors,
+  trimming proven join columns from projected deferred rows, lowering the
+  small-scale deferred-view LIMIT fast-path threshold, bounding grouped Top-N
+  postprocessing, exposing expanded-view pushdown metadata in `EXPLAIN`, and
+  reducing inactive faulty-VFS wrapper overhead.
 
 ### Fixed
 

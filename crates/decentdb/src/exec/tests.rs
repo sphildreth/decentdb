@@ -8,19 +8,21 @@ use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::InMemoryPageStore;
 use crate::{Db, DbConfig, Value};
+use tempfile::TempDir;
 
 use super::{
     append_paged_table_chunks, apply_paged_row_changes_to_manifest,
-    apply_paged_row_deletions_to_manifest, decode_manifest_payload,
-    decode_paged_table_manifest_payload, decode_runtime_payload,
+    apply_paged_row_deletions_to_manifest, apply_simple_projection_postprocessing_with_order,
+    decode_manifest_payload, decode_paged_table_manifest_payload, decode_runtime_payload,
     drop_index_include_columns_section, encode_legacy_table_payload_from_manifest,
     encode_manifest_payload, encode_paged_table_chunks, encode_paged_table_chunks_from_rows,
     encode_runtime_payload, encode_table_payload, like_match, persist_paged_table,
     read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
     rewrite_paged_table_from_resident, simple_trigram_lookup,
     try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
-    EngineRuntime, OverflowPointer, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow,
-    TableData, TablePageManifest, TablePageManifestChunk, TableRowSource,
+    EngineRuntime, OverflowPointer, PersistedTableState, QueryRow, RuntimeBtreeKeys, RuntimeIndex,
+    SimpleOrderByPlan, StoredRow, TableData, TablePageManifest, TablePageManifestChunk,
+    TableRowSource, DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS,
 };
 
 const PAGE_SIZE: u32 = 4096;
@@ -65,6 +67,41 @@ fn simple_expression_projection_fast_path_handles_wildcard_like_order_limit() {
     assert_eq!(
         result.rows()[0].values(),
         &[Value::Int64(3), Value::Text("Motley A".to_string())]
+    );
+}
+
+#[test]
+fn simple_projection_postprocessing_with_order_uses_bounded_top_n() {
+    let rows = vec![
+        QueryRow::new(vec![Value::Int64(1)]),
+        QueryRow::new(vec![Value::Int64(4)]),
+        QueryRow::new(vec![Value::Int64(2)]),
+        QueryRow::new(vec![Value::Int64(5)]),
+        QueryRow::new(vec![Value::Int64(3)]),
+    ];
+
+    let result = apply_simple_projection_postprocessing_with_order(
+        None,
+        rows,
+        vec!["n".to_string()],
+        Some(&[SimpleOrderByPlan {
+            projection_index: 0,
+            descending: true,
+            collation: None,
+        }]),
+        Some(2),
+        1,
+    )
+    .expect("postprocessing");
+
+    assert_eq!(result.columns(), &["n".to_string()]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(4), Value::Int64(3)]
     );
 }
 
@@ -5718,6 +5755,229 @@ fn indexed_join_grouped_count_uses_child_index_counts() {
 }
 
 #[test]
+fn indexed_join_top10_like_shape_uses_child_index_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE creators (id INT64 PRIMARY KEY, display_name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE assets (id INT64 PRIMARY KEY, creator_id INT64 NOT NULL, label TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_assets_creator ON assets (creator_id)",
+    );
+    for creator_id in 1_i64..=12 {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO creators (id, display_name) VALUES ({creator_id}, 'creator_{creator_id}')"
+            ),
+        );
+    }
+
+    let mut asset_id = 1_i64;
+    for creator_id in 1_i64..=12 {
+        for _ in 0_i64..(13 - creator_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO assets (id, creator_id, label) \
+                     VALUES ({asset_id}, {creator_id}, 'asset')"
+                ),
+            );
+            asset_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT c.id, c.display_name, COUNT(a.id) AS asset_count \
+             FROM creators c JOIN assets a ON a.creator_id = c.id \
+             GROUP BY c.id, c.display_name \
+             ORDER BY asset_count DESC, c.id ASC \
+             LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    assert_eq!(
+        runtime
+            .indexed_join_grouped_count_parent_table_name(query, &[])
+            .expect("analyze")
+            .expect("indexed grouped count parent table"),
+        "creators"
+    );
+    let result = runtime
+        .try_execute_indexed_join_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("indexed grouped join count path should match this shape");
+
+    let expected = (1_i64..=10)
+        .map(|creator_id| {
+            vec![
+                Value::Int64(creator_id),
+                Value::Text(format!("creator_{creator_id}")),
+                Value::Int64(13 - creator_id),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.rows().len(), 10);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn indexed_join_top10_like_shape_with_album_table_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE collections (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE tracks (id INT64 PRIMARY KEY, collection_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_tracks_collection ON tracks (collection_id)",
+    );
+    for collection_id in 1_i64..=11 {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO collections (id, title) VALUES ({collection_id}, 'collection_{collection_id}')"
+            ),
+        );
+    }
+
+    let mut track_id = 1_i64;
+    for collection_id in 1_i64..=11 {
+        for _ in 0_i64..(12 - collection_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO tracks (id, collection_id, title) \
+                     VALUES ({track_id}, {collection_id}, 'track')"
+                ),
+            );
+            track_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT c.id, c.title, COUNT(t.id) AS track_count \
+             FROM collections c JOIN tracks t ON t.collection_id = c.id \
+             GROUP BY c.id, c.title \
+             ORDER BY track_count DESC, c.id ASC \
+             LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    assert_eq!(
+        runtime
+            .indexed_join_grouped_count_parent_table_name(query, &[])
+            .expect("analyze")
+            .expect("indexed grouped count parent table"),
+        "collections"
+    );
+    let result = runtime
+        .try_execute_indexed_join_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("indexed grouped join count path should match this shape");
+
+    let expected = (1_i64..=10)
+        .map(|collection_id| {
+            vec![
+                Value::Int64(collection_id),
+                Value::Text(format!("collection_{collection_id}")),
+                Value::Int64(12 - collection_id),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.rows().len(), 10);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn simple_grouped_count_top_n_with_offset_bounds_rows() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64, title TEXT)",
+    );
+    let mut song_id = 1_i64;
+    for artist_id in 1_i64..=8 {
+        for _ in 0_i64..(9 - artist_id) {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO songs (id, artist_id, title) VALUES ({song_id}, {artist_id}, 't')"
+                ),
+            );
+            song_id += 1;
+        }
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT artist_id, COUNT(*) AS song_count \
+         FROM songs \
+         GROUP BY artist_id \
+         HAVING COUNT(*) >= 3 \
+         ORDER BY song_count DESC \
+         LIMIT 5 OFFSET 1",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_grouped_count_query(query, &[])
+        .expect("execute")
+        .expect("simple grouped count top-N should stay on fast path");
+
+    let expected = vec![
+        vec![Value::Int64(2), Value::Int64(7)],
+        vec![Value::Int64(3), Value::Int64(6)],
+        vec![Value::Int64(4), Value::Int64(5)],
+        vec![Value::Int64(5), Value::Int64(4)],
+        vec![Value::Int64(6), Value::Int64(3)],
+    ];
+
+    assert_eq!(result.rows().len(), 5);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
 fn indexed_inner_join_aggregate_counts_distinct_child_values() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -6215,6 +6475,214 @@ fn view_projection_limit_pushes_into_indexed_join_chain() {
             Value::Text("a1".to_string()),
             Value::Text("s1".to_string()),
         ]
+    );
+}
+
+#[test]
+fn paged_row_storage_deferred_view_filter_projection_keeps_tables_deferred() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("paged-row-storage-deferred-view-filter-projection.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        defer_table_materialization: true,
+        persistent_pk_index: true,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::open_or_create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create artists");
+        db.execute(
+            "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create albums");
+        db.execute(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create songs");
+        db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+            .expect("create albums artist index");
+        db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+            .expect("create songs album index");
+        db.execute(
+            "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.title AS song_title \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+        )
+        .expect("create view");
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+            .expect("insert artist 1");
+        db.execute("INSERT INTO artists (id, name) VALUES (2, 'b')")
+            .expect("insert artist 2");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+            .expect("insert album 1");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')")
+            .expect("insert album 2");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')")
+            .expect("insert song 1");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')")
+            .expect("insert song 2");
+        db.execute("INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')")
+            .expect("insert song 3");
+        db.checkpoint().expect("checkpoint");
+    }
+
+    let db = Db::open_or_create(&path, config).expect("reopen db");
+    let json_before = db.inspect_storage_state_json().expect("json before query");
+    assert!(
+        json_before.contains("\"loaded_table_count\":0"),
+        "expected deferred view tables to start unloaded, got: {json_before}"
+    );
+    assert!(
+        json_before.contains("\"deferred_table_count\":3"),
+        "expected all view base tables to remain deferred at reopen, got: {json_before}"
+    );
+
+    let result = db
+        .execute_with_params(
+            "SELECT album_title, song_title FROM v_artist_songs WHERE artist_id = $1",
+            &[Value::Int64(1)],
+        )
+        .expect("view filter projection query");
+
+    assert_eq!(
+        result.columns(),
+        &["album_title".to_string(), "song_title".to_string()]
+    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s1".to_string())]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s2".to_string())]
+    );
+
+    let json_after = db.inspect_storage_state_json().expect("json after query");
+    assert!(
+        json_after.contains("\"loaded_table_count\":0"),
+        "expected deferred view filter projection to avoid resident table materialization, got: {json_after}"
+    );
+    assert!(
+        json_after.contains("\"deferred_table_count\":3"),
+        "expected deferred view filter projection to leave base tables deferred, got: {json_after}"
+    );
+}
+
+#[test]
+fn paged_row_storage_deferred_view_projection_limit_keeps_tables_deferred() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("paged-row-storage-deferred-view-projection-limit.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        defer_table_materialization: true,
+        persistent_pk_index: true,
+        ..DbConfig::default()
+    };
+    let target_song_rows: i64 = DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS as i64 + 1;
+
+    let mut song_values = String::new();
+    for song_id in 1..=target_song_rows {
+        if !song_values.is_empty() {
+            song_values.push(',');
+        }
+        song_values.push_str(&format!("({song_id}, 10, 'song_{song_id:05}')"));
+    }
+
+    {
+        let db = Db::open_or_create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create artists");
+        db.execute(
+            "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create albums");
+        db.execute(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT)",
+        )
+        .expect("create songs");
+        db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+            .expect("create albums artist index");
+        db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+            .expect("create songs album index");
+        db.execute(
+            "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.id AS song_id, s.title AS song_title \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+        )
+        .expect("create view");
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+            .expect("insert artist");
+        db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+            .expect("insert album");
+        db.execute(&format!(
+            "INSERT INTO songs (id, album_id, title) VALUES {song_values}"
+        ))
+        .expect("insert songs");
+        db.checkpoint().expect("checkpoint");
+    }
+
+    let db = Db::open_or_create(&path, config).expect("reopen db");
+    let json_before = db.inspect_storage_state_json().expect("json before query");
+    assert!(
+        json_before.contains("\"loaded_table_count\":0"),
+        "expected deferred view tables to start unloaded, got: {json_before}"
+    );
+    assert!(
+        json_before.contains("\"deferred_table_count\":3"),
+        "expected view base tables to start deferred, got: {json_before}"
+    );
+
+    let result = db
+        .execute_with_params(
+            "SELECT artist_id, artist_name, album_title, song_id, song_title FROM v_artist_songs LIMIT 1000",
+            &[],
+        )
+        .expect("view projection limit query");
+
+    assert_eq!(
+        result.rows().len(),
+        1000,
+        "expected 1000 rows from limited query"
+    );
+    assert_eq!(
+        result.columns(),
+        &[
+            "artist_id".to_string(),
+            "artist_name".to_string(),
+            "album_title".to_string(),
+            "song_id".to_string(),
+            "song_title".to_string()
+        ]
+    );
+
+    let mut seen_song_ids = std::collections::HashSet::new();
+    for row in result.rows() {
+        let Value::Int64(song_id) = row.values()[3] else {
+            panic!("expected int64 song_id in result")
+        };
+        assert!((1..=target_song_rows).contains(&song_id));
+        assert!(seen_song_ids.insert(song_id));
+    }
+
+    let json_after = db.inspect_storage_state_json().expect("json after query");
+    assert!(
+        json_after.contains("\"loaded_table_count\":0"),
+        "expected deferred view projection limit to avoid resident table materialization, got: {json_after}"
+    );
+    assert!(
+        json_after.contains("\"deferred_table_count\":3"),
+        "expected deferred view projection limit to leave base tables deferred, got: {json_after}"
     );
 }
 

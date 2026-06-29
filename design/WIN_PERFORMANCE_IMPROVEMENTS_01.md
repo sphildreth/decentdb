@@ -1,7 +1,7 @@
 # Performance Improvements 01: Streaming Executor, Cost-Based Planning, And Durable Commit Fast Path
 
 **Date:** 2026-06-14
-**Status:** Proposed
+**Status:** In Progress - Phase 2 deferred-view slice partially delivered
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Future Win SPEC
 **Audience:** Core engine maintainers, planner and executor maintainers, WAL and
@@ -117,6 +117,41 @@ public benchmark surface and the rust-baseline surface described in
 If the benchmark data does not show significant improvement, this effort is
 not considered successful.
 
+### 1.1 Implementation Status As Of 2026-06-29
+
+This document is still the active implementation source of truth, but the work
+is not complete. The current branch has delivered a focused Workstream A /
+Phase 2 slice for deferred SQL view execution:
+
+- cached parsed view queries in the runtime, seeded by `CREATE VIEW`;
+- projected deferred reads for `v_artist_songs`-style view filter and limit
+  paths, so base rows decode only the columns needed for join keys and final
+  output;
+- streaming deferred view joins that avoid building `Vec<Vec<StoredRow>>`
+  intermediate join results;
+- precomputed output projection positions and join-key projection positions
+  for those view paths;
+- deferred-view projected row decoding now stops after all requested columns
+  are decoded, trims fetched join columns that are already proven by the
+  lookup index, and uses a specialized linear three-table walker for the
+  common root-to-child-to-grandchild inner-join view shape;
+- a lower deferred-view limit fast-path threshold (`10_000` persisted rows)
+  so smoke-scale view LIMIT queries no longer fall back to the eager generic
+  executor;
+- bounded top-N postprocessing for simple projection + `ORDER BY` + `LIMIT`
+  shapes;
+- planner `EXPLAIN` output now marks simple expanded-view filter,
+  projection, and safe limit pushdown opportunities;
+- passive-path bypasses in the faulty VFS wrapper, preserving failpoint
+  behavior while avoiding wrapper overhead when no active failpoints apply.
+
+The current branch has **not** completed the full WIN01 definition of done.
+Remaining work still includes full smoke/medium/full/huge rust-baseline runs,
+public benchmark guardrail runs, full/huge RSS proof, planner/explain
+integration beyond the existing planner scaffold, durable commit-path profiling
+and optimization, documentation finalization, and the final paranoid
+pre-commit suite.
+
 ## 2. Product Goals
 
 - Make DecentDB's default core engine performance less dependent on narrow
@@ -223,21 +258,32 @@ column before counting rows and that peak RSS can climb sharply during query
 evaluation. This is direct evidence that eager intermediate materialization is
 a core-engine performance and memory bottleneck visible to every binding.
 
-The latest folded-in diagnostic comparison uses the checked-in DecentDB run
-from `benchmarks/rust-baseline/results/2026-06-23-*` and the latest available
-local SQLite reference in
-`.tmp/rust-baseline-sqlite-compare-20260611-152618/results`. It is a current
-diagnostic comparison, not a freshly paired benchmark run. The active gaps are:
+The current in-progress diagnostic comparison uses the pre-work DecentDB run in
+`.tmp/perf01-before-rust-baseline/results` (`2026-06-28-2256`), the latest
+current-branch DecentDB smoke/medium run in
+`.tmp/perf01-after-view-linear-walker-smoke-medium/results`
+(`2026-06-29-0153`), and the paired SQLite smoke/medium reference in the same
+directory.
 
-| Scale | `query_artist_by_id` SQLite / DecentDB | `query_view_first_1000` SQLite / DecentDB | `query_songs_for_artist_via_view` SQLite / DecentDB | Interpretation |
-|---|---:|---:|---:|---|
-| smoke | 0.50x | 0.05x | 0.10x | SQLite wins tiny lookup and view paths |
-| medium | 1.06x | 0.19x | 0.18x | DecentDB barely wins point lookup; SQLite still wins view paths |
-| full | 1.37x | 0.14x | 0.23x | DecentDB wins point lookup; SQLite still wins view paths |
-| huge | 1.87x | 0.14x | 0.18x | DecentDB wins point lookup; SQLite still wins view paths |
+| Scale | Metric | Before DecentDB | Current DecentDB | Current SQLite | Current DecentDB / SQLite | Status |
+|---|---:|---:|---:|---:|---:|---|
+| smoke | `query_view_first_1000` | 0.003272s | 0.000545s | 0.000367s | 1.48x slower | Improved 6.0x, still SQLite-faster |
+| smoke | `query_songs_for_artist_via_view` | 0.000285s | 0.000146s | 0.000055s | 2.65x slower | Improved 2.0x, still SQLite-faster |
+| smoke | `query_artist_by_id` | 0.000025s | 0.000032s | 0.000023s | 1.39x slower | Small fixed-overhead loss remains |
+| medium | `query_view_first_1000` | 0.002089s | 0.000859s | 0.000389s | 2.21x slower | Improved 2.4x, still SQLite-faster |
+| medium | `query_songs_for_artist_via_view` | 0.000340s | 0.000150s | 0.000071s | 2.11x slower | Improved 2.3x, still SQLite-faster |
+| medium | `query_artist_by_id` | 0.000035s | 0.000033s | 0.000050s | 0.66x faster | DecentDB faster than SQLite in this run |
 
-DecentDB still wins rust-baseline total runtime at every scale in this
-comparison: 1.23x smoke, 1.93x medium, 1.89x full, and 1.29x huge.
+The largest focused win in this slice came from routing smoke-scale view LIMIT
+queries through the deferred-view fast path instead of the eager generic
+executor: a threshold experiment improved smoke `query_view_first_1000` from
+0.003344s to 0.000724s. Subsequent projected-decode trimming and the linear
+deferred-view walker brought the latest smoke run to 0.000545s, still well
+ahead of the original baseline but not yet ahead of SQLite.
+
+Full and huge rust-baseline reruns are still pending for this win. Until those
+complete, the previous checked-in full/huge comparisons remain historical
+diagnostics rather than accepted current evidence.
 
 ### 4.3 Code Hotspots That Must Be Addressed
 
@@ -250,8 +296,8 @@ hotspot.
 | `crates/decentdb/src/exec/mod.rs` generic datasets | Many paths build `Dataset::with_rows`, `Vec<Vec<Value>>`, and `Vec<QueryRow>` intermediates | Introduce streaming/late-materialized operators for the measured hot paths |
 | `crates/decentdb/src/exec/mod.rs` joins | Specialized indexed/hash-like join helpers exist, but generic join still materializes full sides and outputs | Promote useful join strategies into planner-owned physical nodes |
 | `crates/decentdb/src/exec/mod.rs` views | View-specific fast paths exist but are shape-dependent | Push filters/projections/limits/order through view expansion in a general planned way |
-| `crates/decentdb/src/planner/mod.rs` | Structural/rule-based planning | Implement ADR 0112 cost annotation and cost-based choices |
-| `crates/decentdb/src/planner/physical.rs` | Physical nodes have no `estRows`/`estCost`; no first-class hash join | Add explicit cost/cardinality and planned join/view operators |
+| `crates/decentdb/src/planner/mod.rs` | Estimate and join/view plan scaffolding exists, but execution still relies heavily on executor recognition | Complete ADR 0112 cost-driven access-path, join-order, and view-pushdown choices and wire them to execution paths |
+| `crates/decentdb/src/planner/physical.rs` | `estRows`/`estCost`, `HashJoin`, `IndexedJoin`, `StreamingAggregate`, and view nodes exist | Make these planned operators authoritative for execution and add stronger `EXPLAIN`/path-selection coverage |
 | WAL/pager commit path | Durable commit p95 is at the fsync floor plus engine overhead | Remove avoidable overhead while preserving durability |
 
 ## 5. Required Benchmark Protocol
@@ -734,6 +780,19 @@ The commit fast path must be measured with:
 - any existing write-queue/group-commit benchmarks.
 
 ## 10. Implementation Phases
+
+### Current Phase Status
+
+As of 2026-06-29:
+
+| Phase | Status | Notes |
+|---|---|---|
+| Phase 0: Baseline And Profiling | Partial | Smoke/medium before/after artifacts exist in `.tmp/perf01-*`; full/huge and public benchmark baselines still need a clean final run. |
+| Phase 1: Internal Row Views And Projection Pruning | Partial | Several projected deferred read helpers exist, but there is not yet a general `RowView`/`ExecRow` layer across simple scans, aggregates, and joins. |
+| Phase 2: Streaming Aggregates And View Hot Paths | Partial | Deferred view filter/LIMIT paths now use projected reads, trimmed projection sets, linear-chain streaming joins, and bounded grouped Top-N postprocessing; the view paths still trail SQLite and not all view/grouped shapes are complete. |
+| Phase 3: Cost-Based Planner And Join Operators | Partial | Planner estimate/operator scaffolding exists and `EXPLAIN` now exposes simple expanded-view pushdown metadata; cost-based execution selection and broader path-selection tests remain. |
+| Phase 4: Commit Fast Path | Partial | Faulty VFS passive-path overhead was reduced; required syscall/CPU profiling and commit benchmark proof remain. |
+| Phase 5: Final Benchmark And Documentation Sweep | Not complete | This status update and changelog entry are in progress; full final benchmark report and paranoid pre-commit are still required. |
 
 ### Phase 0: Baseline And Profiling
 

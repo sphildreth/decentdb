@@ -97,6 +97,10 @@ impl VfsFile for FaultyVfsFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if self.state.is_passive_path() {
+            return self.inner.read_at(offset, buf);
+        }
+
         let label = classify_read(self.inner.kind());
         match self.state.decision(label) {
             FaultDecision::Untracked => self.inner.read_at(offset, buf),
@@ -130,6 +134,10 @@ impl VfsFile for FaultyVfsFile {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        if self.state.is_passive_path() {
+            return self.inner.write_at(offset, buf);
+        }
+
         let label = classify_write(self.inner.kind(), offset, buf);
         match self.state.decision(label) {
             FaultDecision::Untracked => self.inner.write_at(offset, buf),
@@ -162,6 +170,10 @@ impl VfsFile for FaultyVfsFile {
     }
 
     fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        if self.state.is_passive_path() {
+            return self.inner.write_all_at_many(writes);
+        }
+
         if self.state.can_passthrough_batch() {
             return self.inner.write_all_at_many(writes);
         }
@@ -192,6 +204,10 @@ impl VfsFile for FaultyVfsFile {
     }
 
     fn sync_data(&self) -> Result<()> {
+        if self.state.is_passive_path() {
+            return self.inner.sync_data();
+        }
+
         let label = classify_sync(self.inner.kind());
         match self.state.decision(label) {
             FaultDecision::Untracked => self.inner.sync_data(),
@@ -218,6 +234,10 @@ impl VfsFile for FaultyVfsFile {
     }
 
     fn sync_metadata(&self) -> Result<()> {
+        if self.state.is_passive_path() {
+            return self.inner.sync_metadata();
+        }
+
         let label = classify_metadata_sync(self.inner.kind());
         match self.state.decision(label) {
             FaultDecision::Untracked => self.inner.sync_metadata(),
@@ -271,6 +291,10 @@ struct FaultState {
 }
 
 impl FaultState {
+    fn is_passive_path(&self) -> bool {
+        !self.has_active_failpoints() || !self.is_owner_thread()
+    }
+
     fn can_passthrough_batch(&self) -> bool {
         if !self.has_active_failpoints() {
             return true;

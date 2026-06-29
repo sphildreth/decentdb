@@ -134,7 +134,8 @@ const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
 const DEFERRED_RUNTIME_BTREE_INDEX_CACHE_LIMIT: usize = 16;
 const DEFERRED_PAGED_ROW_PAYLOAD_CACHE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
-const DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS: usize = 100_000;
+const DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS: usize = 10_000;
+const VIEW_QUERY_CACHE_LIMIT: usize = 128;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
     OnceLock::new();
@@ -159,6 +160,56 @@ pub(crate) enum NameResolutionScope {
 pub(super) enum CompatSchemaQualifier {
     Main,
     Temp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ViewQueryCacheKey {
+    temporary: bool,
+    name: String,
+    sql_text: String,
+}
+
+impl ViewQueryCacheKey {
+    fn new(view: &ViewSchema) -> Self {
+        Self {
+            temporary: view.temporary,
+            name: view.name.clone(),
+            sql_text: view.sql_text.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ViewQueryCache {
+    entries: HashMap<ViewQueryCacheKey, Arc<Query>>,
+    insertion_order: VecDeque<ViewQueryCacheKey>,
+}
+
+impl ViewQueryCache {
+    fn get(&self, key: &ViewQueryCacheKey) -> Option<Arc<Query>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: ViewQueryCacheKey, query: Arc<Query>) -> Arc<Query> {
+        if VIEW_QUERY_CACHE_LIMIT == 0 {
+            return query;
+        }
+        if !self.entries.contains_key(&key) {
+            self.insertion_order.push_back(key.clone());
+        }
+        self.entries.insert(key, Arc::clone(&query));
+        self.evict_excess();
+        query
+    }
+
+    fn evict_excess(&mut self) {
+        while self.entries.len() > VIEW_QUERY_CACHE_LIMIT {
+            let Some(evicted) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+    }
 }
 
 pub(super) fn compat_schema_qualified_name(name: &str) -> (Option<CompatSchemaQualifier>, &str) {
@@ -2057,6 +2108,29 @@ impl RuntimeRowIdSet<'_> {
             }
         }
     }
+
+    fn visit_until(self, mut visitor: impl FnMut(i64) -> Result<bool>) -> Result<bool> {
+        match self {
+            Self::Empty => Ok(false),
+            Self::Single(row_id) => visitor(row_id),
+            Self::Many(values) => {
+                for row_id in values {
+                    if visitor(*row_id)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Owned(values) => {
+                for row_id in values {
+                    if visitor(row_id)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
 }
 
 fn visible_row_id_set_count(
@@ -2720,6 +2794,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) indexes: Arc<BTreeMap<String, Arc<RuntimeIndex>>>,
     pub(crate) persisted_tables: Arc<BTreeMap<String, PersistedTableState>>,
     deferred_paged_row_locator_caches: Arc<BTreeMap<String, Arc<DeferredPagedRowLocatorCache>>>,
+    view_query_cache: Arc<Mutex<ViewQueryCache>>,
     resident_tombstone_locators: Arc<BTreeMap<String, Arc<Int64Map<u32>>>>,
     /// Tables whose row data has not yet been loaded from storage.
     /// Populated during `decode_manifest_payload` and cleared by
@@ -2907,6 +2982,7 @@ impl Clone for EngineRuntime {
             indexes: Arc::clone(&self.indexes),
             persisted_tables: Arc::clone(&self.persisted_tables),
             deferred_paged_row_locator_caches: Arc::clone(&self.deferred_paged_row_locator_caches),
+            view_query_cache: Arc::clone(&self.view_query_cache),
             resident_tombstone_locators: Arc::clone(&self.resident_tombstone_locators),
             deferred_tables: Arc::clone(&self.deferred_tables),
             // Preserve dirty state so that multi-statement transactions
@@ -3047,6 +3123,7 @@ impl EngineRuntime {
             indexes: Arc::new(BTreeMap::new()),
             persisted_tables: Arc::new(BTreeMap::new()),
             deferred_paged_row_locator_caches: Arc::new(BTreeMap::new()),
+            view_query_cache: Arc::new(Mutex::new(ViewQueryCache::default())),
             resident_tombstone_locators: Arc::new(BTreeMap::new()),
             deferred_tables: Arc::new(BTreeSet::new()),
             dirty_tables: Arc::new(BTreeSet::new()),
@@ -3176,6 +3253,40 @@ impl EngineRuntime {
         runtime.temp_indexes_mut().clear();
         runtime.temp_schema_cookie = 0;
         runtime
+    }
+
+    fn cached_view_query(&self, view: &ViewSchema) -> Result<Arc<Query>> {
+        let key = ViewQueryCacheKey::new(view);
+        {
+            let cache = self
+                .view_query_cache
+                .lock()
+                .expect("view query cache lock should not be poisoned");
+            if let Some(query) = cache.get(&key) {
+                return Ok(query);
+            }
+        }
+
+        let view_statement = parse_sql_statement(&view.sql_text)?;
+        let Statement::Query(query) = view_statement else {
+            return Err(DbError::corruption(format!(
+                "view {} does not contain a SELECT statement",
+                view.name
+            )));
+        };
+        let query = Arc::new(query);
+        let mut cache = self
+            .view_query_cache
+            .lock()
+            .expect("view query cache lock should not be poisoned");
+        Ok(cache.insert(key, query))
+    }
+
+    fn cache_view_query(&self, view: &ViewSchema, query: Query) {
+        self.view_query_cache
+            .lock()
+            .expect("view query cache lock should not be poisoned")
+            .insert(ViewQueryCacheKey::new(view), Arc::new(query));
     }
 
     fn catalog_mut(&mut self) -> &mut CatalogState {
@@ -13150,13 +13261,7 @@ impl EngineRuntime {
             return Ok(None);
         };
         let view_binding = alias.as_deref().unwrap_or(name.as_str());
-        let view_statement = parse_sql_statement(&view.sql_text)?;
-        let Statement::Query(view_query) = view_statement else {
-            return Err(DbError::corruption(format!(
-                "view {} does not contain a SELECT statement",
-                view.name
-            )));
-        };
+        let view_query = self.cached_view_query(view)?;
         if view_query.recursive
             || !view_query.ctes.is_empty()
             || !view_query.order_by.is_empty()
@@ -19752,14 +19857,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let view_binding = view_alias.as_deref().unwrap_or(view_name.as_str());
-
-        let view_statement = parse_sql_statement(&view.sql_text)?;
-        let Statement::Query(view_query) = view_statement else {
-            return Err(DbError::corruption(format!(
-                "view {} does not contain a SELECT statement",
-                view.name
-            )));
-        };
+        let view_query = self.cached_view_query(view)?;
         if view_query.recursive
             || !view_query.ctes.is_empty()
             || !view_query.order_by.is_empty()
@@ -19889,9 +19987,18 @@ impl EngineRuntime {
             };
             join_steps.push(step);
         }
+        let table_projections =
+            build_deferred_view_table_projections(&table_schemas, &projections, &join_steps);
+        let projection_indexes = build_deferred_view_projection_indexes(
+            &projections,
+            &table_projections,
+            "deferred view limit projection",
+        )?;
 
+        let mut table_readers = Vec::with_capacity(table_bindings.len());
         for (binding, schema) in table_bindings.iter().zip(table_schemas.iter()) {
-            if self.visible_table_row_source(binding.name).is_some() {
+            if let Some(source) = self.visible_table_row_source(binding.name) {
+                table_readers.push(DeferredViewTableRowReader::Source(source));
                 continue;
             }
             let Some(state) = self.persisted_table_state(binding.name) else {
@@ -19905,6 +20012,11 @@ impl EngineRuntime {
             if !deferred_rowid_lookup_available(state, schema, use_persistent_pk_index, cache) {
                 return Ok(None);
             }
+            table_readers.push(DeferredViewTableRowReader::Deferred {
+                state,
+                schema,
+                paged_locator_cache: cache,
+            });
         }
 
         let store = SnapshotPageStore {
@@ -19915,20 +20027,22 @@ impl EngineRuntime {
         let mut rows = Vec::new();
         let mut offset_remaining = offset;
         let mut limit_remaining = limit;
-        let root_binding = table_bindings[0];
-        if let Some(source) = self.visible_table_row_source(root_binding.name) {
+        if let DeferredViewTableRowReader::Source(source) = &table_readers[0] {
             for root_row in source.rows() {
                 let root_row = root_row?;
                 let root_row = StoredRow {
                     row_id: root_row.row_id(),
-                    values: root_row.values().to_vec(),
+                    values: project_simple_projection_value_vec(
+                        root_row.values(),
+                        &table_projections[0].projection_indexes,
+                    ),
                 };
                 if self.push_deferred_view_limit_rows_from_root(
                     &store,
-                    &table_bindings,
-                    &table_schemas,
+                    &table_readers,
                     &join_steps,
-                    &projections,
+                    &table_projections,
+                    &projection_indexes,
                     root_row,
                     &mut offset_remaining,
                     &mut limit_remaining,
@@ -19939,27 +20053,32 @@ impl EngineRuntime {
                 }
             }
         } else {
-            let Some(root_state) = self.persisted_table_state(root_binding.name) else {
+            let DeferredViewTableRowReader::Deferred { state, .. } = &table_readers[0] else {
                 return Ok(None);
             };
-            visit_persisted_table_rows_until(&store, root_state, |row_id, values| {
-                let root_row = StoredRow {
-                    row_id,
-                    values: values.to_vec(),
-                };
-                self.push_deferred_view_limit_rows_from_root(
-                    &store,
-                    &table_bindings,
-                    &table_schemas,
-                    &join_steps,
-                    &projections,
-                    root_row,
-                    &mut offset_remaining,
-                    &mut limit_remaining,
-                    &mut rows,
-                    use_persistent_pk_index,
-                )
-            })?;
+            visit_persisted_table_projected_values_until(
+                &store,
+                *state,
+                &table_projections[0].projection_indexes,
+                |row_id, root_values| {
+                    let root_row = StoredRow {
+                        row_id,
+                        values: root_values.to_vec(),
+                    };
+                    self.push_deferred_view_limit_rows_from_root(
+                        &store,
+                        &table_readers,
+                        &join_steps,
+                        &table_projections,
+                        &projection_indexes,
+                        root_row,
+                        &mut offset_remaining,
+                        &mut limit_remaining,
+                        &mut rows,
+                        use_persistent_pk_index,
+                    )
+                },
+            )?;
         }
 
         Ok(Some(QueryResult::with_rows(column_names, rows)))
@@ -20020,13 +20139,7 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let view_statement = parse_sql_statement(&view.sql_text)?;
-        let Statement::Query(view_query) = view_statement else {
-            return Err(DbError::corruption(format!(
-                "view {} does not contain a SELECT statement",
-                view.name
-            )));
-        };
+        let view_query = self.cached_view_query(view)?;
         if view_query.recursive
             || !view_query.ctes.is_empty()
             || !view_query.order_by.is_empty()
@@ -20174,9 +20287,18 @@ impl EngineRuntime {
             };
             join_steps.push(step);
         }
+        let table_projections =
+            build_deferred_view_table_projections(&table_schemas, &projections, &join_steps);
+        let projection_indexes = build_deferred_view_projection_indexes(
+            &projections,
+            &table_projections,
+            "deferred view projection",
+        )?;
 
+        let mut table_readers = Vec::with_capacity(table_bindings.len());
         for (binding, schema) in table_bindings.iter().zip(table_schemas.iter()) {
-            if self.visible_table_row_source(binding.name).is_some() {
+            if let Some(source) = self.visible_table_row_source(binding.name) {
+                table_readers.push(DeferredViewTableRowReader::Source(source));
                 continue;
             }
             let Some(state) = self.persisted_table_state(binding.name) else {
@@ -20190,6 +20312,11 @@ impl EngineRuntime {
             if !deferred_rowid_lookup_available(state, schema, use_persistent_pk_index, cache) {
                 return Ok(None);
             }
+            table_readers.push(DeferredViewTableRowReader::Deferred {
+                state,
+                schema,
+                paged_locator_cache: cache,
+            });
         }
 
         let filter_value = self.eval_expr(
@@ -20208,75 +20335,150 @@ impl EngineRuntime {
             wal,
             snapshot_lsn,
         };
-        let Some(source_row) = self.read_simple_view_join_row_at_snapshot(
+        let Some(source_row) = table_readers[source_table_index].read_projected(
             &store,
-            table_bindings[source_table_index].name,
-            table_schemas[source_table_index],
             source_row_id,
             use_persistent_pk_index,
+            &table_projections[source_table_index].projection_indexes,
         )?
         else {
             return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
         };
 
-        let mut partial_rows = vec![vec![source_row]];
-        for step in join_steps {
-            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
-            else {
-                return Ok(None);
-            };
-            let mut next_rows = Vec::new();
-            for partial in partial_rows {
-                let Some(key_value) = partial
-                    .get(step.previous_table_index)
-                    .and_then(|row| row.values.get(step.previous_column_index))
-                else {
-                    return Err(DbError::internal(
-                        "deferred view join row is shorter than the planned schema",
-                    ));
-                };
-                if matches!(key_value, Value::Null) {
-                    continue;
-                }
-                for row_id in keys.row_ids_for_value(key_value)? {
-                    let Some(joined_row) = self.read_simple_view_join_row_at_snapshot(
-                        &store,
-                        table_bindings[step.current_table_index].name,
-                        table_schemas[step.current_table_index],
-                        row_id,
-                        use_persistent_pk_index,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let mut extended = partial.clone();
-                    extended.push(joined_row);
-                    next_rows.push(extended);
-                }
-            }
-            partial_rows = next_rows;
-            if partial_rows.is_empty() {
-                break;
-            }
+        let mut rows = Vec::new();
+        if let Some(stopped) = self.stream_deferred_view_linear_three_table_rows_from_root(
+            &store,
+            &table_readers,
+            &join_steps,
+            &table_projections,
+            &source_row,
+            use_persistent_pk_index,
+            &mut |partial| {
+                let values = collect_deferred_view_projection_values_from_refs(
+                    partial,
+                    &projection_indexes,
+                    "deferred view projection",
+                )?;
+                rows.push(QueryRow::new(values));
+                Ok(false)
+            },
+        )? {
+            let _ = stopped;
+            return Ok(Some(QueryResult::with_rows(column_names, rows)));
         }
 
-        let mut rows = Vec::with_capacity(partial_rows.len());
-        for partial in partial_rows {
-            let mut values = Vec::with_capacity(projections.len());
-            for projection in &projections {
-                let Some(value) = partial
-                    .get(projection.table_index)
-                    .and_then(|row| row.values.get(projection.column_index))
-                else {
-                    return Err(DbError::internal(
-                        "deferred view projection row is shorter than the planned schema",
-                    ));
-                };
-                values.push(value.clone());
-            }
-            rows.push(QueryRow::new(values));
+        match self.stream_deferred_view_join_rows_from_root(
+            &store,
+            &table_readers,
+            &join_steps,
+            &table_projections,
+            source_row,
+            use_persistent_pk_index,
+            false,
+            &mut |partial| {
+                let values = collect_deferred_view_projection_values(
+                    partial,
+                    &projection_indexes,
+                    "deferred view projection",
+                )?;
+                rows.push(QueryRow::new(values));
+                Ok(false)
+            },
+        )? {
+            Some(_) => Ok(Some(QueryResult::with_rows(column_names, rows))),
+            None => Ok(None),
         }
-        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_deferred_view_linear_three_table_rows_from_root<S: PageStore, F>(
+        &self,
+        store: &S,
+        table_row_readers: &[DeferredViewTableRowReader<'_>],
+        join_steps: &[DeferredViewJoinStep],
+        table_projections: &[DeferredViewTableProjection],
+        root_row: &StoredRow,
+        use_persistent_pk_index: bool,
+        visit: &mut F,
+    ) -> Result<Option<bool>>
+    where
+        F: FnMut(&[&StoredRow; 3]) -> Result<bool>,
+    {
+        if table_row_readers.len() != 3 || join_steps.len() != 2 || table_projections.len() != 3 {
+            return Ok(None);
+        }
+        let step0 = &join_steps[0];
+        let step1 = &join_steps[1];
+        if step0.previous_table_index != 0
+            || step0.current_table_index != 1
+            || step1.previous_table_index != 1
+            || step1.current_table_index != 2
+        {
+            return Ok(None);
+        }
+        let Some(RuntimeIndex::Btree { keys: keys0, .. }) = self.index(&step0.current_index_name)
+        else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys: keys1, .. }) = self.index(&step1.current_index_name)
+        else {
+            return Ok(None);
+        };
+        let key0_projection_index = table_projections[0]
+            .position(step0.previous_column_index)
+            .ok_or_else(|| {
+                DbError::internal(
+                    "deferred view linear join root projection is missing required column",
+                )
+            })?;
+        let key1_projection_index = table_projections[1]
+            .position(step1.previous_column_index)
+            .ok_or_else(|| {
+                DbError::internal(
+                    "deferred view linear join middle projection is missing required column",
+                )
+            })?;
+        let Some(key0) = root_row.values.get(key0_projection_index) else {
+            return Err(DbError::internal(
+                "deferred view linear join root row is shorter than planned schema",
+            ));
+        };
+        if matches!(key0, Value::Null) {
+            return Ok(Some(false));
+        }
+
+        let stopped = keys0.row_ids_for_value_set(key0)?.visit_until(|row1_id| {
+            let Some(row1) = table_row_readers[1].read_projected(
+                store,
+                row1_id,
+                use_persistent_pk_index,
+                &table_projections[1].projection_indexes,
+            )?
+            else {
+                return Ok(false);
+            };
+            let Some(key1) = row1.values.get(key1_projection_index) else {
+                return Err(DbError::internal(
+                    "deferred view linear join middle row is shorter than planned schema",
+                ));
+            };
+            if matches!(key1, Value::Null) {
+                return Ok(false);
+            }
+            keys1.row_ids_for_value_set(key1)?.visit_until(|row2_id| {
+                let Some(row2) = table_row_readers[2].read_projected(
+                    store,
+                    row2_id,
+                    use_persistent_pk_index,
+                    &table_projections[2].projection_indexes,
+                )?
+                else {
+                    return Ok(false);
+                };
+                visit(&[root_row, &row1, &row2])
+            })
+        })?;
+        Ok(Some(stopped))
     }
 
     fn deferred_view_join_step(
@@ -20323,6 +20525,13 @@ impl EngineRuntime {
                 {
                     return Ok(None);
                 }
+                if schema_column_index(table_schemas[current_table_index], current_ref.column)
+                    .is_none()
+                {
+                    return Err(DbError::internal(
+                        "deferred view join current column is missing from schema",
+                    ));
+                }
             }
         }
         Ok(matched)
@@ -20348,125 +20557,269 @@ impl EngineRuntime {
         })
     }
 
-    fn read_simple_view_join_row_at_snapshot<S: PageStore>(
-        &self,
-        store: &S,
-        table_name: &str,
-        table_schema: &TableSchema,
-        row_id: i64,
-        use_persistent_pk_index: bool,
-    ) -> Result<Option<StoredRow>> {
-        if let Some(source) = self.visible_table_row_source(table_name) {
-            return source.row_by_id(row_id).map(|row| {
-                row.map(|row| StoredRow {
-                    row_id: row.row_id(),
-                    values: row.values().to_vec(),
-                })
-            });
-        }
-        let Some(state) = self.persisted_table_state(table_name) else {
-            return Ok(None);
-        };
-        let cache = self
-            .catalog
-            .table(table_name)
-            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
-            .map(|cache| cache.as_ref());
-        read_deferred_stored_row_by_id(
-            store,
-            state,
-            table_schema,
-            row_id,
-            use_persistent_pk_index,
-            cache,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn push_deferred_view_limit_rows_from_root<S: PageStore>(
         &self,
         store: &S,
-        table_bindings: &[TableBindingRef<'_>],
-        table_schemas: &[&TableSchema],
+        table_row_readers: &[DeferredViewTableRowReader<'_>],
         join_steps: &[DeferredViewJoinStep],
-        projections: &[DeferredViewProjection],
+        table_projections: &[DeferredViewTableProjection],
+        projection_indexes: &[(usize, usize)],
         root_row: StoredRow,
         offset_remaining: &mut usize,
         limit_remaining: &mut usize,
         rows: &mut Vec<QueryRow>,
         use_persistent_pk_index: bool,
     ) -> Result<bool> {
-        let mut partial_rows = vec![vec![root_row]];
+        let Some(stopped) = self.stream_deferred_view_join_rows_from_root(
+            store,
+            table_row_readers,
+            join_steps,
+            table_projections,
+            root_row,
+            use_persistent_pk_index,
+            true,
+            &mut |partial| {
+                if *offset_remaining > 0 {
+                    *offset_remaining -= 1;
+                    return Ok(false);
+                }
+                if *limit_remaining == 0 {
+                    return Ok(true);
+                }
+                let values = collect_deferred_view_projection_values(
+                    partial,
+                    projection_indexes,
+                    "deferred view limit projection",
+                )?;
+                rows.push(QueryRow::new(values));
+                *limit_remaining = (*limit_remaining).saturating_sub(1);
+                Ok(*limit_remaining == 0)
+            },
+        )?
+        else {
+            return Err(DbError::internal(
+                "index was unavailable while executing deferred view limit join",
+            ));
+        };
+        Ok(stopped)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_deferred_view_join_rows_from_root<S: PageStore, F>(
+        &self,
+        store: &S,
+        table_row_readers: &[DeferredViewTableRowReader<'_>],
+        join_steps: &[DeferredViewJoinStep],
+        table_projections: &[DeferredViewTableProjection],
+        root_row: StoredRow,
+        use_persistent_pk_index: bool,
+        require_index: bool,
+        visit: &mut F,
+    ) -> Result<Option<bool>>
+    where
+        F: FnMut(&[StoredRow]) -> Result<bool>,
+    {
+        #[allow(clippy::too_many_arguments)]
+        fn walk_join_rows<S: PageStore, F>(
+            store: &S,
+            table_row_readers: &[DeferredViewTableRowReader<'_>],
+            join_steps: &[DeferredViewJoinStep],
+            table_projections: &[DeferredViewTableProjection],
+            join_keys: &[&RuntimeBtreeKeys],
+            key_projection_indexes: &[usize],
+            step_index: usize,
+            partial_rows: &mut Vec<StoredRow>,
+            use_persistent_pk_index: bool,
+            visit: &mut F,
+        ) -> Result<Option<bool>>
+        where
+            F: FnMut(&[StoredRow]) -> Result<bool>,
+        {
+            if step_index == join_steps.len() {
+                return Ok(Some(visit(partial_rows.as_slice())?));
+            }
+
+            let step = &join_steps[step_index];
+            let keys = join_keys[step_index];
+            let Some(previous_row) = partial_rows.get(step.previous_table_index) else {
+                return Err(DbError::internal(
+                    "deferred view limit join row is shorter than the planned schema",
+                ));
+            };
+            let Some(key_value) = previous_row.values.get(key_projection_indexes[step_index])
+            else {
+                return Err(DbError::internal(
+                    "deferred view limit join projection row is shorter than planned schema",
+                ));
+            };
+            if matches!(key_value, Value::Null) {
+                return Ok(Some(false));
+            }
+
+            let mut outcome = None;
+            let row_ids = keys.row_ids_for_value_set(key_value)?;
+            match row_ids {
+                RuntimeRowIdSet::Empty => {}
+                RuntimeRowIdSet::Single(row_id) => {
+                    let row_ids = std::iter::once(row_id);
+                    for row_id in row_ids {
+                        let Some(joined_row) = table_row_readers[step.current_table_index]
+                            .read_projected(
+                                store,
+                                row_id,
+                                use_persistent_pk_index,
+                                &table_projections[step.current_table_index].projection_indexes,
+                            )?
+                        else {
+                            continue;
+                        };
+                        if partial_rows.len() != step.current_table_index {
+                            return Err(DbError::internal(
+                                "deferred view join row is not in expected table order",
+                            ));
+                        }
+                        partial_rows.push(joined_row);
+                        let child_outcome = walk_join_rows(
+                            store,
+                            table_row_readers,
+                            join_steps,
+                            table_projections,
+                            join_keys,
+                            key_projection_indexes,
+                            step_index + 1,
+                            partial_rows,
+                            use_persistent_pk_index,
+                            visit,
+                        )?;
+                        partial_rows.pop();
+                        if !matches!(child_outcome, Some(false)) {
+                            outcome = Some(child_outcome);
+                            break;
+                        }
+                    }
+                }
+                RuntimeRowIdSet::Many(row_ids) => {
+                    for row_id in row_ids {
+                        if outcome.is_some() {
+                            break;
+                        }
+                        let Some(joined_row) = table_row_readers[step.current_table_index]
+                            .read_projected(
+                                store,
+                                *row_id,
+                                use_persistent_pk_index,
+                                &table_projections[step.current_table_index].projection_indexes,
+                            )?
+                        else {
+                            continue;
+                        };
+                        if partial_rows.len() != step.current_table_index {
+                            return Err(DbError::internal(
+                                "deferred view join row is not in expected table order",
+                            ));
+                        }
+                        partial_rows.push(joined_row);
+                        let child_outcome = walk_join_rows(
+                            store,
+                            table_row_readers,
+                            join_steps,
+                            table_projections,
+                            join_keys,
+                            key_projection_indexes,
+                            step_index + 1,
+                            partial_rows,
+                            use_persistent_pk_index,
+                            visit,
+                        )?;
+                        partial_rows.pop();
+                        if !matches!(child_outcome, Some(false)) {
+                            outcome = Some(child_outcome);
+                        }
+                    }
+                }
+                RuntimeRowIdSet::Owned(row_ids) => {
+                    for row_id in row_ids {
+                        if outcome.is_some() {
+                            break;
+                        }
+                        let Some(joined_row) = table_row_readers[step.current_table_index]
+                            .read_projected(
+                                store,
+                                row_id,
+                                use_persistent_pk_index,
+                                &table_projections[step.current_table_index].projection_indexes,
+                            )?
+                        else {
+                            continue;
+                        };
+                        if partial_rows.len() != step.current_table_index {
+                            return Err(DbError::internal(
+                                "deferred view join row is not in expected table order",
+                            ));
+                        }
+                        partial_rows.push(joined_row);
+                        let child_outcome = walk_join_rows(
+                            store,
+                            table_row_readers,
+                            join_steps,
+                            table_projections,
+                            join_keys,
+                            key_projection_indexes,
+                            step_index + 1,
+                            partial_rows,
+                            use_persistent_pk_index,
+                            visit,
+                        )?;
+                        partial_rows.pop();
+                        if !matches!(child_outcome, Some(false)) {
+                            outcome = Some(child_outcome);
+                        }
+                    }
+                }
+            }
+
+            Ok(outcome.unwrap_or(Some(false)))
+        }
+
+        let mut join_keys = Vec::with_capacity(join_steps.len());
+        let mut key_projection_indexes = Vec::with_capacity(join_steps.len());
         for step in join_steps {
             let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.current_index_name)
             else {
+                if !require_index {
+                    return Ok(None);
+                }
                 return Err(DbError::internal(format!(
                     "index {} is missing for deferred view limit join",
                     step.current_index_name
                 )));
             };
-            let mut next_rows = Vec::new();
-            for partial in partial_rows {
-                let Some(key_value) = partial
-                    .get(step.previous_table_index)
-                    .and_then(|row| row.values.get(step.previous_column_index))
-                else {
-                    return Err(DbError::internal(
-                        "deferred view limit join row is shorter than the planned schema",
-                    ));
-                };
-                if matches!(key_value, Value::Null) {
-                    continue;
-                }
-                for row_id in keys.row_ids_for_value(key_value)? {
-                    let Some(joined_row) = self.read_simple_view_join_row_at_snapshot(
-                        store,
-                        table_bindings[step.current_table_index].name,
-                        table_schemas[step.current_table_index],
-                        row_id,
-                        use_persistent_pk_index,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let mut extended = partial.clone();
-                    extended.push(joined_row);
-                    next_rows.push(extended);
-                }
-            }
-            partial_rows = next_rows;
-            if partial_rows.is_empty() {
-                return Ok(false);
-            }
+            join_keys.push(keys);
+            let Some(projection_index) =
+                table_projections[step.previous_table_index].position(step.previous_column_index)
+            else {
+                return Err(DbError::internal(
+                    "deferred view limit join projection is missing required column",
+                ));
+            };
+            key_projection_indexes.push(projection_index);
         }
 
-        for partial in partial_rows {
-            if *offset_remaining > 0 {
-                *offset_remaining -= 1;
-                continue;
-            }
-            if *limit_remaining == 0 {
-                return Ok(true);
-            }
-            let mut values = Vec::with_capacity(projections.len());
-            for projection in projections {
-                let Some(value) = partial
-                    .get(projection.table_index)
-                    .and_then(|row| row.values.get(projection.column_index))
-                else {
-                    return Err(DbError::internal(
-                        "deferred view limit projection row is shorter than the planned schema",
-                    ));
-                };
-                values.push(value.clone());
-            }
-            rows.push(QueryRow::new(values));
-            *limit_remaining = (*limit_remaining).saturating_sub(1);
-            if *limit_remaining == 0 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let mut partial_rows = Vec::with_capacity(join_steps.len() + 1);
+        partial_rows.push(root_row);
+        walk_join_rows(
+            store,
+            table_row_readers,
+            join_steps,
+            table_projections,
+            &join_keys,
+            &key_projection_indexes,
+            0,
+            &mut partial_rows,
+            use_persistent_pk_index,
+            visit,
+        )
     }
 
     pub(crate) fn try_execute_simple_deferred_paged_query(
@@ -22339,9 +22692,9 @@ impl EngineRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_simple_grouped_postprocessing(
+    fn apply_simple_grouped_postprocessing<I>(
         &self,
-        rows: Vec<QueryRow>,
+        rows: I,
         column_names: Vec<String>,
         having_bindings: &[ColumnBinding],
         having: Option<&Expr>,
@@ -22349,31 +22702,73 @@ impl EngineRuntime {
         order_by: Option<&[SimpleOrderByPlan]>,
         limit: Option<usize>,
         offset: usize,
-    ) -> Result<QueryResult> {
-        let rows = if let Some(having) = having {
+    ) -> Result<QueryResult>
+    where
+        I: IntoIterator<Item = QueryRow>,
+    {
+        let bounded_order = order_by
+            .and_then(|order_by| limit.map(|limit| (order_by, offset.saturating_add(limit))));
+        let mut rows_out = if let Some((_, bounded_row_count)) = bounded_order {
+            if bounded_row_count == 0 {
+                return Ok(QueryResult::with_rows(column_names, Vec::new()));
+            }
+            Vec::with_capacity(bounded_row_count)
+        } else {
+            Vec::new()
+        };
+
+        let mut push_row = |row: QueryRow| -> Result<()> {
+            if let Some((order_by, bounded_row_count)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows_out,
+                    row,
+                    order_by,
+                    bounded_row_count,
+                )
+            } else {
+                rows_out.push(row);
+                Ok(())
+            }
+        };
+
+        if let Some(having) = having {
             let having_dataset = Dataset::with_rows(having_bindings.to_vec(), Vec::new());
             let ctes = BTreeMap::new();
-            let mut filtered = Vec::with_capacity(rows.len());
             for row in rows {
                 if matches!(
                     self.eval_expr(having, &having_dataset, row.values(), params, &ctes, None)?,
                     Value::Bool(true)
                 ) {
-                    filtered.push(row);
+                    push_row(row)?;
                 }
             }
-            filtered
         } else {
-            rows
-        };
-        apply_simple_projection_postprocessing_with_order(
-            Some(self),
-            rows,
-            column_names,
-            order_by,
-            limit,
-            offset,
-        )
+            for row in rows {
+                push_row(row)?;
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows_out, order_by)?;
+            let rows = rows_out
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
+
+        if let Some(order_by) = order_by {
+            sort_query_rows_by_projection_order(Some(self), &mut rows_out, order_by)?;
+        }
+
+        let rows = rows_out
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
+        Ok(QueryResult::with_rows(column_names, rows))
     }
 
     pub(crate) fn evaluate_query(
@@ -23141,13 +23536,7 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let view_statement = parse_sql_statement(&view.sql_text)?;
-        let Statement::Query(mut query) = view_statement else {
-            return Err(DbError::corruption(format!(
-                "view {} does not contain a SELECT statement",
-                view.name
-            )));
-        };
+        let mut query = (*self.cached_view_query(view)?).clone();
         if query.recursive
             || !query.ctes.is_empty()
             || !query.order_by.is_empty()
@@ -25029,18 +25418,12 @@ impl EngineRuntime {
                     return Ok(dataset);
                 }
                 if let Some(view) = self.visible_view(name, NameResolutionScope::Session) {
-                    let view_statement = parse_sql_statement(&view.sql_text)?;
-                    let Statement::Query(query) = view_statement else {
-                        return Err(DbError::corruption(format!(
-                            "view {} does not contain a SELECT statement",
-                            view.name
-                        )));
-                    };
+                    let query = self.cached_view_query(view)?;
                     let mut dataset = if view.temporary {
-                        self.evaluate_query(&query, params, ctes)?
+                        self.evaluate_query(query.as_ref(), params, ctes)?
                     } else {
                         let persistent_runtime = self.persistent_resolution_runtime();
-                        persistent_runtime.evaluate_query(&query, params, ctes)?
+                        persistent_runtime.evaluate_query(query.as_ref(), params, ctes)?
                     };
                     if let Some(alias) = alias {
                         for column in &mut dataset.columns {
@@ -29205,6 +29588,48 @@ where
     Ok(visible_count)
 }
 
+fn visit_table_payload_projected_values_from_bytes_until<F>(
+    bytes: &[u8],
+    projection_indexes: &[usize],
+    tombstoned_row_ids: Option<&[i64]>,
+    visitor: &mut F,
+) -> Result<(usize, bool)>
+where
+    F: FnMut(i64, &[Value]) -> Result<bool>,
+{
+    if bytes.is_empty() {
+        return Ok((0, false));
+    }
+    let mut cursor = Cursor::new(bytes);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut visible_count = 0usize;
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let (is_tombstone, row_bytes_len) = split_table_payload_row_len(cursor.read_u32()?);
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        if is_tombstone {
+            continue;
+        }
+        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.contains(&row_id)) {
+            continue;
+        }
+        let values = Row::decode_projection_with_overflow::<crate::storage::page::InMemoryPageStore>(
+            row_bytes,
+            None,
+            projection_indexes,
+        )?;
+        visible_count += 1;
+        if visitor(row_id, &values)? {
+            return Ok((visible_count, true));
+        }
+    }
+    Ok((visible_count, false))
+}
+
 fn visit_table_payload_rows_from_pointer<S: PageStore, F>(
     store: &S,
     pointer: OverflowPointer,
@@ -29289,6 +29714,56 @@ where
         visited += 1;
     }
     Ok(visited)
+}
+
+fn visit_table_payload_projected_values_from_pointer_until<S: PageStore, F>(
+    store: &S,
+    pointer: OverflowPointer,
+    projection_indexes: &[usize],
+    visitor: &mut F,
+) -> Result<(usize, bool)>
+where
+    F: FnMut(i64, &[Value]) -> Result<bool>,
+{
+    if pointer.head_page_id == 0 || pointer.logical_len == 0 {
+        return Ok((0, false));
+    }
+    if pointer.is_compressed() {
+        let payload = read_overflow(store, pointer)?;
+        return visit_table_payload_projected_values_from_bytes_until(
+            &payload,
+            projection_indexes,
+            None,
+            visitor,
+        );
+    }
+
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
+    cursor.read_exact(&mut magic)?;
+    if magic != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut visited = 0usize;
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let (is_tombstone, row_bytes_len) = split_table_payload_row_len(cursor.read_u32()?);
+        let row_bytes = cursor.read_vec(row_bytes_len)?;
+        if is_tombstone {
+            continue;
+        }
+        let values = Row::decode_projection_with_overflow::<crate::storage::page::InMemoryPageStore>(
+            &row_bytes,
+            None,
+            projection_indexes,
+        )?;
+        visited += 1;
+        if visitor(row_id, &values)? {
+            return Ok((visited, true));
+        }
+    }
+    Ok((visited, false))
 }
 
 fn visit_table_payload_int64_column_from_bytes<F>(
@@ -29506,6 +29981,89 @@ where
         ));
     }
     Ok(total_row_count)
+}
+
+fn visit_persisted_table_projected_values_until<S: PageStore, F>(
+    store: &S,
+    state: PersistedTableState,
+    projection_indexes: &[usize],
+    mut visitor: F,
+) -> Result<usize>
+where
+    F: FnMut(i64, &[Value]) -> Result<bool>,
+{
+    if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+        return Ok(0);
+    }
+    if !state.pointer.is_table_paged_manifest() {
+        let (row_count, stopped) = visit_table_payload_projected_values_from_pointer_until(
+            store,
+            state.pointer,
+            projection_indexes,
+            &mut visitor,
+        )?;
+        if !stopped && state.row_count != 0 && row_count != state.row_count {
+            return Err(DbError::corruption("table payload row count mismatch"));
+        }
+        return Ok(row_count);
+    }
+
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let mut visited_row_count = 0usize;
+    let mut total_row_count = 0usize;
+    for chunk in manifest.chunks {
+        let mut count = 0usize;
+        let tombstones = if chunk.tombstoned_row_ids.is_empty() {
+            None
+        } else {
+            Some(chunk.tombstoned_row_ids.as_slice())
+        };
+
+        let base_payload = read_overflow(store, chunk.pointer)?;
+        let (base_count, stopped) = visit_table_payload_projected_values_from_bytes_until(
+            &base_payload,
+            projection_indexes,
+            tombstones,
+            &mut visitor,
+        )?;
+        visited_row_count = visited_row_count.saturating_add(base_count);
+        count = count.saturating_add(base_count);
+        if stopped {
+            return Ok(visited_row_count);
+        }
+
+        if let Some(overlay_pointer) = chunk.overlay_pointer {
+            let overlay_payload = read_overflow(store, overlay_pointer)?;
+            let (overlay_count, stopped) = visit_table_payload_projected_values_from_bytes_until(
+                &overlay_payload,
+                projection_indexes,
+                None,
+                &mut visitor,
+            )?;
+            visited_row_count = visited_row_count.saturating_add(overlay_count);
+            count = count.saturating_add(overlay_count);
+            if stopped {
+                return Ok(visited_row_count);
+            }
+        }
+
+        if count != chunk.row_count {
+            return Err(DbError::corruption("paged table chunk row count mismatch"));
+        }
+        total_row_count = total_row_count.saturating_add(count);
+    }
+    if state.row_count != 0 && total_row_count != state.row_count {
+        return Err(DbError::corruption(
+            "paged table manifest row count mismatch",
+        ));
+    }
+    Ok(visited_row_count)
 }
 
 fn visit_persisted_table_rows<S: PageStore, F>(
@@ -33756,22 +34314,22 @@ fn render_simple_grouped_numeric_aggregate_groups(
                 .collect::<Result<Vec<_>>>()?;
             rows.push(QueryRow::new(output));
         }
-        return apply_simple_projection_postprocessing_with_order(
-            Some(runtime),
+        return runtime.apply_simple_grouped_postprocessing(
             rows,
             plan.column_names.clone(),
+            &[],
+            None,
+            params,
             plan.order_by.as_deref(),
             plan.limit,
             plan.offset,
         );
     }
 
-    let rows = groups
-        .into_iter()
-        .map(|group| group.into_row(&plan.aggregate_bindings))
-        .collect();
     runtime.apply_simple_grouped_postprocessing(
-        rows,
+        groups
+            .into_iter()
+            .map(|group| group.into_row(&plan.aggregate_bindings)),
         plan.column_names.clone(),
         &plan.having_bindings,
         plan.having.as_ref(),
@@ -33826,22 +34384,22 @@ fn render_simple_grouped_count_groups(
                 .collect::<Result<Vec<_>>>()?;
             rows.push(QueryRow::new(output));
         }
-        return apply_simple_projection_postprocessing_with_order(
-            Some(runtime),
+        return runtime.apply_simple_grouped_postprocessing(
             rows,
             plan.column_names.clone(),
+            &[],
+            None,
+            params,
             plan.order_by.as_deref(),
             plan.limit,
             plan.offset,
         );
     }
 
-    let rows = groups
-        .into_iter()
-        .map(SimpleGroupedCountAggregate::into_row)
-        .collect();
     runtime.apply_simple_grouped_postprocessing(
-        rows,
+        groups
+            .into_iter()
+            .map(SimpleGroupedCountAggregate::into_row),
         plan.column_names.clone(),
         &plan.having_bindings,
         plan.having.as_ref(),
@@ -35018,6 +35576,159 @@ struct DeferredViewJoinStep {
     current_index_name: String,
 }
 
+#[derive(Clone)]
+enum DeferredViewTableRowReader<'a> {
+    Source(VisibleTableRowSource<'a>),
+    Deferred {
+        state: PersistedTableState,
+        schema: &'a TableSchema,
+        paged_locator_cache: Option<&'a DeferredPagedRowLocatorCache>,
+    },
+}
+
+impl<'a> DeferredViewTableRowReader<'a> {
+    fn read_projected<S: PageStore>(
+        &self,
+        store: &S,
+        row_id: i64,
+        use_persistent_pk_index: bool,
+        projection_indexes: &[usize],
+    ) -> Result<Option<StoredRow>> {
+        match *self {
+            Self::Source(source) => source
+                .projected_values_by_id(row_id, projection_indexes)
+                .map(|values| values.map(|values| StoredRow { row_id, values })),
+            Self::Deferred {
+                state,
+                schema,
+                paged_locator_cache,
+            } => read_deferred_projected_values_by_id(
+                store,
+                state,
+                schema,
+                row_id,
+                use_persistent_pk_index,
+                paged_locator_cache,
+                projection_indexes,
+            )
+            .map(|values| values.map(|values| StoredRow { row_id, values })),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeferredViewTableProjection {
+    projection_indexes: Vec<usize>,
+    projected_positions: Vec<Option<usize>>,
+}
+
+impl DeferredViewTableProjection {
+    fn new(schema: &TableSchema, required_columns: BTreeSet<usize>) -> Self {
+        let projection_indexes = required_columns.into_iter().collect::<Vec<_>>();
+        let mut projected_positions = vec![None; schema.columns.len()];
+        for (position, column_index) in projection_indexes.iter().copied().enumerate() {
+            projected_positions[column_index] = Some(position);
+        }
+        Self {
+            projection_indexes,
+            projected_positions,
+        }
+    }
+
+    fn position(&self, column_index: usize) -> Option<usize> {
+        self.projected_positions
+            .get(column_index)
+            .copied()
+            .flatten()
+    }
+}
+
+fn build_deferred_view_table_projections(
+    table_schemas: &[&TableSchema],
+    projections: &[DeferredViewProjection],
+    join_steps: &[DeferredViewJoinStep],
+) -> Vec<DeferredViewTableProjection> {
+    let mut required_columns = table_schemas
+        .iter()
+        .map(|_| BTreeSet::new())
+        .collect::<Vec<_>>();
+    for projection in projections {
+        required_columns[projection.table_index].insert(projection.column_index);
+    }
+    for step in join_steps {
+        required_columns[step.previous_table_index].insert(step.previous_column_index);
+    }
+    table_schemas
+        .iter()
+        .zip(required_columns)
+        .map(|(schema, columns)| DeferredViewTableProjection::new(schema, columns))
+        .collect()
+}
+
+fn build_deferred_view_projection_indexes(
+    projections: &[DeferredViewProjection],
+    table_projections: &[DeferredViewTableProjection],
+    context: &str,
+) -> Result<Vec<(usize, usize)>> {
+    let mut projection_indexes = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let projected_index = table_projections[projection.table_index]
+            .position(projection.column_index)
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "{context} projection is missing required column index {}",
+                    projection.column_index
+                ))
+            })?;
+        projection_indexes.push((projection.table_index, projected_index));
+    }
+    Ok(projection_indexes)
+}
+
+fn collect_deferred_view_projection_values(
+    partial_rows: &[StoredRow],
+    projection_indexes: &[(usize, usize)],
+    context: &str,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(projection_indexes.len());
+    for (table_index, projected_index) in projection_indexes.iter().copied() {
+        let Some(row) = partial_rows.get(table_index) else {
+            return Err(DbError::internal(format!(
+                "{context} row is shorter than planned schema",
+            )));
+        };
+        let Some(value) = row.values.get(projected_index) else {
+            return Err(DbError::internal(format!(
+                "{context} projection row is shorter than planned schema",
+            )));
+        };
+        values.push(value.clone());
+    }
+    Ok(values)
+}
+
+fn collect_deferred_view_projection_values_from_refs(
+    partial_rows: &[&StoredRow],
+    projection_indexes: &[(usize, usize)],
+    context: &str,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(projection_indexes.len());
+    for (table_index, projected_index) in projection_indexes.iter().copied() {
+        let Some(row) = partial_rows.get(table_index) else {
+            return Err(DbError::internal(format!(
+                "{context} row is shorter than planned schema",
+            )));
+        };
+        let Some(value) = row.values.get(projected_index) else {
+            return Err(DbError::internal(format!(
+                "{context} projection row is shorter than planned schema",
+            )));
+        };
+        values.push(value.clone());
+    }
+    Ok(values)
+}
+
 fn table_output_columns(table: &TableSchema, alias: &Option<String>) -> Vec<ColumnBinding> {
     let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
     table
@@ -35718,6 +36429,25 @@ fn apply_simple_projection_postprocessing_with_order(
     offset: usize,
 ) -> Result<QueryResult> {
     if let Some(order_by) = order_by {
+        if let Some(limit) = limit {
+            let bounded_row_count = offset.saturating_add(limit);
+            if bounded_row_count == 0 {
+                return Ok(QueryResult::with_rows(column_names, Vec::new()));
+            }
+            let mut bounded_rows = Vec::with_capacity(rows.len().min(bounded_row_count));
+            for row in rows {
+                push_bounded_projection_ordered_query_row(
+                    runtime,
+                    &mut bounded_rows,
+                    row,
+                    order_by,
+                    bounded_row_count,
+                )?;
+            }
+            sort_query_rows_by_projection_order(runtime, &mut bounded_rows, order_by)?;
+            let rows = bounded_rows.into_iter().skip(offset).take(limit).collect();
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
         sort_query_rows_by_projection_order(runtime, &mut rows, order_by)?;
     }
     let rows = rows

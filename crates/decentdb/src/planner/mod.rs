@@ -35,6 +35,7 @@ pub(crate) fn plan_statement(
 }
 
 pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<PhysicalPlan> {
+    let view_pushdown = simple_view_pushdown_flags(query, catalog);
     let mut plan = plan_query_body(&query.body, catalog)?;
     if !query.order_by.is_empty() {
         plan = maybe_spatial_knn_plan(&plan, query, catalog)
@@ -53,7 +54,105 @@ pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<Physic
             estimate: PlanEstimate::ZERO,
         };
     }
+    if view_pushdown != ViewPushdownFlags::default() {
+        plan = mark_expanded_view_pushdown(plan, view_pushdown);
+    }
     Ok(annotate_plan(plan, catalog))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ViewPushdownFlags {
+    filter: bool,
+    projection: bool,
+    limit: bool,
+}
+
+fn simple_view_pushdown_flags(query: &Query, catalog: &CatalogState) -> ViewPushdownFlags {
+    let QueryBody::Select(select) = &query.body else {
+        return ViewPushdownFlags::default();
+    };
+    let [FromItem::Table { name, .. }] = select.from.as_slice() else {
+        return ViewPushdownFlags::default();
+    };
+    if catalog.view(name).is_none() {
+        return ViewPushdownFlags::default();
+    }
+    let filter = select.filter.is_some();
+    ViewPushdownFlags {
+        filter,
+        projection: select_projection_can_push_into_view(&select.projection),
+        limit: query.limit.is_some()
+            && query.offset.is_none()
+            && query.order_by.is_empty()
+            && !filter,
+    }
+}
+
+fn select_projection_can_push_into_view(projection: &[SelectItem]) -> bool {
+    !projection.is_empty()
+        && projection.iter().all(|item| match item {
+            SelectItem::Expr { expr, .. } => !expr_has_aggregate(expr),
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        })
+}
+
+fn mark_expanded_view_pushdown(plan: PhysicalPlan, flags: ViewPushdownFlags) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Project {
+            input,
+            items,
+            estimate,
+        } => PhysicalPlan::Project {
+            input: Box::new(mark_expanded_view_pushdown(*input, flags)),
+            items,
+            estimate,
+        },
+        PhysicalPlan::Filter {
+            input,
+            predicate,
+            estimate,
+        } => PhysicalPlan::Filter {
+            input: Box::new(mark_expanded_view_pushdown(*input, flags)),
+            predicate,
+            estimate,
+        },
+        PhysicalPlan::Sort {
+            input,
+            order_by,
+            estimate,
+        } => PhysicalPlan::Sort {
+            input: Box::new(mark_expanded_view_pushdown(*input, flags)),
+            order_by,
+            estimate,
+        },
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+            estimate,
+        } => PhysicalPlan::Limit {
+            input: Box::new(mark_expanded_view_pushdown(*input, flags)),
+            limit,
+            offset,
+            estimate,
+        },
+        PhysicalPlan::ExpandedView {
+            name,
+            input,
+            pushed_filter,
+            pushed_projection,
+            pushed_limit,
+            estimate,
+        } => PhysicalPlan::ExpandedView {
+            name,
+            input,
+            pushed_filter: pushed_filter || flags.filter,
+            pushed_projection: pushed_projection || flags.projection,
+            pushed_limit: pushed_limit || flags.limit,
+            estimate,
+        },
+        other => other,
+    }
 }
 
 fn plan_query_body(query: &QueryBody, catalog: &CatalogState) -> Result<PhysicalPlan> {
@@ -2171,7 +2270,7 @@ fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnSchema, ColumnType, IndexColumn, IndexSchema};
+    use crate::catalog::{ColumnSchema, ColumnType, IndexColumn, IndexSchema, ViewSchema};
     use crate::record::value::Value;
     use crate::sql::ast::{SelectItem, UnaryOp};
 
@@ -2291,6 +2390,21 @@ mod tests {
         catalog
     }
 
+    fn catalog_with_artist_view() -> CatalogState {
+        let mut catalog = catalog_with_artist_table();
+        catalog.views.insert(
+            "v_artist".to_string(),
+            ViewSchema {
+                name: "v_artist".to_string(),
+                temporary: false,
+                sql_text: "SELECT Id, NameNormalized FROM Artist".to_string(),
+                column_names: vec!["Id".to_string(), "NameNormalized".to_string()],
+                dependencies: vec!["Artist".to_string()],
+            },
+        );
+        catalog
+    }
+
     fn single_table_select(filter: Expr) -> Select {
         Select {
             distinct: false,
@@ -2341,6 +2455,55 @@ mod tests {
             order_by: vec![],
             within_group: false,
         }
+    }
+
+    #[test]
+    fn explain_plan_renders_expanded_view_for_simple_view_query() {
+        let catalog = catalog_with_artist_view();
+        let statement = parse_sql_statement("SELECT Id FROM v_artist LIMIT 10").expect("parse");
+
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(
+                    "ExpandedView(name=v_artist, pushedFilter=false, pushedProjection=true, pushedLimit=true"
+                )),
+            "expected rendered plan to expose pushed projection and limit on ExpandedView, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("TableScan(table=artist")),
+            "expected rendered expanded view plan to scan the base table, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explain_plan_marks_simple_view_filter_projection_pushdown() {
+        let catalog = catalog_with_artist_view();
+        let statement = parse_sql_statement(
+            "SELECT Id FROM v_artist WHERE NameNormalized = 'MOTLEYCRUE' LIMIT 10",
+        )
+        .expect("parse");
+
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(
+                    "ExpandedView(name=v_artist, pushedFilter=true, pushedProjection=true, pushedLimit=false"
+                )),
+            "expected rendered plan to expose pushed filter/projection and avoid unsafe limit pushdown, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Filter((namenormalized = 'MOTLEYCRUE')")),
+            "expected rendered plan to retain visible outer filter, got: {lines:?}"
+        );
     }
 
     // ── expr_has_aggregate ──────────────────────────────────────────

@@ -184,6 +184,9 @@ impl Row {
         store: Option<&S>,
         projection_indexes: &[usize],
     ) -> Result<Vec<Value>> {
+        if projection_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
         let (field_count, mut offset) = decode_varint_u64(bytes)?;
         let field_count = usize::try_from(field_count)
             .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
@@ -195,6 +198,7 @@ impl Row {
         }
 
         let mut projected: Vec<Option<Value>> = vec![None; projection_indexes.len()];
+        let mut remaining = projection_indexes.len();
         for field_index in 0..field_count {
             let tag = *bytes
                 .get(offset)
@@ -222,11 +226,16 @@ impl Row {
                         .ok_or_else(|| DbError::internal("projected row value missing"))?
                         .clone();
                     projected[projection_offset] = Some(value);
+                    remaining = remaining.saturating_sub(1);
                 } else {
                     projected[projection_offset] =
                         Some(Self::decode_value_with_overflow(tag, payload, store)?);
+                    remaining = remaining.saturating_sub(1);
                     first_projection_offset = Some(projection_offset);
                 }
+            }
+            if remaining == 0 {
+                break;
             }
         }
 
