@@ -2806,7 +2806,10 @@ class Cursor:
         bind_int64 = self._lib.ddb_stmt_bind_int64
         bind_float64 = self._lib.ddb_stmt_bind_float64
         bind_text = self._lib.ddb_stmt_bind_text
+        fetch_stmt_affected_rows = self._lib.ddb_stmt_affected_rows
         err_ok = ERR_OK
+        affected = ctypes.c_uint64()
+        affected_byref = byref(affected)
 
         def bind_row_fast(params):
             for i, param in enumerate(params, start=1):
@@ -2830,8 +2833,7 @@ class Cursor:
                     _raise_error(code, sql=sql, params=params)
 
         def fetch_affected_rows(params):
-            affected = ctypes.c_uint64()
-            code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
+            code = fetch_stmt_affected_rows(self._stmt, affected_byref)
             if code != err_ok:
                 _raise_error(code, sql=sql, params=params)
             return int(affected.value)
