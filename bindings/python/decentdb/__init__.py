@@ -2832,7 +2832,7 @@ class Cursor:
         def fetch_affected_rows(params):
             affected = ctypes.c_uint64()
             code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
-            if code != ERR_OK:
+            if code != err_ok:
                 _raise_error(code, sql=sql, params=params)
             return int(affected.value)
 
