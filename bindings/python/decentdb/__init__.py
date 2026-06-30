@@ -2829,10 +2829,19 @@ class Cursor:
                 if code != err_ok:
                     _raise_error(code, sql=sql, params=params)
 
+        def fetch_affected_rows(params):
+            affected = ctypes.c_uint64()
+            code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            return int(affected.value)
+
+        total_affected = 0
         bind_row_fast(normalized_first)
         code = step_stmt(self._stmt, byref(step_out))
         if code != ERR_OK:
             _raise_error(code, sql=sql, params=normalized_first)
+        total_affected += fetch_affected_rows(normalized_first)
         self._bound_param_count = expected_count
 
         if "?" in operation:
@@ -2855,6 +2864,7 @@ class Cursor:
                 code = step_stmt(self._stmt, byref(step_out))
                 if code != ERR_OK:
                     _raise_error(code, sql=sql, params=params)
+                total_affected += fetch_affected_rows(params)
         else:
             for params in iterator:
                 if isinstance(params, Mapping):
@@ -2879,6 +2889,7 @@ class Cursor:
                 code = step_stmt(self._stmt, byref(step_out))
                 if code != ERR_OK:
                     _raise_error(code, sql=sql, params=params)
+                total_affected += fetch_affected_rows(params)
 
         count = ctypes.c_size_t()
         code = self._lib.ddb_stmt_column_count(self._stmt, ctypes.byref(count))
@@ -2898,11 +2909,7 @@ class Cursor:
         self._store_cached_non_query_metadata(sql)
         self._query_active = False
         self._has_buffered_row = False
-        affected = ctypes.c_uint64()
-        code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
-        if code != ERR_OK:
-            _raise_error(code, sql=sql, params=None)
-        self.rowcount = int(affected.value)
+        self.rowcount = total_affected
         return self
 
     def _decode_current_row(self):
