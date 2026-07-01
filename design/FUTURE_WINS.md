@@ -128,9 +128,9 @@ Status values:
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments. The
-current public release in this repository is `2.16.0`, and the current
-planning release bucket in this repository is `2.16.0`. `vNext` means
-the first release bucket after `2.16.0` only when scope is explicitly accepted.
+current public release in this repository is `2.16.1`, and the current
+planning release bucket in this repository is `2.16.1`. `vNext` means
+the first release bucket after `2.16.1` only when scope is explicitly accepted.
 `vNext+1` and `vNext+2` are follow-on planning buckets, not exact semantic
 versions.
 

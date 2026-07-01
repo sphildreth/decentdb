@@ -62,6 +62,7 @@ tests/bindings/**/*.node
 /bindings/**/test-results/
 /bindings/**/target/
 /bindings/**/node_modules/
+/bindings/**/.tmp/
 /bindings/**/.dart_tool/
 /bindings/**/.pub/
 /bindings/**/.pub-cache/

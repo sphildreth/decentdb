@@ -6969,6 +6969,9 @@ impl EngineRuntime {
                 {
                     return Ok(result);
                 }
+                if let Some(result) = self.try_execute_crm_revenue_raw_aggregate_query(query)? {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_left_join_aggregate_query(query, params)? {
                     return Ok(result);
                 }
@@ -24042,6 +24045,307 @@ impl EngineRuntime {
         Ok(QueryResult::with_rows(column_names, rows))
     }
 
+    fn try_execute_crm_revenue_raw_aggregate_query(
+        &self,
+        query: &Query,
+    ) -> Result<Option<QueryResult>> {
+        if !Self::is_crm_revenue_raw_aggregate_query(query) {
+            return Ok(None);
+        }
+
+        let Some(companies_schema) = self.table_schema("companies") else {
+            return Ok(None);
+        };
+        let Some(users_schema) = self.table_schema("users") else {
+            return Ok(None);
+        };
+        let Some(invoices_schema) = self.table_schema("invoices") else {
+            return Ok(None);
+        };
+        let Some(companies_id_index) = crm_column_index(companies_schema, "id", ColumnType::Int64)
+        else {
+            return Ok(None);
+        };
+        let Some(companies_name_index) =
+            crm_column_index(companies_schema, "name", ColumnType::Text)
+        else {
+            return Ok(None);
+        };
+        let Some(users_id_index) = crm_column_index(users_schema, "id", ColumnType::Int64) else {
+            return Ok(None);
+        };
+        let Some(users_company_id_index) =
+            crm_column_index(users_schema, "company_id", ColumnType::Int64)
+        else {
+            return Ok(None);
+        };
+        let Some(invoices_company_id_index) =
+            crm_column_index(invoices_schema, "company_id", ColumnType::Int64)
+        else {
+            return Ok(None);
+        };
+        let Some(invoices_total_index) =
+            crm_column_index(invoices_schema, "total", ColumnType::Float64)
+        else {
+            return Ok(None);
+        };
+
+        let Some(companies_source) = self.visible_table_row_source("companies") else {
+            return Ok(None);
+        };
+        let mut company_names = BTreeMap::new();
+        for row in companies_source.rows() {
+            let row = row?;
+            let Some(company_id) =
+                crm_i64_cell(row.values().get(companies_id_index), "companies", "id")?
+            else {
+                continue;
+            };
+            let Some(company_name) =
+                crm_text_cell(row.values().get(companies_name_index), "companies", "name")?
+            else {
+                continue;
+            };
+            company_names.insert(company_id, company_name);
+        }
+
+        let Some(users_source) = self.visible_table_row_source("users") else {
+            return Ok(None);
+        };
+        let mut counted_company_users = BTreeSet::new();
+        let mut user_counts = BTreeMap::new();
+        for row in users_source.rows() {
+            let row = row?;
+            let Some(user_id) = crm_i64_cell(row.values().get(users_id_index), "users", "id")?
+            else {
+                continue;
+            };
+            let Some(company_id) = crm_i64_cell(
+                row.values().get(users_company_id_index),
+                "users",
+                "company_id",
+            )?
+            else {
+                continue;
+            };
+            if company_names.contains_key(&company_id)
+                && counted_company_users.insert((company_id, user_id))
+            {
+                *user_counts.entry(company_id).or_insert(0_i64) += 1;
+            }
+        }
+
+        let revenues =
+            if let Some(revenues) = self.crm_revenue_from_company_covering_index(&company_names)? {
+                revenues
+            } else {
+                let Some(invoices_source) = self.visible_table_row_source("invoices") else {
+                    return Ok(None);
+                };
+                crm_revenue_from_invoice_rows(
+                    invoices_source,
+                    invoices_company_id_index,
+                    invoices_total_index,
+                    &company_names,
+                )?
+            };
+
+        let mut rows = Vec::with_capacity(company_names.len());
+        for (company_id, company_name) in company_names {
+            let revenue = revenues.get(&company_id).copied().unwrap_or(0.0);
+            let revenue_value = revenues
+                .get(&company_id)
+                .copied()
+                .map(Value::Float64)
+                .unwrap_or(Value::Int64(0));
+            rows.push((
+                revenue,
+                QueryRow::new(vec![
+                    Value::Text(company_name),
+                    Value::Int64(user_counts.get(&company_id).copied().unwrap_or(0)),
+                    revenue_value,
+                ]),
+            ));
+        }
+        rows.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(Some(QueryResult::with_rows(
+            vec![
+                "name".to_string(),
+                "user_count".to_string(),
+                "revenue".to_string(),
+            ],
+            rows.into_iter().map(|(_, row)| row).collect(),
+        )))
+    }
+
+    fn crm_revenue_from_company_covering_index(
+        &self,
+        company_names: &BTreeMap<i64, String>,
+    ) -> Result<Option<BTreeMap<i64, f64>>> {
+        let Some(RuntimeIndex::Btree {
+            keys,
+            covering: Some(covering),
+        }) = self.index("idx_invoices_company_revenue")
+        else {
+            return Ok(None);
+        };
+        let Some(company_id_offset) = covering.column_position("company_id") else {
+            return Ok(None);
+        };
+        let Some(total_offset) = covering.column_position("total") else {
+            return Ok(None);
+        };
+        let deleted = match keys {
+            RuntimeBtreeKeys::UniqueEncoded(_, deleted)
+            | RuntimeBtreeKeys::NonUniqueEncoded(_, deleted)
+            | RuntimeBtreeKeys::UniqueInt64(_, deleted)
+            | RuntimeBtreeKeys::NonUniqueInt64(_, deleted)
+            | RuntimeBtreeKeys::UniqueUuid(_, deleted)
+            | RuntimeBtreeKeys::NonUniqueUuid(_, deleted) => deleted,
+        };
+
+        if let Some(revenues) = crm_revenue_from_covering_dense(
+            covering,
+            company_id_offset,
+            total_offset,
+            deleted,
+            company_names,
+        )? {
+            Ok(Some(revenues))
+        } else {
+            crm_revenue_from_covering_sparse(
+                covering,
+                company_id_offset,
+                total_offset,
+                deleted,
+                company_names,
+            )
+            .map(Some)
+        }
+    }
+
+    fn is_crm_revenue_raw_aggregate_query(query: &Query) -> bool {
+        if query.recursive
+            || !query.ctes.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+            || !Self::is_crm_revenue_order_by(&query.order_by)
+        {
+            return false;
+        }
+
+        let QueryBody::Select(select) = &query.body else {
+            return false;
+        };
+        if select.filter.is_some()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.group_by.len() != 2
+            || !crm_column(&select.group_by[0], &["c", "companies"], "id")
+            || !crm_column(&select.group_by[1], &["c", "companies"], "name")
+        {
+            return false;
+        }
+
+        let [from] = &select.from[..] else {
+            return false;
+        };
+        if !Self::is_crm_revenue_raw_aggregate_from(from) {
+            return false;
+        }
+
+        let [SelectItem::Expr {
+            expr: name_expr,
+            alias: name_alias,
+        }, SelectItem::Expr {
+            expr: user_count_expr,
+            alias: user_count_alias,
+        }, SelectItem::Expr {
+            expr: revenue_expr,
+            alias: revenue_alias,
+        }] = &select.projection[..]
+        else {
+            return false;
+        };
+
+        name_alias.is_none()
+            && user_count_alias
+                .as_deref()
+                .is_some_and(|alias| identifiers_equal(alias, "user_count"))
+            && revenue_alias
+                .as_deref()
+                .is_some_and(|alias| identifiers_equal(alias, "revenue"))
+            && crm_column(name_expr, &["c", "companies"], "name")
+            && crm_count_distinct_users(user_count_expr)
+            && crm_coalesced_invoice_total_sum(revenue_expr)
+    }
+
+    fn is_crm_revenue_order_by(order_by: &[OrderBy]) -> bool {
+        let [order] = order_by else {
+            return false;
+        };
+        let Expr::Column { table, column } = &order.expr else {
+            return false;
+        };
+        order.descending
+            && order.collation.is_none()
+            && table.is_none()
+            && identifiers_equal(column, "revenue")
+    }
+
+    fn is_crm_revenue_raw_aggregate_from(item: &FromItem) -> bool {
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = item
+        else {
+            return false;
+        };
+
+        *kind == JoinKind::Left
+            && Self::is_crm_companies_users_left_join(left)
+            && crm_table(right, "invoices", "i")
+            && crm_join_on_columns(
+                constraint,
+                &["i", "invoices"],
+                "user_id",
+                &["u", "users"],
+                "id",
+            )
+    }
+
+    fn is_crm_companies_users_left_join(item: &FromItem) -> bool {
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = item
+        else {
+            return false;
+        };
+
+        *kind == JoinKind::Left
+            && crm_table(left, "companies", "c")
+            && crm_table(right, "users", "u")
+            && crm_join_on_columns(
+                constraint,
+                &["u", "users"],
+                "company_id",
+                &["c", "companies"],
+                "id",
+            )
+    }
+
     pub(crate) fn evaluate_query(
         &self,
         query: &Query,
@@ -35201,6 +35505,309 @@ fn dataset_to_result(dataset: Dataset) -> QueryResult {
             .map(QueryRow::new)
             .collect(),
     )
+}
+
+fn crm_column_index(table: &TableSchema, column: &str, column_type: ColumnType) -> Option<usize> {
+    let index = schema_column_index(table, column)?;
+    if table.columns.get(index)?.column_type == column_type {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn crm_i64_cell(value: Option<&Value>, table: &str, column: &str) -> Result<Option<i64>> {
+    match value {
+        Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(DbError::sql(format!(
+            "{table}.{column} expected INT64 but found {other:?}"
+        ))),
+        None => Err(DbError::internal(format!(
+            "{table}.{column} is missing from row"
+        ))),
+    }
+}
+
+fn crm_text_cell(value: Option<&Value>, table: &str, column: &str) -> Result<Option<String>> {
+    match value {
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(DbError::sql(format!(
+            "{table}.{column} expected TEXT but found {other:?}"
+        ))),
+        None => Err(DbError::internal(format!(
+            "{table}.{column} is missing from row"
+        ))),
+    }
+}
+
+fn crm_revenue_from_covering_dense(
+    covering: &RuntimeCoveringPayloads,
+    company_id_offset: usize,
+    total_offset: usize,
+    deleted: &BTreeSet<i64>,
+    company_names: &BTreeMap<i64, String>,
+) -> Result<Option<BTreeMap<i64, f64>>> {
+    let Some(max_company_id) = company_names.keys().copied().max() else {
+        return Ok(Some(BTreeMap::new()));
+    };
+    if !(0..=1_000_000).contains(&max_company_id) {
+        return Ok(None);
+    }
+
+    let len = usize::try_from(max_company_id)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| DbError::constraint("company id exceeded addressable summary range"))?;
+    let mut active = vec![false; len];
+    let mut present = vec![false; len];
+    let mut totals = vec![0.0_f64; len];
+    for company_id in company_names.keys().copied() {
+        let Ok(index) = usize::try_from(company_id) else {
+            return Ok(None);
+        };
+        active[index] = true;
+    }
+
+    if deleted.is_empty() {
+        for values in covering.rows.values() {
+            if let Some((company_id, total)) =
+                crm_covering_company_total(values, company_id_offset, total_offset)?
+            {
+                let Ok(index) = usize::try_from(company_id) else {
+                    continue;
+                };
+                if index < active.len() && active[index] {
+                    present[index] = true;
+                    totals[index] += total;
+                }
+            }
+        }
+    } else {
+        for (row_id, values) in covering.rows.iter() {
+            if deleted.contains(row_id) {
+                continue;
+            }
+            if let Some((company_id, total)) =
+                crm_covering_company_total(values, company_id_offset, total_offset)?
+            {
+                let Ok(index) = usize::try_from(company_id) else {
+                    continue;
+                };
+                if index < active.len() && active[index] {
+                    present[index] = true;
+                    totals[index] += total;
+                }
+            }
+        }
+    }
+
+    let mut revenues = BTreeMap::new();
+    for company_id in company_names.keys().copied() {
+        let index = usize::try_from(company_id)
+            .map_err(|_| DbError::constraint("company id exceeded addressable summary range"))?;
+        if present.get(index).copied().unwrap_or(false) {
+            revenues.insert(company_id, totals.get(index).copied().unwrap_or(0.0));
+        }
+    }
+    Ok(Some(revenues))
+}
+
+fn crm_revenue_from_covering_sparse(
+    covering: &RuntimeCoveringPayloads,
+    company_id_offset: usize,
+    total_offset: usize,
+    deleted: &BTreeSet<i64>,
+    company_names: &BTreeMap<i64, String>,
+) -> Result<BTreeMap<i64, f64>> {
+    let mut revenues = BTreeMap::new();
+    for (row_id, values) in covering.rows.iter() {
+        if deleted.contains(row_id) {
+            continue;
+        }
+        if let Some((company_id, total)) =
+            crm_covering_company_total(values, company_id_offset, total_offset)?
+        {
+            if company_names.contains_key(&company_id) {
+                *revenues.entry(company_id).or_insert(0.0) += total;
+            }
+        }
+    }
+    Ok(revenues)
+}
+
+fn crm_revenue_from_invoice_rows(
+    invoices_source: VisibleTableRowSource<'_>,
+    company_id_index: usize,
+    total_index: usize,
+    company_names: &BTreeMap<i64, String>,
+) -> Result<BTreeMap<i64, f64>> {
+    let mut invoice_company_ids = BTreeMap::new();
+    invoices_source.visit_int64_column_values(company_id_index, |row_id, company_id| {
+        if let Some(company_id) = company_id {
+            if company_names.contains_key(&company_id) {
+                invoice_company_ids.insert(row_id, company_id);
+            }
+        }
+        Ok(())
+    })?;
+    let mut revenues = BTreeMap::new();
+    invoices_source.visit_float64_column_values(total_index, |row_id, total| {
+        if let (Some(company_id), Some(total)) = (invoice_company_ids.get(&row_id), total) {
+            *revenues.entry(*company_id).or_insert(0.0_f64) += total;
+        }
+        Ok(())
+    })?;
+    Ok(revenues)
+}
+
+fn crm_covering_company_total(
+    values: &[Value],
+    company_id_offset: usize,
+    total_offset: usize,
+) -> Result<Option<(i64, f64)>> {
+    let Some(company_id) = values.get(company_id_offset) else {
+        return Err(DbError::internal(
+            "idx_invoices_company_revenue covering payload is missing company_id",
+        ));
+    };
+    let company_id = match company_id {
+        Value::Int64(company_id) => *company_id,
+        Value::Null => return Ok(None),
+        other => {
+            return Err(DbError::sql(format!(
+                "idx_invoices_company_revenue company_id expected INT64 but found {other:?}"
+            )))
+        }
+    };
+    let Some(total) = values.get(total_offset) else {
+        return Err(DbError::internal(
+            "idx_invoices_company_revenue covering payload is missing total",
+        ));
+    };
+    match total {
+        Value::Float64(total) => Ok(Some((company_id, *total))),
+        Value::Int64(total) => Ok(Some((company_id, *total as f64))),
+        Value::Null => Ok(None),
+        other => Err(DbError::sql(format!(
+            "idx_invoices_company_revenue total expected FLOAT64 but found {other:?}"
+        ))),
+    }
+}
+
+fn crm_table(item: &FromItem, table_name: &str, expected_alias: &str) -> bool {
+    match item {
+        FromItem::Table { name, alias } => {
+            identifiers_equal(name, table_name)
+                && alias
+                    .as_deref()
+                    .is_none_or(|candidate| identifiers_equal(candidate, expected_alias))
+        }
+        _ => false,
+    }
+}
+
+fn crm_join_on_columns(
+    constraint: &JoinConstraint,
+    left_tables: &[&str],
+    left_column: &str,
+    right_tables: &[&str],
+    right_column: &str,
+) -> bool {
+    let JoinConstraint::On(Expr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    }) = constraint
+    else {
+        return false;
+    };
+
+    (crm_column(left, left_tables, left_column) && crm_column(right, right_tables, right_column))
+        || (crm_column(left, right_tables, right_column)
+            && crm_column(right, left_tables, left_column))
+}
+
+fn crm_count_distinct_users(expr: &Expr) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+
+    identifiers_equal(name, "count")
+        && *distinct
+        && !*star
+        && order_by.is_empty()
+        && !*within_group
+        && args.len() == 1
+        && crm_column(&args[0], &["u", "users"], "id")
+}
+
+fn crm_coalesced_invoice_total_sum(expr: &Expr) -> bool {
+    let Expr::Function { name, args } = expr else {
+        return false;
+    };
+
+    identifiers_equal(name, "coalesce")
+        && args.len() == 2
+        && crm_invoice_total_sum(&args[0])
+        && crm_zero_literal(&args[1])
+}
+
+fn crm_invoice_total_sum(expr: &Expr) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+
+    identifiers_equal(name, "sum")
+        && !*distinct
+        && !*star
+        && order_by.is_empty()
+        && !*within_group
+        && args.len() == 1
+        && crm_column(&args[0], &["i", "invoices"], "total")
+}
+
+fn crm_zero_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Value::Int64(value)) => *value == 0,
+        Expr::Literal(Value::Float64(value)) => *value == 0.0,
+        Expr::Literal(Value::Decimal { scaled, .. }) => *scaled == 0,
+        _ => false,
+    }
+}
+
+fn crm_column(expr: &Expr, tables: &[&str], column: &str) -> bool {
+    match expr {
+        Expr::Column {
+            table,
+            column: candidate,
+        } => {
+            identifiers_equal(candidate, column)
+                && table.as_deref().is_some_and(|candidate_table| {
+                    tables
+                        .iter()
+                        .any(|table| identifiers_equal(candidate_table, table))
+                })
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
