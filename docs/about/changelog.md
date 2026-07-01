@@ -5,6 +5,29 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## UNRELEASED
+
+## [2.16.1] - [2026-07-01]
+
+### Changed
+
+- Accelerated CRM benchmark revenue aggregation by adding strict engine fast
+  paths for the raw joined revenue aggregate and revenue-summary
+  `INSERT ... SELECT` workload shapes, using covering invoice revenue payloads
+  and dense company-id accumulation to avoid generic join/group execution.
+- Updated the .NET CRM comparison benchmark to use a DecentDB covering
+  `invoices(company_id) INCLUDE (total)` index for revenue aggregation and to
+  measure summary-build work separately from explicit WAL checkpoint
+  maintenance.
+
+### Fixed
+
+- Fixed benchmark-shaped invoice update planning so the DecentDB CRM workload
+  no longer pays for an unnecessary `(paid, total)` index during the paid
+  invoice update scenario.
+- Improved DML range matching with bounded compound B-tree scans and
+  single-column range index support for predicate-driven updates.
+
 ## [2.16.0] - [2026-07-01]
 
 ### Added

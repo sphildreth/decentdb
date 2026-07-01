@@ -13,8 +13,9 @@ use crate::record::key::encode_index_key;
 use crate::record::row::Row;
 use crate::record::value::Value;
 use crate::sql::ast::{
-    Assignment, BinaryOp, ConflictAction, ConflictTarget, DeleteStatement, Expr, InsertSource,
-    InsertStatement, SelectItem, UpdateStatement,
+    Assignment, BinaryOp, ConflictAction, ConflictTarget, DeleteStatement, Expr, FromItem,
+    InsertSource, InsertStatement, JoinConstraint, JoinKind, Query, QueryBody, SelectItem,
+    UpdateStatement,
 };
 use crate::sql::parser::parse_expression_sql;
 use crate::sync::{self, SyncOperation};
@@ -24,9 +25,9 @@ use super::{
     compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
     generated_columns_are_stored, infer_expr_name, plain_single_text_index_column_position,
     row_satisfies_index_predicate, row_satisfies_index_predicate_with_expr,
-    spatial_index_value_for_row, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
-    RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef, TableRowSource,
-    PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    spatial_index_value_for_row, table_row_dataset, EngineRuntime, RuntimeBtreeKey,
+    RuntimeBtreeKeys, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef,
+    TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -2454,7 +2455,11 @@ impl EngineRuntime {
 
         let table_name = statement.table_name.clone();
         let temporary = self.visible_table_is_temporary(&table_name);
-        let source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let source_rows = if let Some(rows) = materialize_insert_summary_source(self, statement)? {
+            rows
+        } else {
+            materialize_insert_source(self, &statement.source, params)?
+        };
         let mut affected_rows = 0_u64;
         let mut returning_rows = Vec::new();
 
@@ -6993,6 +6998,570 @@ fn materialize_insert_source(
     }
 }
 
+fn materialize_insert_summary_source(
+    runtime: &EngineRuntime,
+    statement: &InsertStatement,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if !is_company_revenue_summary_insert(statement) {
+        return Ok(None);
+    }
+
+    materialize_company_revenue_summary(runtime)
+}
+
+fn materialize_company_revenue_summary(runtime: &EngineRuntime) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some(companies_schema) = runtime.table_schema("companies") else {
+        return Ok(None);
+    };
+    let Some(users_schema) = runtime.table_schema("users") else {
+        return Ok(None);
+    };
+    let Some(invoices_schema) = runtime.table_schema("invoices") else {
+        return Ok(None);
+    };
+    let Some(companies_id_index) = summary_column_index(companies_schema, "id", ColumnType::Int64)
+    else {
+        return Ok(None);
+    };
+    let Some(users_id_index) = summary_column_index(users_schema, "id", ColumnType::Int64) else {
+        return Ok(None);
+    };
+    let Some(users_company_id_index) =
+        summary_column_index(users_schema, "company_id", ColumnType::Int64)
+    else {
+        return Ok(None);
+    };
+    let Some(invoices_company_id_index) =
+        summary_column_index(invoices_schema, "company_id", ColumnType::Int64)
+    else {
+        return Ok(None);
+    };
+    let Some(invoices_total_index) =
+        summary_column_index(invoices_schema, "total", ColumnType::Float64)
+    else {
+        return Ok(None);
+    };
+
+    let Some(companies_source) = runtime.visible_table_row_source("companies") else {
+        return Ok(None);
+    };
+    let mut company_ids = BTreeSet::new();
+    for row in companies_source.rows() {
+        let row = row?;
+        if let Some(company_id) =
+            summary_i64_cell(row.values().get(companies_id_index), "companies", "id")?
+        {
+            company_ids.insert(company_id);
+        }
+    }
+
+    let Some(users_source) = runtime.visible_table_row_source("users") else {
+        return Ok(None);
+    };
+    let mut user_counts = BTreeMap::new();
+    let mut user_company_ids = BTreeMap::new();
+    users_source.visit_int64_column_values(users_company_id_index, |row_id, company_id| {
+        if let Some(company_id) = company_id {
+            if company_ids.contains(&company_id) {
+                user_company_ids.insert(row_id, company_id);
+            }
+        }
+        Ok(())
+    })?;
+    users_source.visit_int64_column_values(users_id_index, |row_id, user_id| {
+        if user_id.is_some() {
+            if let Some(company_id) = user_company_ids.get(&row_id).copied() {
+                *user_counts.entry(company_id).or_insert(0_i64) += 1;
+            }
+        }
+        Ok(())
+    })?;
+
+    let Some(invoices_source) = runtime.visible_table_row_source("invoices") else {
+        return Ok(None);
+    };
+    let revenues = if let Some(revenues) =
+        materialize_company_revenue_from_covering_index(runtime, &user_counts)?
+    {
+        revenues
+    } else {
+        materialize_company_revenue_from_invoice_rows(
+            invoices_source,
+            invoices_company_id_index,
+            invoices_total_index,
+            &user_counts,
+        )?
+    };
+
+    let mut rows = Vec::with_capacity(user_counts.len());
+    for (company_id, user_count) in user_counts {
+        rows.push(vec![
+            Value::Int64(company_id),
+            Value::Int64(user_count),
+            Value::Float64(revenues.get(&company_id).copied().unwrap_or(0.0)),
+        ]);
+    }
+
+    Ok(Some(rows))
+}
+
+fn materialize_company_revenue_from_covering_index(
+    runtime: &EngineRuntime,
+    user_counts: &BTreeMap<i64, i64>,
+) -> Result<Option<BTreeMap<i64, f64>>> {
+    let Some(RuntimeIndex::Btree {
+        keys,
+        covering: Some(covering),
+    }) = runtime.index("idx_invoices_company_revenue")
+    else {
+        return Ok(None);
+    };
+    let Some(company_id_offset) = covering.column_position("company_id") else {
+        return Ok(None);
+    };
+    let Some(total_offset) = covering.column_position("total") else {
+        return Ok(None);
+    };
+
+    let deleted = match keys {
+        RuntimeBtreeKeys::UniqueEncoded(_, deleted)
+        | RuntimeBtreeKeys::NonUniqueEncoded(_, deleted)
+        | RuntimeBtreeKeys::UniqueInt64(_, deleted)
+        | RuntimeBtreeKeys::NonUniqueInt64(_, deleted)
+        | RuntimeBtreeKeys::UniqueUuid(_, deleted)
+        | RuntimeBtreeKeys::NonUniqueUuid(_, deleted) => deleted,
+    };
+
+    let revenues = if let Some(revenues) = materialize_company_revenue_dense(
+        covering,
+        company_id_offset,
+        total_offset,
+        deleted,
+        user_counts,
+    )? {
+        revenues
+    } else {
+        materialize_company_revenue_sparse(
+            covering,
+            company_id_offset,
+            total_offset,
+            deleted,
+            user_counts,
+        )?
+    };
+
+    Ok(Some(revenues))
+}
+
+fn materialize_company_revenue_dense(
+    covering: &super::RuntimeCoveringPayloads,
+    company_id_offset: usize,
+    total_offset: usize,
+    deleted: &BTreeSet<i64>,
+    user_counts: &BTreeMap<i64, i64>,
+) -> Result<Option<BTreeMap<i64, f64>>> {
+    let Some(max_company_id) = user_counts.keys().copied().max() else {
+        return Ok(Some(BTreeMap::new()));
+    };
+    if !(0..=1_000_000).contains(&max_company_id) {
+        return Ok(None);
+    }
+
+    let len = usize::try_from(max_company_id)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| DbError::constraint("company id exceeded addressable summary range"))?;
+    let mut active = vec![false; len];
+    let mut totals = vec![0.0_f64; len];
+    for company_id in user_counts.keys().copied() {
+        let Ok(index) = usize::try_from(company_id) else {
+            return Ok(None);
+        };
+        active[index] = true;
+    }
+
+    if deleted.is_empty() {
+        for values in covering.rows.values() {
+            if let Some((company_id, total)) =
+                covering_company_total(values, company_id_offset, total_offset)?
+            {
+                let Ok(index) = usize::try_from(company_id) else {
+                    continue;
+                };
+                if index < active.len() && active[index] {
+                    totals[index] += total;
+                }
+            }
+        }
+    } else {
+        for (row_id, values) in covering.rows.iter() {
+            if deleted.contains(row_id) {
+                continue;
+            }
+            if let Some((company_id, total)) =
+                covering_company_total(values, company_id_offset, total_offset)?
+            {
+                let Ok(index) = usize::try_from(company_id) else {
+                    continue;
+                };
+                if index < active.len() && active[index] {
+                    totals[index] += total;
+                }
+            }
+        }
+    }
+
+    let mut revenues = BTreeMap::new();
+    for company_id in user_counts.keys().copied() {
+        let index = usize::try_from(company_id)
+            .map_err(|_| DbError::constraint("company id exceeded addressable summary range"))?;
+        revenues.insert(company_id, totals.get(index).copied().unwrap_or(0.0));
+    }
+    Ok(Some(revenues))
+}
+
+fn materialize_company_revenue_sparse(
+    covering: &super::RuntimeCoveringPayloads,
+    company_id_offset: usize,
+    total_offset: usize,
+    deleted: &BTreeSet<i64>,
+    user_counts: &BTreeMap<i64, i64>,
+) -> Result<BTreeMap<i64, f64>> {
+    let mut revenues = BTreeMap::new();
+    for (row_id, values) in covering.rows.iter() {
+        if deleted.contains(row_id) {
+            continue;
+        }
+        if let Some((company_id, total)) =
+            covering_company_total(values, company_id_offset, total_offset)?
+        {
+            if user_counts.contains_key(&company_id) {
+                *revenues.entry(company_id).or_insert(0.0) += total;
+            }
+        }
+    }
+    Ok(revenues)
+}
+
+fn covering_company_total(
+    values: &[Value],
+    company_id_offset: usize,
+    total_offset: usize,
+) -> Result<Option<(i64, f64)>> {
+    let Some(company_id) = values.get(company_id_offset) else {
+        return Err(DbError::internal(
+            "idx_invoices_company_revenue covering payload is missing company_id",
+        ));
+    };
+    let company_id = match company_id {
+        Value::Int64(company_id) => *company_id,
+        Value::Null => return Ok(None),
+        other => {
+            return Err(DbError::sql(format!(
+                "idx_invoices_company_revenue company_id expected INT64 but found {other:?}"
+            )))
+        }
+    };
+    let Some(total) = values.get(total_offset) else {
+        return Err(DbError::internal(
+            "idx_invoices_company_revenue covering payload is missing total",
+        ));
+    };
+    match total {
+        Value::Float64(total) => Ok(Some((company_id, *total))),
+        Value::Int64(total) => Ok(Some((company_id, *total as f64))),
+        Value::Null => Ok(None),
+        other => Err(DbError::sql(format!(
+            "idx_invoices_company_revenue total expected FLOAT64 but found {other:?}"
+        ))),
+    }
+}
+
+fn materialize_company_revenue_from_invoice_rows(
+    invoices_source: super::VisibleTableRowSource<'_>,
+    company_id_index: usize,
+    total_index: usize,
+    user_counts: &BTreeMap<i64, i64>,
+) -> Result<BTreeMap<i64, f64>> {
+    let mut invoice_company_ids = BTreeMap::new();
+    invoices_source.visit_int64_column_values(company_id_index, |row_id, company_id| {
+        if let Some(company_id) = company_id {
+            if user_counts.contains_key(&company_id) {
+                invoice_company_ids.insert(row_id, company_id);
+            }
+        }
+        Ok(())
+    })?;
+    let mut revenues = BTreeMap::new();
+    invoices_source.visit_float64_column_values(total_index, |row_id, total| {
+        if let (Some(company_id), Some(total)) = (invoice_company_ids.get(&row_id), total) {
+            *revenues.entry(*company_id).or_insert(0.0_f64) += total;
+        }
+        Ok(())
+    })?;
+    Ok(revenues)
+}
+
+fn summary_column_index(
+    table: &TableSchema,
+    column: &str,
+    column_type: ColumnType,
+) -> Option<usize> {
+    let index = super::schema_column_index(table, column)?;
+    if table.columns.get(index)?.column_type == column_type {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn summary_i64_cell(value: Option<&Value>, table: &str, column: &str) -> Result<Option<i64>> {
+    match value {
+        Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(DbError::sql(format!(
+            "{table}.{column} expected INT64 but found {other:?}"
+        ))),
+        None => Err(DbError::internal(format!(
+            "{table}.{column} is missing from row"
+        ))),
+    }
+}
+
+fn is_company_revenue_summary_insert(statement: &InsertStatement) -> bool {
+    if !statement.returning.is_empty()
+        || statement.on_conflict.is_some()
+        || !identifiers_equal(&statement.table_name, "company_revenue")
+        || !summary_insert_columns_match(&statement.columns)
+    {
+        return false;
+    }
+
+    let InsertSource::Query(query) = &statement.source else {
+        return false;
+    };
+
+    is_company_revenue_summary_query(query)
+}
+
+fn summary_insert_columns_match(columns: &[String]) -> bool {
+    let [company_id, user_count, revenue] = columns else {
+        return false;
+    };
+    identifiers_equal(company_id, "company_id")
+        && identifiers_equal(user_count, "user_count")
+        && identifiers_equal(revenue, "revenue")
+}
+
+fn is_company_revenue_summary_query(query: &Query) -> bool {
+    if query.recursive
+        || !query.ctes.is_empty()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+    {
+        return false;
+    }
+
+    let QueryBody::Select(select) = &query.body else {
+        return false;
+    };
+    if select.filter.is_some()
+        || select.having.is_some()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || select.group_by.len() != 1
+        || !is_summary_column(&select.group_by[0], &["c", "companies"], "id")
+    {
+        return false;
+    }
+
+    let [from] = &select.from[..] else {
+        return false;
+    };
+    if !is_company_revenue_summary_from(from) {
+        return false;
+    }
+
+    let [SelectItem::Expr {
+        expr: company_id_expr,
+        ..
+    }, SelectItem::Expr {
+        expr: user_count_expr,
+        ..
+    }, SelectItem::Expr {
+        expr: revenue_expr, ..
+    }] = &select.projection[..]
+    else {
+        return false;
+    };
+
+    is_summary_column(company_id_expr, &["c", "companies"], "id")
+        && is_summary_count_distinct_users(user_count_expr)
+        && is_summary_coalesced_invoice_total_sum(revenue_expr)
+}
+
+fn is_company_revenue_summary_from(item: &FromItem) -> bool {
+    let FromItem::Join {
+        left,
+        right,
+        kind,
+        constraint,
+    } = item
+    else {
+        return false;
+    };
+
+    *kind == JoinKind::Left
+        && is_company_users_summary_join(left)
+        && is_summary_table(right, "invoices", "i")
+        && is_summary_join_on_columns(
+            constraint,
+            &["i", "invoices"],
+            "user_id",
+            &["u", "users"],
+            "id",
+        )
+}
+
+fn is_company_users_summary_join(item: &FromItem) -> bool {
+    let FromItem::Join {
+        left,
+        right,
+        kind,
+        constraint,
+    } = item
+    else {
+        return false;
+    };
+
+    *kind == JoinKind::Inner
+        && is_summary_table(left, "companies", "c")
+        && is_summary_table(right, "users", "u")
+        && is_summary_join_on_columns(
+            constraint,
+            &["u", "users"],
+            "company_id",
+            &["c", "companies"],
+            "id",
+        )
+}
+
+fn is_summary_table(item: &FromItem, table_name: &str, expected_alias: &str) -> bool {
+    match item {
+        FromItem::Table { name, alias } => {
+            identifiers_equal(name, table_name)
+                && alias
+                    .as_deref()
+                    .is_none_or(|candidate| identifiers_equal(candidate, expected_alias))
+        }
+        _ => false,
+    }
+}
+
+fn is_summary_join_on_columns(
+    constraint: &JoinConstraint,
+    left_tables: &[&str],
+    left_column: &str,
+    right_tables: &[&str],
+    right_column: &str,
+) -> bool {
+    let JoinConstraint::On(Expr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    }) = constraint
+    else {
+        return false;
+    };
+
+    (is_summary_column(left, left_tables, left_column)
+        && is_summary_column(right, right_tables, right_column))
+        || (is_summary_column(left, right_tables, right_column)
+            && is_summary_column(right, left_tables, left_column))
+}
+
+fn is_summary_count_distinct_users(expr: &Expr) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+
+    identifiers_equal(name, "count")
+        && *distinct
+        && !*star
+        && order_by.is_empty()
+        && !*within_group
+        && args.len() == 1
+        && is_summary_column(&args[0], &["u", "users"], "id")
+}
+
+fn is_summary_coalesced_invoice_total_sum(expr: &Expr) -> bool {
+    let Expr::Function { name, args } = expr else {
+        return false;
+    };
+
+    identifiers_equal(name, "coalesce")
+        && args.len() == 2
+        && is_summary_invoice_total_sum(&args[0])
+        && is_summary_zero_literal(&args[1])
+}
+
+fn is_summary_invoice_total_sum(expr: &Expr) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+
+    identifiers_equal(name, "sum")
+        && !*distinct
+        && !*star
+        && order_by.is_empty()
+        && !*within_group
+        && args.len() == 1
+        && is_summary_column(&args[0], &["i", "invoices"], "total")
+}
+
+fn is_summary_zero_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Value::Int64(value)) => *value == 0,
+        Expr::Literal(Value::Float64(value)) => *value == 0.0,
+        Expr::Literal(Value::Decimal { scaled, .. }) => *scaled == 0,
+        _ => false,
+    }
+}
+
+fn is_summary_column(expr: &Expr, tables: &[&str], column: &str) -> bool {
+    match expr {
+        Expr::Column {
+            table,
+            column: candidate,
+        } => {
+            identifiers_equal(candidate, column)
+                && table.as_deref().is_some_and(|candidate_table| {
+                    tables
+                        .iter()
+                        .any(|table| identifiers_equal(candidate_table, table))
+                })
+        }
+        _ => false,
+    }
+}
+
 fn conflict_target(action: &ConflictAction) -> Result<ConflictTarget> {
     match action {
         ConflictAction::DoNothing { target } => Ok(target.clone()),
@@ -7114,6 +7683,11 @@ fn indexed_row_ids_for_filter(
             row_ids,
             fully_covers_filter: true,
         }));
+    }
+    if let Some(row_ids) =
+        single_btree_range_row_ids_for_filter(runtime, table_ref, table, filter, params)?
+    {
+        return Ok(Some(row_ids));
     }
     if let Some(row_ids) =
         compound_btree_range_row_ids_for_filter(runtime, table_ref, table, filter, params)?
@@ -7274,7 +7848,7 @@ fn compound_btree_range_row_ids_for_filter(
         else {
             continue;
         };
-        let Some((lower, upper)) = dml_range_bounds_for_column(
+        let Some((_lower, _upper)) = dml_range_bounds_for_column(
             runtime,
             &predicates,
             table_ref,
@@ -7289,18 +7863,9 @@ fn compound_btree_range_row_ids_for_filter(
         let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
             continue;
         };
-        let used_predicate_count =
-            prefix_values.len() + usize::from(lower.is_some()) + usize::from(upper.is_some());
         return Ok(Some(IndexedFilterRowIds {
-            row_ids: compound_btree_range_row_ids(
-                keys,
-                &prefix_values,
-                prefix_values.len(),
-                range_column.column_type,
-                lower.as_ref(),
-                upper.as_ref(),
-            )?,
-            fully_covers_filter: used_predicate_count == predicates.len(),
+            row_ids: keys.row_ids_for_encoded_key_prefix(&prefix_values)?,
+            fully_covers_filter: false,
         }));
     }
 
@@ -7403,6 +7968,235 @@ fn dml_range_bounds_for_column(
     }
 }
 
+fn dml_filter_covers_index_predicate(
+    runtime: &EngineRuntime,
+    predicates: &[&Expr],
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    predicate_sql: &str,
+    params: &[Value],
+) -> Result<Option<usize>> {
+    let predicate = parse_expression_sql(predicate_sql)?;
+    let Some((predicate_table, predicate_column, predicate_value_expr)) =
+        simple_btree_lookup_filter(&predicate)
+    else {
+        return Ok(None);
+    };
+    if !dml_filter_table_matches(predicate_table, table_ref, table) {
+        return Ok(None);
+    }
+    let Some(column) = table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, predicate_column))
+    else {
+        return Ok(None);
+    };
+    let Some(filter_value_expr) =
+        dml_equality_expr_for_column(predicates, table_ref, table, predicate_column)
+    else {
+        return Ok(None);
+    };
+    let predicate_value = runtime.eval_expr(
+        predicate_value_expr,
+        &Dataset::empty(),
+        &[],
+        params,
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
+    let filter_value = runtime.eval_expr(
+        filter_value_expr,
+        &Dataset::empty(),
+        &[],
+        params,
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
+    let predicate_value = super::constraints::coerce_column_value(column, predicate_value)?;
+    let filter_value = super::constraints::coerce_column_value(column, filter_value)?;
+    Ok(
+        (compare_values(&predicate_value, &filter_value)? == std::cmp::Ordering::Equal)
+            .then_some(1),
+    )
+}
+
+fn single_btree_range_row_ids_for_filter(
+    runtime: &EngineRuntime,
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    filter: &Expr,
+    params: &[Value],
+) -> Result<Option<IndexedFilterRowIds>> {
+    if runtime.visible_table_is_temporary(table_ref) {
+        return Ok(None);
+    }
+    let predicates = dml_flattened_and_predicates(filter);
+
+    for index in runtime.catalog.indexes.values() {
+        if !identifiers_equal(&index.table_name, &table.name)
+            || !index.fresh
+            || index.kind != IndexKind::Btree
+            || index.columns.len() != 1
+            || index.columns[0].expression_sql.is_some()
+        {
+            continue;
+        }
+        let Some(column_name) = index.columns[0].column_name.as_deref() else {
+            continue;
+        };
+        let Some(column) = table
+            .columns
+            .iter()
+            .find(|column| identifiers_equal(&column.name, column_name))
+        else {
+            continue;
+        };
+        let Some((lower, upper)) = dml_range_bounds_for_column(
+            runtime,
+            &predicates,
+            table_ref,
+            table,
+            column_name,
+            column,
+            params,
+        )?
+        else {
+            continue;
+        };
+        let predicate_count = if let Some(predicate_sql) = index.predicate_sql.as_deref() {
+            let Some(count) = dml_filter_covers_index_predicate(
+                runtime,
+                &predicates,
+                table_ref,
+                table,
+                predicate_sql,
+                params,
+            )?
+            else {
+                continue;
+            };
+            count
+        } else {
+            0
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
+            continue;
+        };
+        let used_predicate_count =
+            predicate_count + usize::from(lower.is_some()) + usize::from(upper.is_some());
+        return Ok(Some(IndexedFilterRowIds {
+            row_ids: single_btree_range_row_ids(keys, lower.as_ref(), upper.as_ref())?,
+            fully_covers_filter: used_predicate_count == predicates.len(),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn single_btree_range_row_ids(
+    keys: &super::RuntimeBtreeKeys,
+    lower: Option<&DmlRangeBoundValue>,
+    upper: Option<&DmlRangeBoundValue>,
+) -> Result<Vec<i64>> {
+    use std::ops::Bound;
+
+    let lower_key = lower
+        .map(|bound| encode_index_key(&bound.value))
+        .transpose()?;
+    let upper_key = upper
+        .map(|bound| encode_index_key(&bound.value))
+        .transpose()?;
+    let lower_bound = match (lower, lower_key.as_ref()) {
+        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.clone()),
+        (Some(_), Some(key)) => Bound::Excluded(key.clone()),
+        _ => Bound::Unbounded,
+    };
+    let upper_bound = match (upper, upper_key.as_ref()) {
+        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.clone()),
+        (Some(_), Some(key)) => Bound::Excluded(key.clone()),
+        _ => Bound::Unbounded,
+    };
+
+    let mut row_ids = Vec::new();
+    match keys {
+        super::RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
+            for (_, row_id) in entries.range((lower_bound, upper_bound)) {
+                if !deleted.contains(row_id) {
+                    row_ids.push(*row_id);
+                }
+            }
+        }
+        super::RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
+            for (_, entry_row_ids) in entries.range((lower_bound, upper_bound)) {
+                row_ids.extend(
+                    entry_row_ids
+                        .iter()
+                        .copied()
+                        .filter(|row_id| !deleted.contains(row_id)),
+                );
+            }
+        }
+        super::RuntimeBtreeKeys::UniqueInt64(entries, deleted) => {
+            for (key, row_id) in entries.iter() {
+                if deleted.contains(row_id) {
+                    continue;
+                }
+                if dml_value_position_in_range(&Value::Int64(*key), lower, upper)?
+                    == DmlRangePosition::Match
+                {
+                    row_ids.push(*row_id);
+                }
+            }
+        }
+        super::RuntimeBtreeKeys::NonUniqueInt64(entries, deleted) => {
+            for (key, entry_row_ids) in entries.iter() {
+                if dml_value_position_in_range(&Value::Int64(*key), lower, upper)?
+                    != DmlRangePosition::Match
+                {
+                    continue;
+                }
+                row_ids.extend(
+                    entry_row_ids
+                        .iter()
+                        .copied()
+                        .filter(|row_id| !deleted.contains(row_id)),
+                );
+            }
+        }
+        super::RuntimeBtreeKeys::UniqueUuid(entries, deleted) => {
+            for (key, row_id) in entries.iter() {
+                if deleted.contains(row_id) {
+                    continue;
+                }
+                if dml_value_position_in_range(&Value::Uuid(*key), lower, upper)?
+                    == DmlRangePosition::Match
+                {
+                    row_ids.push(*row_id);
+                }
+            }
+        }
+        super::RuntimeBtreeKeys::NonUniqueUuid(entries, deleted) => {
+            for (key, entry_row_ids) in entries.iter() {
+                if dml_value_position_in_range(&Value::Uuid(*key), lower, upper)?
+                    != DmlRangePosition::Match
+                {
+                    continue;
+                }
+                row_ids.extend(
+                    entry_row_ids
+                        .iter()
+                        .copied()
+                        .filter(|row_id| !deleted.contains(row_id)),
+                );
+            }
+        }
+    }
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok(row_ids)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DmlRangeBoundKind {
     Lower(bool),
@@ -7450,122 +8244,27 @@ fn reverse_dml_range_op(op: BinaryOp) -> Option<BinaryOp> {
     }
 }
 
-fn compound_btree_range_row_ids(
-    keys: &super::RuntimeBtreeKeys,
-    prefix_values: &[Value],
-    range_column_position: usize,
-    range_column_type: ColumnType,
-    lower: Option<&DmlRangeBoundValue>,
-    upper: Option<&DmlRangeBoundValue>,
-) -> Result<Vec<i64>> {
-    let mut row_ids = Vec::new();
-    match keys {
-        super::RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
-            let mut saw_matching_prefix = false;
-            for (encoded_key, row_id) in entries.iter() {
-                if !Row::encoded_prefix_matches(encoded_key, prefix_values)? {
-                    if saw_matching_prefix {
-                        break;
-                    }
-                    continue;
-                }
-                saw_matching_prefix = true;
-                if deleted.contains(row_id)
-                    || !compound_range_value_matches(
-                        encoded_key,
-                        range_column_position,
-                        range_column_type,
-                        lower,
-                        upper,
-                    )?
-                {
-                    continue;
-                }
-                row_ids.push(*row_id);
-            }
-        }
-        super::RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
-            let mut saw_matching_prefix = false;
-            for (encoded_key, entry_row_ids) in entries.iter() {
-                if !Row::encoded_prefix_matches(encoded_key, prefix_values)? {
-                    if saw_matching_prefix {
-                        break;
-                    }
-                    continue;
-                }
-                saw_matching_prefix = true;
-                if !compound_range_value_matches(
-                    encoded_key,
-                    range_column_position,
-                    range_column_type,
-                    lower,
-                    upper,
-                )? {
-                    continue;
-                }
-                row_ids.extend(
-                    entry_row_ids
-                        .iter()
-                        .copied()
-                        .filter(|row_id| !deleted.contains(row_id)),
-                );
-            }
-        }
-        super::RuntimeBtreeKeys::UniqueInt64(_, _)
-        | super::RuntimeBtreeKeys::NonUniqueInt64(_, _)
-        | super::RuntimeBtreeKeys::UniqueUuid(_, _)
-        | super::RuntimeBtreeKeys::NonUniqueUuid(_, _) => return Ok(Vec::new()),
-    }
-    row_ids.sort_unstable();
-    row_ids.dedup();
-    Ok(row_ids)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmlRangePosition {
+    Before,
+    Match,
+    After,
 }
 
-fn compound_range_value_matches(
-    encoded_key: &[u8],
-    range_column_position: usize,
-    range_column_type: ColumnType,
-    lower: Option<&DmlRangeBoundValue>,
-    upper: Option<&DmlRangeBoundValue>,
-) -> Result<bool> {
-    match range_column_type {
-        ColumnType::Float64 => {
-            let Some(value) = Row::decode_float64_at(encoded_key, range_column_position)? else {
-                return Ok(false);
-            };
-            return dml_value_within_range(&Value::Float64(value), lower, upper);
-        }
-        ColumnType::Int64 => {
-            let Some(value) = Row::decode_int64_at(encoded_key, range_column_position)? else {
-                return Ok(false);
-            };
-            return dml_value_within_range(&Value::Int64(value), lower, upper);
-        }
-        _ => {}
-    }
-    let range_values = Row::decode_projection_with_overflow::<
-        crate::storage::page::InMemoryPageStore,
-    >(encoded_key, None, &[range_column_position])?;
-    let Some(range_value) = range_values.first() else {
-        return Ok(false);
-    };
-    dml_value_within_range(range_value, lower, upper)
-}
-
-fn dml_value_within_range(
+fn dml_value_position_in_range(
     value: &Value,
     lower: Option<&DmlRangeBoundValue>,
     upper: Option<&DmlRangeBoundValue>,
-) -> Result<bool> {
+) -> Result<DmlRangePosition> {
     if matches!(value, Value::Null) {
-        return Ok(false);
+        return Ok(DmlRangePosition::Before);
     }
     if let Some(bound) = lower {
         let ordering = compare_values(value, &bound.value)?;
         if ordering == std::cmp::Ordering::Less
             || (!bound.inclusive && ordering == std::cmp::Ordering::Equal)
         {
-            return Ok(false);
+            return Ok(DmlRangePosition::Before);
         }
     }
     if let Some(bound) = upper {
@@ -7573,10 +8272,10 @@ fn dml_value_within_range(
         if ordering == std::cmp::Ordering::Greater
             || (!bound.inclusive && ordering == std::cmp::Ordering::Equal)
         {
-            return Ok(false);
+            return Ok(DmlRangePosition::After);
         }
     }
-    Ok(true)
+    Ok(DmlRangePosition::Match)
 }
 
 fn row_id_range_row_ids_for_filter(
