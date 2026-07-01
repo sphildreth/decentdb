@@ -5,7 +5,7 @@ This page collects the current Python embedded comparison charts and a plain-lan
 ## Benchmark snapshot metadata
 
 <!-- BENCHMARK_AUTOGEN_METADATA_START -->
-- Document updated: 2026-06-29 23:29:58 UTC
+- Document updated: 2026-07-01 02:45:56 UTC
 - Ranking snapshot: final sweep point at `500` operations from the exported benchmark bundles in `docs/assets/benchmarks/python-embedded-compare/`
 <!-- BENCHMARK_AUTOGEN_METADATA_END -->
 
@@ -60,14 +60,14 @@ The summary table below uses the latest sweep point shown in the charts: `500` o
 <!-- BENCHMARK_AUTOGEN_SUMMARY_START -->
 | Workload | Benchmark | Leader at 500 ops | Leader mean latency (us/op) | DecentDB mean latency (us/op) | DecentDB rank | Reading |
 | --- | --- | --- | ---: | ---: | --- | --- |
-| Workload C | Full scan | DuckDB | 674.36 | 1270.32 | 3rd of 6 | Trailing |
-| Workload C | Point select | SQLite_wal_full | 6.43 | 14.35 | 2nd of 6 | Near the front |
-| Workload A | Point select | SQLite_wal_full | 6.32 | 17.06 | 2nd of 6 | Near the front |
-| Workload A | Aggregate | SQLite_wal_full | 57.51 | 138.78 | 2nd of 6 | Near the front |
-| Workload A | Join | SQLite_wal_full | 30.41 | 223.16 | 2nd of 6 | Near the front |
-| Workload A | Range scan | SQLite_wal_full | 6.10 | 29.36 | 2nd of 6 | Near the front |
-| Workload A | Delete | H2(JDBC) | 40.56 | 679.71 | 5th of 6 | Trailing |
-| Workload A | Update | H2(JDBC) | 46.64 | 835.14 | 5th of 6 | Trailing |
+| Workload C | Full scan | SQLite_wal_full | 668.88 | 1271.04 | 3rd of 6 | Trailing |
+| Workload C | Point select | SQLite_wal_full | 6.43 | 15.06 | 2nd of 6 | Near the front |
+| Workload A | Point select | SQLite_wal_full | 6.19 | 16.78 | 2nd of 6 | Near the front |
+| Workload A | Aggregate | SQLite_wal_full | 57.64 | 137.27 | 2nd of 6 | Near the front |
+| Workload A | Join | SQLite_wal_full | 29.58 | 223.22 | 2nd of 6 | Near the front |
+| Workload A | Range scan | SQLite_wal_full | 5.99 | 29.06 | 2nd of 6 | Near the front |
+| Workload A | Delete | H2(JDBC) | 36.07 | 883.29 | 5th of 6 | Trailing |
+| Workload A | Update | H2(JDBC) | 42.89 | 938.35 | 5th of 6 | Trailing |
 <!-- BENCHMARK_AUTOGEN_SUMMARY_END -->
 
 Notes:
