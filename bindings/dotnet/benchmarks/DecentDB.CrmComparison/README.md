@@ -65,6 +65,7 @@ Argument order for the helper script is:
 6. native mode (`1` to enable, `0` to disable)
 7. seed
 8. engines (`all`, `decentdb`, `sqlite`)
+9. collect allocations (`1` to enable, `0` to disable; default: `0`)
 
 ## Matrix Runner
 
@@ -74,6 +75,12 @@ Run all canonical comparison modes through one wrapper:
 bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark-matrix.sh --size Small --iterations 3 --warmup 1 --run-id ci-smoke
 ```
 
+Enable allocation telemetry for an entire matrix run with:
+
+```bash
+bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark-matrix.sh --size Small --iterations 3 --collect-allocations
+```
+
 The matrix runner executes:
 
 1. DecentDB ADO.NET vs SQLite, relaxed
@@ -81,6 +88,9 @@ The matrix runner executes:
 3. SQLite ADO.NET only, relaxed
 4. SQLite ADO.NET only, durable
 5. Optional DecentDB native-only modes when `--native-on` is set (relaxed and durable)
+
+Each mode writes `validation.json` beside `results.json`, and the matrix run writes a
+top-level `matrix-summary.json` for lightweight trend capture.
 
 ## Options
 
@@ -100,6 +110,9 @@ The matrix runner executes:
 - `--decentdb-relaxed`: explicit relaxed profile.
 - `--decentdb-durable`: explicit durable profile.
 - `--engines <all|decentdb|sqlite>`: limit engine execution for harness separation.
+- `--collect-allocations`: enable managed allocation telemetry by scenario using
+  `GC.GetAllocatedBytesForCurrentThread()`.
+- `--no-collect-allocations`: force allocation telemetry off (default).
 
 ## Logs
 
@@ -110,20 +123,34 @@ manual review scripts parsing the same canonical command contract.
 
 ## Regression Guard
 
-Use `compare-crm-benchmark.py` to compare measured summaries:
+Use `compare-crm-benchmark.py` to compare measured summaries and validate per-mode outputs:
 
 ```bash
 python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
   --baseline .tmp/crm-comparison/baseline.json \
   --current .tmp/crm-comparison/current.json \
   --max-regression 0.10 \
+  --max-allocation-regression 0.10 \
   --check-decentdb-win
 ```
+
+For local smoke checks without a baseline file, validate output completeness with:
+
+```bash
+python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
+  --current .tmp/crm-comparison/tiny-results.json \
+  --require-complete \
+  --expected-engines DecentDB,SQLite
+```
+
+Matrix mode runs now write `validation.json` beside each `results.json` with the
+mode-level coverage and regression payload.
 
 The guardrail fails if:
 
 - a scenario/engine pair is missing from current output;
 - any mean duration regresses beyond the configured ratio; or
+- any collected mean allocation count regresses beyond the configured ratio; or
 - DecentDB fails the lead policy when `--check-decentdb-win` is set.
 
 ## Scenario Split (Phase 10)
@@ -151,5 +178,5 @@ Each engine directory contains:
 
 The JSON manifest records the workload seed, warmup/measured iteration counts,
 engine order per measured scenario result, runtime/platform details, DecentDB
-engine/ABI details, SQLite provider/native versions, raw scenario timings, and
-grouped summary statistics.
+engine/ABI details, SQLite provider/native versions, raw scenario timings,
+optional allocation telemetry, and grouped summary statistics.

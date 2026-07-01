@@ -32,6 +32,40 @@ fn assert_float_close(value: &Value, expected: f64) {
     }
 }
 
+fn setup_p5_selectivity_update_dataset(db: &Db) {
+    exec(
+        db,
+        "CREATE TABLE crm_p5_selectivity_invoices (
+            id INT64 PRIMARY KEY,
+            company_id INT64 NOT NULL,
+            total FLOAT64 NOT NULL,
+            paid BOOL NOT NULL
+        )",
+    );
+    exec(
+        db,
+        "CREATE INDEX crm_p5_selectivity_paid_total_idx
+         ON crm_p5_selectivity_invoices(paid, total)",
+    );
+
+    let insert = db
+        .prepare(
+            "INSERT INTO crm_p5_selectivity_invoices (id, company_id, total, paid)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .unwrap();
+    for id in 1_i64..=100_i64 {
+        insert
+            .execute(&[
+                Value::Int64(id),
+                Value::Int64(10),
+                Value::Float64(id as f64),
+                Value::Bool(false),
+            ])
+            .unwrap();
+    }
+}
+
 #[test]
 fn crm_invoice_item_generated_stored_insert_reuses_prepared_statement() {
     let db = mem_db();
@@ -223,14 +257,35 @@ fn crm_indexed_paid_total_update_is_correct_for_repeat_no_rows_and_rollback() {
             (5, 30, 60.00, FALSE)",
     );
 
+    let select_candidates = db
+        .prepare(
+            "SELECT id
+             FROM crm_p5_invoices
+             WHERE paid = FALSE AND total < $1
+             ORDER BY id",
+        )
+        .unwrap();
+    let pre_update = rows(&select_candidates.execute(&[Value::Float64(100.0)]).unwrap());
+    assert_eq!(
+        pre_update,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(5)],
+        ]
+    );
+
     let mark_paid = db
         .prepare("UPDATE crm_p5_invoices SET paid = TRUE WHERE paid = FALSE AND total < $1")
         .unwrap();
-    let first = mark_paid.execute(&[Value::Float64(80.0)]).unwrap();
-    assert_eq!(first.affected_rows(), 3);
+    let first = mark_paid.execute(&[Value::Float64(100.0)]).unwrap();
+    assert_eq!(first.affected_rows(), pre_update.len() as u64);
 
-    let second = mark_paid.execute(&[Value::Float64(80.0)]).unwrap();
+    let second = mark_paid.execute(&[Value::Float64(100.0)]).unwrap();
     assert_eq!(second.affected_rows(), 0);
+
+    let post_update = rows(&select_candidates.execute(&[Value::Float64(100.0)]).unwrap());
+    assert!(post_update.is_empty());
 
     let count_paid_under_limit = db
         .prepare(
@@ -240,7 +295,7 @@ fn crm_indexed_paid_total_update_is_correct_for_repeat_no_rows_and_rollback() {
         )
         .unwrap();
     let count_result = count_paid_under_limit
-        .execute(&[Value::Float64(80.0)])
+        .execute(&[Value::Float64(100.0)])
         .unwrap();
     assert_eq!(rows(&count_result), vec![vec![Value::Int64(4)]]);
 
@@ -321,6 +376,64 @@ fn crm_indexed_paid_total_update_rechecks_residual_predicates() {
             vec![Value::Int64(5), Value::Bool(true)],
         ]
     );
+}
+
+#[test]
+fn crm_indexed_paid_total_update_selectivity_matrix() {
+    let cases = [
+        (1.0, 0_usize),
+        (2.0, 1_usize),
+        (11.0, 10_usize),
+        (51.0, 50_usize),
+    ];
+
+    for &(max_total, expected_count) in &cases {
+        let db = mem_db();
+        setup_p5_selectivity_update_dataset(&db);
+
+        let select_candidates = db
+            .prepare(
+                "SELECT id
+                 FROM crm_p5_selectivity_invoices
+                 WHERE paid = FALSE AND total < $1
+                 ORDER BY id",
+            )
+            .unwrap();
+        let update = db
+            .prepare(
+                "UPDATE crm_p5_selectivity_invoices
+                 SET paid = TRUE
+                 WHERE paid = FALSE AND total < $1",
+            )
+            .unwrap();
+
+        let pre_update = rows(
+            &select_candidates
+                .execute(&[Value::Float64(max_total)])
+                .unwrap(),
+        );
+        let expected_ids: Vec<Vec<Value>> = (1_i64..=(expected_count as i64))
+            .map(|id| vec![Value::Int64(id)])
+            .collect();
+        assert_eq!(
+            pre_update, expected_ids,
+            "select baseline should match configured selectivity for total < {max_total}"
+        );
+
+        let first = update.execute(&[Value::Float64(max_total)]).unwrap();
+        assert_eq!(
+            first.affected_rows(),
+            expected_count as u64,
+            "first update should affect configured row count for total < {max_total}"
+        );
+
+        let second = update.execute(&[Value::Float64(max_total)]).unwrap();
+        assert_eq!(
+            second.affected_rows(),
+            0,
+            "repeat update should affect zero rows for total < {max_total}"
+        );
+    }
 }
 
 #[test]

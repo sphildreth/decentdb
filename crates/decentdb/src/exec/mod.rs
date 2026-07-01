@@ -1236,6 +1236,12 @@ impl TablePageManifest {
                 row.row_id,
                 &encoded_values,
             )?;
+            chunk.pointer = OverflowPointer {
+                head_page_id: 0,
+                logical_len: 0,
+                flags: 0,
+            };
+            chunk.checksum = 0;
             chunk.row_count = chunk
                 .row_count
                 .checked_add(1)
@@ -3963,12 +3969,6 @@ impl EngineRuntime {
         state: PersistedTableState,
         chunk_payloads: &[TablePageManifestChunk],
     ) -> Result<Option<PageId>> {
-        if !db.config().persistent_pk_index && self.tables.contains_key(table_name) {
-            self.deferred_paged_row_locator_caches_mut()
-                .remove(table_name);
-            return Ok(None);
-        }
-
         let needs_locator_cache = self.should_cache_deferred_paged_row_locators(table_name);
         if needs_locator_cache {
             self.cache_deferred_paged_row_locators(table_name, state, chunk_payloads)?;
@@ -7056,32 +7056,89 @@ impl EngineRuntime {
                         }
                     }
                 }
-                let mut lines = planner::plan_statement(
-                    &Statement::Explain(explain.clone()),
-                    &planner_catalog,
-                )?
-                .render();
-                if explain.analyze {
-                    lines.insert(0, "ANALYZE true".to_string());
-                    let started = Instant::now();
-                    let actual_rows = match explain.statement.as_ref() {
-                        Statement::Query(query) => self
-                            .evaluate_query(query, params, &BTreeMap::new())?
-                            .rows
-                            .len(),
-                        other => {
-                            return Err(DbError::sql(format!(
-                                "EXPLAIN ANALYZE is not supported for {other:?}"
-                            )))
+                match explain.statement.as_ref() {
+                    Statement::Update(update) => {
+                        if explain.analyze {
+                            return Err(DbError::sql(
+                                "EXPLAIN ANALYZE is not supported for UPDATE".to_string(),
+                            ));
                         }
-                    };
-                    lines.push(format!("Actual Rows: {actual_rows}"));
-                    lines.push(format!(
-                        "Actual Time: {:.3} ms",
-                        started.elapsed().as_secs_f64() * 1_000.0
-                    ));
+                        if self
+                            .visible_view(&update.table_name, NameResolutionScope::Session)
+                            .is_some()
+                        {
+                            return Err(DbError::sql(format!(
+                                "EXPLAIN UPDATE is not supported for view {}",
+                                update.table_name
+                            )));
+                        }
+
+                        let mut lines = vec![format!("Mutation: UPDATE {}", update.table_name)];
+                        for (index, assignment) in update.assignments.iter().enumerate() {
+                            lines.push(format!(
+                                "Assignment {}: {} = {}",
+                                index + 1,
+                                assignment.column_name,
+                                assignment.expr.to_sql()
+                            ));
+                        }
+                        match &update.filter {
+                            Some(filter) => lines.push(format!("Filter: {}", filter.to_sql())),
+                            None => lines.push("Filter: <none>".to_string()),
+                        }
+                        let table = self.table_schema(&update.table_name).ok_or_else(|| {
+                            DbError::sql(format!("unknown table {}", update.table_name))
+                        })?;
+                        let candidate_rows = dml::matching_row_ids(
+                            self,
+                            &update.table_name,
+                            &update.table_name,
+                            table,
+                            update.filter.as_ref(),
+                            params,
+                        )?
+                        .len();
+                        lines.push(format!("Candidate rows: {candidate_rows}"));
+                        lines.push(format!(
+                            "Returning: {}",
+                            if update.returning.is_empty() {
+                                "OFF"
+                            } else {
+                                "ON"
+                            }
+                        ));
+
+                        Ok(QueryResult::with_explain(lines))
+                    }
+                    _ => {
+                        let mut lines = planner::plan_statement(
+                            &Statement::Explain(explain.clone()),
+                            &planner_catalog,
+                        )?
+                        .render();
+                        if explain.analyze {
+                            lines.insert(0, "ANALYZE true".to_string());
+                            let started = Instant::now();
+                            let actual_rows = match explain.statement.as_ref() {
+                                Statement::Query(query) => self
+                                    .evaluate_query(query, params, &BTreeMap::new())?
+                                    .rows
+                                    .len(),
+                                other => {
+                                    return Err(DbError::sql(format!(
+                                        "EXPLAIN ANALYZE is not supported for {other:?}"
+                                    )))
+                                }
+                            };
+                            lines.push(format!("Actual Rows: {actual_rows}"));
+                            lines.push(format!(
+                                "Actual Time: {:.3} ms",
+                                started.elapsed().as_secs_f64() * 1_000.0
+                            ));
+                        }
+                        Ok(QueryResult::with_explain(lines))
+                    }
                 }
-                Ok(QueryResult::with_explain(lines))
             }
             other => Err(DbError::internal(format!(
                 "read-only execution received mutating statement {other:?}"
@@ -7376,6 +7433,9 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_count_query(query)? else {
             return Ok(None);
         };
+        if plan.filter.is_some() {
+            return Ok(None);
+        }
         if self.visible_table_is_temporary(plan.table_name)
             || self.visible_table_row_source(plan.table_name).is_some()
             || !self.has_deferred_tables()

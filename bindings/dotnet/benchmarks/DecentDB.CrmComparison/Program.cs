@@ -166,7 +166,8 @@ public sealed record BenchmarkResult(
     long TotalRows,
     TimeSpan Duration,
     long? RowsAffected = null,
-    long? RowsRead = null)
+    long? RowsRead = null,
+    long? AllocatedBytes = null)
 {
     public double OperationsPerSecond =>
         (RowsAffected ?? RowsRead ?? TotalRows) / Duration.TotalSeconds;
@@ -182,7 +183,8 @@ public sealed record RunOptions(
     bool AlternateOrder,
     bool UseNativeDecentDbHotPaths,
     EngineSelection EngineSelection,
-    DurabilityProfile DurabilityProfile)
+    DurabilityProfile DurabilityProfile,
+    bool CollectAllocations)
 {
     public static RunOptions Parse(string[] args)
     {
@@ -196,6 +198,7 @@ public sealed record RunOptions(
         var useNativeDecentDbHotPaths = false;
         var engineSelection = EngineSelection.All;
         var durabilityProfile = DurabilityProfile.Relaxed;
+        var collectAllocations = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -232,9 +235,17 @@ public sealed record RunOptions(
             {
                 useNativeDecentDbHotPaths = true;
             }
+            else if (arg.Equals("--collect-allocations", StringComparison.OrdinalIgnoreCase))
+            {
+                collectAllocations = true;
+            }
             else if (arg.Equals("--no-decentdb-native-hot-paths", StringComparison.OrdinalIgnoreCase))
             {
                 useNativeDecentDbHotPaths = false;
+            }
+            else if (arg.Equals("--no-collect-allocations", StringComparison.OrdinalIgnoreCase))
+            {
+                collectAllocations = false;
             }
             else if (arg.Equals("--engines", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
@@ -263,11 +274,11 @@ public sealed record RunOptions(
             else
             {
                 throw new ArgumentException(
-                    $"Unknown argument '{arg}'. Use --size <Tiny|Small|Medium|Large|Jumbo> --iterations <n> --warmup-iterations <n> --seed <n> --json <path> --out-dir <path> --durability <relaxed|durable> --engines <all|decentdb|sqlite> [--decentdb-relaxed|--decentdb-durable] [--no-alternate-order] [--decentdb-native-hot-paths|--no-decentdb-native-hot-paths].");
+                    $"Unknown argument '{arg}'. Use --size <Tiny|Small|Medium|Large|Jumbo> --iterations <n> --warmup-iterations <n> --seed <n> --json <path> --out-dir <path> --durability <relaxed|durable> --engines <all|decentdb|sqlite> [--decentdb-relaxed|--decentdb-durable] [--no-alternate-order] [--decentdb-native-hot-paths|--no-decentdb-native-hot-paths] [--collect-allocations|--no-collect-allocations].");
             }
         }
 
-        return new RunOptions(size, iterations, warmupIterations, dataSeed, jsonPath, outputDirectory, alternateOrder, useNativeDecentDbHotPaths, engineSelection, durabilityProfile);
+        return new RunOptions(size, iterations, warmupIterations, dataSeed, jsonPath, outputDirectory, alternateOrder, useNativeDecentDbHotPaths, engineSelection, durabilityProfile, collectAllocations);
     }
 
     private static ScenarioSize ParseSize(string value)
@@ -317,9 +328,10 @@ public sealed record BenchmarkManifest(
     string DurabilityProfile,
     bool UseNativeDecentDbHotPaths,
     bool NativeDecentDbHotPathsActive,
+    bool CollectAllocations,
     string SQLiteProviderVersion,
     string SQLiteNativeVersion,
-    [JsonPropertyName("engine_order")]
+    [property: JsonPropertyName("engine_order")]
     IReadOnlyList<string> EngineOrder,
     string DotnetSdkVersion,
     string DecentDbAdoNetVersion,
@@ -338,7 +350,8 @@ public sealed record BenchmarkScenarioResult(
     long? RowsRead,
     double OperationsPerSecond,
     string DatabasePath,
-    long DatabaseBytes);
+    long DatabaseBytes,
+    long? AllocatedBytes);
 
 public sealed record BenchmarkSummary(
     string Scenario,
@@ -350,7 +363,8 @@ public sealed record BenchmarkSummary(
     double MinMs,
     double MaxMs,
     double StdDevMs,
-    double MeanOperationsPerSecond);
+    double MeanOperationsPerSecond,
+    double? MeanAllocatedBytes);
 
 public sealed record BenchmarkJsonOutput(
     BenchmarkManifest Manifest,
@@ -1023,6 +1037,7 @@ public sealed class BenchmarkHarness
     private readonly List<int> _userIds = new();
     private readonly List<int> _invoiceIds = new();
     private readonly bool _useNativeDecentDbHotPaths;
+    private readonly bool _collectAllocations;
     private readonly DecentDbNativeHotPathRunner? _nativeRunner;
     private readonly bool _nativeRunnerActive;
 
@@ -1035,7 +1050,8 @@ public sealed class BenchmarkHarness
         WorkloadData data,
         string? explainDirectory,
         DurabilityProfile durabilityProfile,
-        bool useNativeDecentDbHotPaths)
+        bool useNativeDecentDbHotPaths,
+        bool collectAllocations)
     {
         _db = db;
         _engine = engine;
@@ -1044,6 +1060,7 @@ public sealed class BenchmarkHarness
         _explainDirectory = explainDirectory;
         _durabilityProfile = durabilityProfile;
         _useNativeDecentDbHotPaths = useNativeDecentDbHotPaths;
+        _collectAllocations = collectAllocations;
 
         if (_useNativeDecentDbHotPaths && _db is DecentDbProvider && engine == DatabaseEngine.DecentDB)
         {
@@ -1877,14 +1894,27 @@ public sealed class BenchmarkHarness
             await setup();
         }
 
-            var sw = new Stopwatch();
+        var sw = new Stopwatch();
         long actualRows = 0;
+        long? allocatedBytes = null;
+        long startAllocatedBytes = 0;
+        if (_collectAllocations)
+        {
+            startAllocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+        }
 
         try
         {
             sw.Start();
             actualRows = await action();
             sw.Stop();
+            if (_collectAllocations)
+            {
+                var endAllocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+                allocatedBytes = endAllocatedBytes >= startAllocatedBytes
+                    ? endAllocatedBytes - startAllocatedBytes
+                    : null;
+            }
         }
         finally
         {
@@ -1905,8 +1935,12 @@ public sealed class BenchmarkHarness
             WorkloadProfiles.TotalRows(_profile),
             sw.Elapsed,
             rowsAffected ?? (rowsRead.HasValue ? null : actualRows),
-            rowsRead.HasValue ? actualRows : null);
-        Console.WriteLine($"  {name}: {result.Duration.TotalSeconds:F3}s  rows={actualRows:N0}  ops/s={result.OperationsPerSecond:N0}");
+            rowsRead.HasValue ? actualRows : null,
+            allocatedBytes);
+        var allocationText = allocatedBytes.HasValue
+            ? $"{allocatedBytes.Value:N0} bytes"
+            : "n/a";
+        Console.WriteLine($"  {name}: {result.Duration.TotalSeconds:F3}s  rows={actualRows:N0}  ops/s={result.OperationsPerSecond:N0}  alloc={allocationText}");
         return result;
     }
 
@@ -2032,17 +2066,20 @@ public static class Reporter
             return;
         }
 
-        Console.WriteLine("\n" + new string('=', 112));
+        Console.WriteLine("\n" + new string('=', 148));
         Console.WriteLine("MEASURED ITERATION SUMMARY");
-        Console.WriteLine(new string('=', 112));
-        Console.WriteLine(string.Format("{0,-40} {1,-9} {2,5} {3,12} {4,12} {5,12} {6,12}", "Scenario", "Engine", "N", "mean ms", "median ms", "p95 ms", "stddev ms"));
-        Console.WriteLine(new string('-', 112));
+        Console.WriteLine(new string('=', 148));
+        Console.WriteLine(string.Format("{0,-40} {1,-9} {2,5} {3,12} {4,12} {5,12} {6,12} {7,16}", "Scenario", "Engine", "N", "mean ms", "median ms", "p95 ms", "stddev ms", "mean alloc bytes"));
+        Console.WriteLine(new string('-', 148));
         foreach (var item in summary)
         {
-            Console.WriteLine($"{item.Scenario,-40} {item.Engine,-9} {item.Iterations,5:N0} {item.MeanMs,12:F3} {item.MedianMs,12:F3} {item.P95Ms,12:F3} {item.StdDevMs,12:F3}");
+            var allocationText = item.MeanAllocatedBytes.HasValue
+                ? item.MeanAllocatedBytes.Value.ToString("N0")
+                : "n/a";
+            Console.WriteLine($"{item.Scenario,-40} {item.Engine,-9} {item.Iterations,5:N0} {item.MeanMs,12:F3} {item.MedianMs,12:F3} {item.P95Ms,12:F3} {item.StdDevMs,12:F3} {allocationText,16}");
         }
 
-        Console.WriteLine(new string('=', 112));
+        Console.WriteLine(new string('=', 148));
     }
 
     public static void PrintFeatureMatrix()
@@ -2091,6 +2128,7 @@ public class Program
         Console.WriteLine($"Data seed: {options.DataSeed}");
         Console.WriteLine($"Durability profile: {options.DurabilityProfile}");
         Console.WriteLine($"DecentDB native hot paths: {(options.UseNativeDecentDbHotPaths ? "enabled" : "disabled (default)")}");
+        Console.WriteLine($"Allocation telemetry: {(options.CollectAllocations ? "enabled" : "disabled (default)")}");
         Console.WriteLine($"Engine selection: {options.EngineSelection}");
 
         var outputRoot = options.OutputDirectory is null
@@ -2103,14 +2141,16 @@ public class Program
         List<BenchmarkResult>? lastDecentResults = null;
         List<BenchmarkResult>? lastSqliteResults = null;
         bool lastDecentNativeHotPathsActive = false;
-        var measuredEngineOrder = GetEngineOrderForIteration(1, options.AlternateOrder, options.EngineSelection);
+        IReadOnlyList<string> measuredEngineOrder = GetEngineOrderForIteration(1, options.AlternateOrder, options.EngineSelection)
+            .Select(engine => engine.ToString())
+            .ToArray();
 
         for (var warmup = 1; warmup <= options.WarmupIterations; warmup++)
         {
             Console.WriteLine($"\n=== Warmup {warmup:N0}/{options.WarmupIterations:N0} (discarded) ===");
             var warmupRoot = Path.Combine(root, $"warmup-{warmup:D3}");
             Directory.CreateDirectory(warmupRoot);
-            await RunEnginePairAsync("warmup", warmup, warmupRoot, runId, profile, data, options.AlternateOrder, options.DurabilityProfile, options.EngineSelection, recordResults: false, jsonResults, options.UseNativeDecentDbHotPaths);
+            await RunEnginePairAsync("warmup", warmup, warmupRoot, runId, profile, data, options.AlternateOrder, options.DurabilityProfile, options.EngineSelection, recordResults: false, jsonResults, options.UseNativeDecentDbHotPaths, options.CollectAllocations);
         }
 
         for (var iteration = 1; iteration <= options.Iterations; iteration++)
@@ -2131,7 +2171,8 @@ public class Program
                 options.EngineSelection,
                 recordResults: true,
                 jsonResults,
-                options.UseNativeDecentDbHotPaths);
+                options.UseNativeDecentDbHotPaths,
+                options.CollectAllocations);
         }
 
         if (lastDecentResults is not null && lastSqliteResults is not null)
@@ -2169,6 +2210,7 @@ public class Program
                 options.DurabilityProfile.ToString(),
                 options.UseNativeDecentDbHotPaths,
                 lastDecentNativeHotPathsActive,
+                options.CollectAllocations,
                 typeof(SqliteConnection).Assembly.GetName().Version?.ToString() ?? "unknown",
                 GetSQLiteNativeVersion(),
                 measuredEngineOrder,
@@ -2210,7 +2252,8 @@ public class Program
         EngineSelection engineSelection,
         bool recordResults,
         List<BenchmarkScenarioResult> jsonResults,
-        bool useNativeDecentDbHotPaths)
+        bool useNativeDecentDbHotPaths,
+        bool collectAllocations)
     {
         List<BenchmarkResult>? decentResults = null;
         List<BenchmarkResult>? sqliteResults = null;
@@ -2231,7 +2274,8 @@ public class Program
                 durabilityProfile,
                 recordResults,
                 jsonResults,
-                useNativeDecentDbHotPaths);
+                useNativeDecentDbHotPaths,
+                collectAllocations);
 
             if (order[orderIndex] == DatabaseEngine.DecentDB)
             {
@@ -2259,7 +2303,8 @@ public class Program
         DurabilityProfile durabilityProfile,
         bool recordResults,
         List<BenchmarkScenarioResult> jsonResults,
-        bool useNativeDecentDbHotPaths)
+        bool useNativeDecentDbHotPaths,
+        bool collectAllocations)
     {
         var engineName = engine == DatabaseEngine.DecentDB ? "decentdb" : "sqlite";
         var engineRoot = Path.Combine(iterationRoot, $"{engineOrder:D2}-{engineName}");
@@ -2274,7 +2319,7 @@ public class Program
             : new SqliteProvider(path, durabilityProfile == DurabilityProfile.Durable);
 
         await db.OpenAsync();
-        var harness = new BenchmarkHarness(db, engine, profile, data, explainDirectory, durabilityProfile, useNativeDecentDbHotPaths);
+        var harness = new BenchmarkHarness(db, engine, profile, data, explainDirectory, durabilityProfile, useNativeDecentDbHotPaths, collectAllocations);
         await harness.RunAsync();
         var results = harness.Results.ToList();
         var dbBytes = DatabaseFileBytes(path);
@@ -2296,7 +2341,8 @@ public class Program
                     result.RowsRead,
                     result.OperationsPerSecond,
                     path,
-                    dbBytes));
+                    dbBytes,
+                    result.AllocatedBytes));
             }
         }
 
@@ -2313,6 +2359,13 @@ public class Program
             {
                 var durations = g.Select(r => r.DurationMs).Order().ToArray();
                 var ops = g.Select(r => r.OperationsPerSecond).ToArray();
+                var allocated = g
+                    .Where(r => r.AllocatedBytes.HasValue)
+                    .Select(r => (double)r.AllocatedBytes!.Value)
+                    .ToArray();
+                var meanAllocatedBytes = allocated.Length == 0
+                    ? (double?)null
+                    : allocated.Average();
                 return new BenchmarkSummary(
                     g.Key.Scenario,
                     g.Key.Engine,
@@ -2323,7 +2376,8 @@ public class Program
                     durations[0],
                     durations[^1],
                     StdDev(durations),
-                    ops.Average());
+                    ops.Average(),
+                    meanAllocatedBytes);
             })
             .ToArray();
     }

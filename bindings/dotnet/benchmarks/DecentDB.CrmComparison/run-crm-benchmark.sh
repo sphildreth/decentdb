@@ -13,6 +13,7 @@ WARMUP="${5:-1}"
 NATIVE="${6:-0}"
 SEED="${7:-42}"
 ENGINES="${8:-all}"
+COLLECT_ALLOCATIONS="${9:-0}"
 
 if [[ "$ENGINES" != "all" && "$ENGINES" != "decentdb" && "$ENGINES" != "sqlite" ]]; then
   echo "Unknown engines '$ENGINES'. Use all, decentdb, or sqlite." >&2
@@ -21,7 +22,11 @@ fi
 
 mkdir -p "$OUT_ROOT"
 STAMP="$(date +%Y%m%d%H%M%S)"
-RUN_DIR="$OUT_ROOT/$STAMP"
+if [[ "${CRM_BENCHMARK_FIXED_RUN_DIR:-0}" == "1" ]]; then
+  RUN_DIR="$OUT_ROOT"
+else
+  RUN_DIR="$OUT_ROOT/$STAMP"
+fi
 mkdir -p "$RUN_DIR"
 
 LOG_PATH="$RUN_DIR/benchmark.log"
@@ -59,6 +64,12 @@ else
   DOTNET_OPTIONS+=(--no-decentdb-native-hot-paths)
 fi
 
+if [[ "$COLLECT_ALLOCATIONS" == "1" ]]; then
+  DOTNET_OPTIONS+=(--collect-allocations)
+elif [[ "$COLLECT_ALLOCATIONS" == "0" ]]; then
+  DOTNET_OPTIONS+=(--no-collect-allocations)
+fi
+
 printf 'Running benchmark:\n'
 printf 'command: %s\n' "${DOTNET_OPTIONS[*]}"
 printf 'out-dir: %s\n' "$RUN_DIR"
@@ -69,7 +80,7 @@ printf 'log: %s\n' "$LOG_PATH"
   printf 'Started UTC: %s\n' "$(date -u +%FT%TZ)"
   printf 'Output directory: %s\n' "$RUN_DIR"
   printf 'JSON file: %s\n' "$JSON_PATH"
-  printf '---\n'
+  printf '%s\n' '---'
 } > "$LOG_PATH"
 
 "${DOTNET_OPTIONS[@]}" 2>&1 | tee -a "$LOG_PATH"

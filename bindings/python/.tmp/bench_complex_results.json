@@ -11,136 +11,136 @@
   "comparisons": {
     "complex": {
       "aggregate_p50_ms": {
-        "decentdb": 0.027542,
-        "decentdb_vs_sqlite": 4.0905985444824005,
+        "decentdb": 0.027341,
+        "decentdb_vs_sqlite": 4.99835466179159,
         "direction": "lower_is_better",
-        "sqlite": 0.006733,
+        "sqlite": 0.00547,
         "winner": "sqlite"
       },
       "aggregate_p95_ms": {
-        "decentdb": 0.045155,
-        "decentdb_vs_sqlite": 0.9162388653288153,
+        "decentdb": 0.044364,
+        "decentdb_vs_sqlite": 1.0719048999710061,
         "direction": "lower_is_better",
-        "sqlite": 0.049283,
-        "winner": "decentdb"
+        "sqlite": 0.041388,
+        "winner": "sqlite"
       },
       "catalog_insert_s": {
-        "decentdb": 0.0015566640067845583,
-        "decentdb_vs_sqlite": 1.0740043507497188,
+        "decentdb": 0.0022600049996981397,
+        "decentdb_vs_sqlite": 1.987383663399009,
         "direction": "lower_is_better",
-        "sqlite": 0.001449401956051588,
+        "sqlite": 0.0011371759974281304,
         "winner": "sqlite"
       },
       "delete_p50_ms": {
-        "decentdb": 0.030036,
-        "decentdb_vs_sqlite": 1.1920466722228837,
+        "decentdb": 0.027331,
+        "decentdb_vs_sqlite": 1.850816008667976,
         "direction": "lower_is_better",
-        "sqlite": 0.025197,
+        "sqlite": 0.014767,
         "winner": "sqlite"
       },
       "delete_p95_ms": {
-        "decentdb": 0.038763,
-        "decentdb_vs_sqlite": 1.1276837144353289,
+        "decentdb": 0.0369,
+        "decentdb_vs_sqlite": 1.6523374529822676,
         "direction": "lower_is_better",
-        "sqlite": 0.034374,
+        "sqlite": 0.022332,
         "winner": "sqlite"
       },
       "history_p50_ms": {
-        "decentdb": 0.007043,
-        "decentdb_vs_sqlite": 1.3415238095238093,
+        "decentdb": 0.007284,
+        "decentdb_vs_sqlite": 1.6947417403443463,
         "direction": "lower_is_better",
-        "sqlite": 0.00525,
+        "sqlite": 0.004298,
         "winner": "sqlite"
       },
       "history_p95_ms": {
-        "decentdb": 0.008817,
-        "decentdb_vs_sqlite": 0.7632444598337951,
+        "decentdb": 0.009968,
+        "decentdb_vs_sqlite": 1.040718312800167,
         "direction": "lower_is_better",
-        "sqlite": 0.011552,
-        "winner": "decentdb"
+        "sqlite": 0.009578,
+        "winner": "sqlite"
       },
       "join_p50_ms": {
-        "decentdb": 0.049433,
-        "decentdb_vs_sqlite": 1.2657926407702353,
+        "decentdb": 0.050615,
+        "decentdb_vs_sqlite": 1.5846900438321851,
         "direction": "lower_is_better",
-        "sqlite": 0.039053,
+        "sqlite": 0.03194,
         "winner": "sqlite"
       },
       "join_p95_ms": {
-        "decentdb": 0.059261,
-        "decentdb_vs_sqlite": 1.0701953985625023,
+        "decentdb": 0.069921,
+        "decentdb_vs_sqlite": 1.76101246694371,
         "direction": "lower_is_better",
-        "sqlite": 0.055374,
+        "sqlite": 0.039705,
         "winner": "sqlite"
       },
       "orders_insert_rps": {
-        "decentdb": 438410.81795550423,
-        "decentdb_vs_sqlite": 1.2324757207935824,
+        "decentdb": 291240.5514584156,
+        "decentdb_vs_sqlite": 0.6212594487713966,
         "direction": "higher_is_better",
-        "sqlite": 355715.5817018567,
-        "winner": "decentdb"
+        "sqlite": 468790.5383722907,
+        "winner": "sqlite"
       },
       "point_lookup_p50_ms": {
-        "decentdb": 0.002184,
-        "decentdb_vs_sqlite": 0.41052631578947374,
+        "decentdb": 0.002274,
+        "decentdb_vs_sqlite": 0.5206043956043955,
         "direction": "lower_is_better",
-        "sqlite": 0.00532,
+        "sqlite": 0.004368,
         "winner": "decentdb"
       },
       "point_lookup_p95_ms": {
-        "decentdb": 0.002524,
-        "decentdb_vs_sqlite": 0.39610797237915885,
+        "decentdb": 0.003737,
+        "decentdb_vs_sqlite": 0.7986749305407138,
         "direction": "lower_is_better",
-        "sqlite": 0.006372,
+        "sqlite": 0.004679,
         "winner": "decentdb"
       },
       "range_scan_p50_ms": {
-        "decentdb": 0.01051,
-        "decentdb_vs_sqlite": 1.7750380003377808,
+        "decentdb": 0.010149,
+        "decentdb_vs_sqlite": 2.084411583487369,
         "direction": "lower_is_better",
-        "sqlite": 0.005921,
+        "sqlite": 0.004869,
         "winner": "sqlite"
       },
       "range_scan_p95_ms": {
-        "decentdb": 0.018124,
-        "decentdb_vs_sqlite": 0.5525272849216512,
+        "decentdb": 0.0155,
+        "decentdb_vs_sqlite": 0.539994425863991,
         "direction": "lower_is_better",
-        "sqlite": 0.032802,
+        "sqlite": 0.028704,
         "winner": "decentdb"
       },
       "report_query_s": {
-        "decentdb": 4.261010326445103e-05,
-        "decentdb_vs_sqlite": 0.2392011857521527,
+        "decentdb": 4.187900049146265e-05,
+        "decentdb_vs_sqlite": 0.332433702913577,
         "direction": "lower_is_better",
-        "sqlite": 0.0001781350001692772,
+        "sqlite": 0.00012597699969774112,
         "winner": "decentdb"
       },
       "table_scan_p50_ms": {
-        "decentdb": 0.002786,
-        "decentdb_vs_sqlite": 0.6497201492537313,
+        "decentdb": 0.002855,
+        "decentdb_vs_sqlite": 0.8049055539892868,
         "direction": "lower_is_better",
-        "sqlite": 0.004288,
+        "sqlite": 0.003547,
         "winner": "decentdb"
       },
       "table_scan_p95_ms": {
-        "decentdb": 0.003015,
-        "decentdb_vs_sqlite": 0.5844155844155844,
+        "decentdb": 0.003126,
+        "decentdb_vs_sqlite": 0.8547990155865463,
         "direction": "lower_is_better",
-        "sqlite": 0.005159,
+        "sqlite": 0.003657,
         "winner": "decentdb"
       },
       "update_p50_ms": {
-        "decentdb": 0.003938,
-        "decentdb_vs_sqlite": 0.9183768656716417,
+        "decentdb": 0.004278,
+        "decentdb_vs_sqlite": 1.233919815402365,
         "direction": "lower_is_better",
-        "sqlite": 0.004288,
-        "winner": "decentdb"
+        "sqlite": 0.003467,
+        "winner": "sqlite"
       },
       "update_p95_ms": {
-        "decentdb": 0.108864,
-        "decentdb_vs_sqlite": 16.120835184362505,
+        "decentdb": 0.113032,
+        "decentdb_vs_sqlite": 20.36245721491623,
         "direction": "lower_is_better",
-        "sqlite": 0.006753,
+        "sqlite": 0.005551,
         "winner": "sqlite"
       }
     },
@@ -153,24 +153,24 @@
         "winner": "tie"
       },
       "movie_bulk_load_rps": {
-        "decentdb": 101430.16962848562,
-        "decentdb_vs_sqlite": 0.6640391137069719,
+        "decentdb": 98972.27147429365,
+        "decentdb_vs_sqlite": 0.6664961496179039,
         "direction": "higher_is_better",
-        "sqlite": 152747.28180130193,
+        "sqlite": 148496.38896043666,
         "winner": "sqlite"
       },
       "movie_bulk_load_s": {
-        "decentdb": 0.4249228819971904,
-        "decentdb_vs_sqlite": 1.5059353874767103,
+        "decentdb": 0.43547550599760143,
+        "decentdb_vs_sqlite": 1.5003837615165379,
         "direction": "lower_is_better",
-        "sqlite": 0.28216541395522654,
+        "sqlite": 0.2902427480003098,
         "winner": "sqlite"
       },
       "movie_busiest_people_s": {
-        "decentdb": 0.0003637330373749137,
-        "decentdb_vs_sqlite": 0.187545097630574,
+        "decentdb": 0.0003930180027964525,
+        "decentdb_vs_sqlite": 0.1949138264542111,
         "direction": "lower_is_better",
-        "sqlite": 0.0019394430564716458,
+        "sqlite": 0.0020163680019322783,
         "winner": "decentdb"
       },
       "movie_busiest_people_s_rows": {
@@ -181,17 +181,17 @@
         "winner": "tie"
       },
       "movie_checkpoint_after_mutations_s": {
-        "decentdb": 0.010005995980463922,
-        "decentdb_vs_sqlite": 0.4754901473469907,
+        "decentdb": 0.009730276993650477,
+        "decentdb_vs_sqlite": 0.3843705780401031,
         "direction": "lower_is_better",
-        "sqlite": 0.021043540094979107,
+        "sqlite": 0.02531483300117543,
         "winner": "decentdb"
       },
       "movie_checkpoint_s": {
-        "decentdb": 0.03003479994367808,
-        "decentdb_vs_sqlite": 0.6430164744925787,
+        "decentdb": 0.04932977199496236,
+        "decentdb_vs_sqlite": 0.9824332826561517,
         "direction": "lower_is_better",
-        "sqlite": 0.04670922306831926,
+        "sqlite": 0.05021182900236454,
         "winner": "decentdb"
       },
       "movie_delete_cascade_rows": {
@@ -202,10 +202,10 @@
         "winner": "tie"
       },
       "movie_delete_cascade_s": {
-        "decentdb": 0.01813970599323511,
-        "decentdb_vs_sqlite": 1.6825089261503965,
+        "decentdb": 0.01761859500402352,
+        "decentdb_vs_sqlite": 1.516902761227533,
         "direction": "lower_is_better",
-        "sqlite": 0.010781343095004559,
+        "sqlite": 0.011614848001045175,
         "winner": "sqlite"
       },
       "movie_final_file_size_bytes": {
@@ -223,17 +223,17 @@
         "winner": "tie"
       },
       "movie_point_reads_s": {
-        "decentdb": 0.008814257918857038,
-        "decentdb_vs_sqlite": 1.306574384802287,
+        "decentdb": 0.009619939999538474,
+        "decentdb_vs_sqlite": 1.2310548180160552,
         "direction": "lower_is_better",
-        "sqlite": 0.006746081984601915,
+        "sqlite": 0.007814388001861516,
         "winner": "sqlite"
       },
       "movie_tag_search_s": {
-        "decentdb": 0.0007657390087842941,
-        "decentdb_vs_sqlite": 1.9141507778508855,
+        "decentdb": 0.0007442169953719713,
+        "decentdb_vs_sqlite": 1.9513996683221306,
         "direction": "lower_is_better",
-        "sqlite": 0.00040004111360758543,
+        "sqlite": 0.0003813759976765141,
         "winner": "sqlite"
       },
       "movie_tag_search_s_rows": {
@@ -244,10 +244,10 @@
         "winner": "tie"
       },
       "movie_top_rated_s": {
-        "decentdb": 0.0005770439747720957,
-        "decentdb_vs_sqlite": 0.5054632744567573,
+        "decentdb": 0.0005890270040254109,
+        "decentdb_vs_sqlite": 0.49967340639234425,
         "direction": "lower_is_better",
-        "sqlite": 0.0011416140478104353,
+        "sqlite": 0.001178824000817258,
         "winner": "decentdb"
       },
       "movie_top_rated_s_rows": {
@@ -265,24 +265,24 @@
         "winner": "tie"
       },
       "movie_update_batch_s": {
-        "decentdb": 0.018583809956908226,
-        "decentdb_vs_sqlite": 2.2193707507973484,
+        "decentdb": 0.018743477994576097,
+        "decentdb_vs_sqlite": 2.4676244294247605,
         "direction": "lower_is_better",
-        "sqlite": 0.00837345898617059,
+        "sqlite": 0.0075957579974783584,
         "winner": "sqlite"
       },
       "movie_vacuum_s": {
-        "decentdb": 0.013662113924510777,
-        "decentdb_vs_sqlite": 0.2274789312877222,
+        "decentdb": 0.011847595000290312,
+        "decentdb_vs_sqlite": 0.21401804711582534,
         "direction": "lower_is_better",
-        "sqlite": 0.060058810049667954,
+        "sqlite": 0.05535792499722447,
         "winner": "decentdb"
       },
       "movie_watchlist_s": {
-        "decentdb": 0.00015029299538582563,
-        "decentdb_vs_sqlite": 0.7034509777425176,
+        "decentdb": 0.00018203200306743383,
+        "decentdb_vs_sqlite": 0.737589806672207,
         "direction": "lower_is_better",
-        "sqlite": 0.00021365098655223846,
+        "sqlite": 0.0002467930025886744,
         "winner": "decentdb"
       },
       "movie_watchlist_s_rows": {
@@ -620,7 +620,7 @@
       "status": "skipped"
     }
   },
-  "generated_at": "2026-06-29T22:35:27.265843+00:00",
+  "generated_at": "2026-07-01T04:03:43.198977+00:00",
   "python": {
     "executable": "/usr/bin/python",
     "version": "3.14.6"
@@ -628,46 +628,46 @@
   "results": {
     "complex": {
       "decentdb": {
-        "aggregate_p50_ms": 0.027542,
-        "aggregate_p95_ms": 0.045155,
-        "catalog_insert_s": 0.0015566640067845583,
-        "delete_p50_ms": 0.030036,
-        "delete_p95_ms": 0.038763,
-        "history_p50_ms": 0.007043,
-        "history_p95_ms": 0.008817,
-        "join_p50_ms": 0.049433,
-        "join_p95_ms": 0.059261,
-        "orders_insert_rps": 438410.81795550423,
-        "point_lookup_p50_ms": 0.002184,
-        "point_lookup_p95_ms": 0.002524,
-        "range_scan_p50_ms": 0.01051,
-        "range_scan_p95_ms": 0.018124,
-        "report_query_s": 4.261010326445103e-05,
-        "table_scan_p50_ms": 0.002786,
-        "table_scan_p95_ms": 0.003015,
-        "update_p50_ms": 0.003938,
-        "update_p95_ms": 0.108864
+        "aggregate_p50_ms": 0.027341,
+        "aggregate_p95_ms": 0.044364,
+        "catalog_insert_s": 0.0022600049996981397,
+        "delete_p50_ms": 0.027331,
+        "delete_p95_ms": 0.0369,
+        "history_p50_ms": 0.007284,
+        "history_p95_ms": 0.009968,
+        "join_p50_ms": 0.050615,
+        "join_p95_ms": 0.069921,
+        "orders_insert_rps": 291240.5514584156,
+        "point_lookup_p50_ms": 0.002274,
+        "point_lookup_p95_ms": 0.003737,
+        "range_scan_p50_ms": 0.010149,
+        "range_scan_p95_ms": 0.0155,
+        "report_query_s": 4.187900049146265e-05,
+        "table_scan_p50_ms": 0.002855,
+        "table_scan_p95_ms": 0.003126,
+        "update_p50_ms": 0.004278,
+        "update_p95_ms": 0.113032
       },
       "sqlite": {
-        "aggregate_p50_ms": 0.006733,
-        "aggregate_p95_ms": 0.049283,
-        "catalog_insert_s": 0.001449401956051588,
-        "delete_p50_ms": 0.025197,
-        "delete_p95_ms": 0.034374,
-        "history_p50_ms": 0.00525,
-        "history_p95_ms": 0.011552,
-        "join_p50_ms": 0.039053,
-        "join_p95_ms": 0.055374,
-        "orders_insert_rps": 355715.5817018567,
-        "point_lookup_p50_ms": 0.00532,
-        "point_lookup_p95_ms": 0.006372,
-        "range_scan_p50_ms": 0.005921,
-        "range_scan_p95_ms": 0.032802,
-        "report_query_s": 0.0001781350001692772,
-        "table_scan_p50_ms": 0.004288,
-        "table_scan_p95_ms": 0.005159,
-        "update_p50_ms": 0.004288,
-        "update_p95_ms": 0.006753
+        "aggregate_p50_ms": 0.00547,
+        "aggregate_p95_ms": 0.041388,
+        "catalog_insert_s": 0.0011371759974281304,
+        "delete_p50_ms": 0.014767,
+        "delete_p95_ms": 0.022332,
+        "history_p50_ms": 0.004298,
+        "history_p95_ms": 0.009578,
+        "join_p50_ms": 0.03194,
+        "join_p95_ms": 0.039705,
+        "orders_insert_rps": 468790.5383722907,
+        "point_lookup_p50_ms": 0.004368,
+        "point_lookup_p95_ms": 0.004679,
+        "range_scan_p50_ms": 0.004869,
+        "range_scan_p95_ms": 0.028704,
+        "report_query_s": 0.00012597699969774112,
+        "table_scan_p50_ms": 0.003547,
+        "table_scan_p95_ms": 0.003657,
+        "update_p50_ms": 0.003467,
+        "update_p95_ms": 0.005551
       }
     },
     "movie": {
@@ -789,25 +789,25 @@
           }
         },
         "busiest_people_rows": 20,
-        "movie_bulk_load_rps": 101430.16962848562,
-        "movie_bulk_load_s": 0.4249228819971904,
-        "movie_busiest_people_s": 0.0003637330373749137,
+        "movie_bulk_load_rps": 98972.27147429365,
+        "movie_bulk_load_s": 0.43547550599760143,
+        "movie_busiest_people_s": 0.0003930180027964525,
         "movie_busiest_people_s_rows": 20,
-        "movie_checkpoint_after_mutations_s": 0.010005995980463922,
-        "movie_checkpoint_s": 0.03003479994367808,
+        "movie_checkpoint_after_mutations_s": 0.009730276993650477,
+        "movie_checkpoint_s": 0.04932977199496236,
         "movie_delete_cascade_rows": 10,
-        "movie_delete_cascade_s": 0.01813970599323511,
+        "movie_delete_cascade_s": 0.01761859500402352,
         "movie_final_file_size_bytes": 7630848,
         "movie_point_reads_rows": 1000,
-        "movie_point_reads_s": 0.008814257918857038,
-        "movie_tag_search_s": 0.0007657390087842941,
+        "movie_point_reads_s": 0.009619939999538474,
+        "movie_tag_search_s": 0.0007442169953719713,
         "movie_tag_search_s_rows": 50,
-        "movie_top_rated_s": 0.0005770439747720957,
+        "movie_top_rated_s": 0.0005890270040254109,
         "movie_top_rated_s_rows": 0,
         "movie_update_batch_rows": 1000,
-        "movie_update_batch_s": 0.018583809956908226,
-        "movie_vacuum_s": 0.013662113924510777,
-        "movie_watchlist_s": 0.00015029299538582563,
+        "movie_update_batch_s": 0.018743477994576097,
+        "movie_vacuum_s": 0.011847595000290312,
+        "movie_watchlist_s": 0.00018203200306743383,
         "movie_watchlist_s_rows": 2,
         "movies_after": 1990,
         "movies_before": 2000,
@@ -943,25 +943,25 @@
           }
         },
         "busiest_people_rows": 20,
-        "movie_bulk_load_rps": 152747.28180130193,
-        "movie_bulk_load_s": 0.28216541395522654,
-        "movie_busiest_people_s": 0.0019394430564716458,
+        "movie_bulk_load_rps": 148496.38896043666,
+        "movie_bulk_load_s": 0.2902427480003098,
+        "movie_busiest_people_s": 0.0020163680019322783,
         "movie_busiest_people_s_rows": 20,
-        "movie_checkpoint_after_mutations_s": 0.021043540094979107,
-        "movie_checkpoint_s": 0.04670922306831926,
+        "movie_checkpoint_after_mutations_s": 0.02531483300117543,
+        "movie_checkpoint_s": 0.05021182900236454,
         "movie_delete_cascade_rows": 10,
-        "movie_delete_cascade_s": 0.010781343095004559,
+        "movie_delete_cascade_s": 0.011614848001045175,
         "movie_final_file_size_bytes": 9400320,
         "movie_point_reads_rows": 1000,
-        "movie_point_reads_s": 0.006746081984601915,
-        "movie_tag_search_s": 0.00040004111360758543,
+        "movie_point_reads_s": 0.007814388001861516,
+        "movie_tag_search_s": 0.0003813759976765141,
         "movie_tag_search_s_rows": 50,
-        "movie_top_rated_s": 0.0011416140478104353,
+        "movie_top_rated_s": 0.001178824000817258,
         "movie_top_rated_s_rows": 0,
         "movie_update_batch_rows": 1000,
-        "movie_update_batch_s": 0.00837345898617059,
-        "movie_vacuum_s": 0.060058810049667954,
-        "movie_watchlist_s": 0.00021365098655223846,
+        "movie_update_batch_s": 0.0075957579974783584,
+        "movie_vacuum_s": 0.05535792499722447,
+        "movie_watchlist_s": 0.0002467930025886744,
         "movie_watchlist_s_rows": 2,
         "movies_after": 1990,
         "movies_before": 2000,

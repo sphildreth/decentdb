@@ -77,53 +77,13 @@ jobs:
             echo "::error::Smoke benchmark did not produce results at $RESULT_DIR/results.json" >&2
             exit 1
           fi
-          RESULT_COUNT="$(python - <<'PY' "$RESULT_DIR/results.json"
-import json
-import sys
-path = sys.argv[1]
-payload = json.loads(open(path, "r", encoding="utf-8").read())
-summary = payload.get("summary") or payload.get("summaries") or []
-if not summary:
-    raise SystemExit("missing benchmark summary")
-by_engine = {}
-for row in summary:
-    by_engine.setdefault(row.get("Engine"), []).append(row.get("Scenario"))
-
-if "DecentDB" not in by_engine or "SQLite" not in by_engine:
-    raise SystemExit("summary is missing DecentDB or SQLite rows")
-
-expected_scenarios = {
-    "01. Bulk Insert Companies",
-    "02. Bulk Insert Users",
-    "03. Bulk Insert Addresses",
-    "04. Bulk Insert Invoices",
-    "05. Bulk Insert Invoice Items",
-    "06. Point Reads (PK lookup)",
-    "07a. Raw Joined Aggregate",
-    "07b. Build Revenue Summary",
-    "07c. Read Revenue Summary",
-    "08. Substring Search (LIKE %token%)",
-    "09. Update Invoices Paid",
-    "10. Complex Window/Analytic Query",
-    "11. View Query (Unpaid Invoices)",
-    "12. Delete Cascade Test",
-}
-
-missing_decent = expected_scenarios - set(by_engine["DecentDB"])
-if missing_decent:
-    raise SystemExit(f"DecentDB summary missing scenarios: {', '.join(sorted(missing_decent))}")
-
-missing_sqlite = expected_scenarios - set(by_engine["SQLite"])
-if missing_sqlite:
-    raise SystemExit(f"SQLite summary missing scenarios: {', '.join(sorted(missing_sqlite))}")
-
-if any(float(item.get("MeanMs", 0.0)) <= 0 for item in summary):
-    raise SystemExit("summary contains non-positive mean duration")
-
-print(len(summary))
-PY
-)"
-          echo "Smoke summary rows: $RESULT_COUNT"
+          python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
+            --current "$RESULT_DIR/results.json" \
+            --require-complete \
+            --expected-engines "DecentDB,SQLite" \
+            --max-mean-ms 60000 \
+            --output "$RESULT_DIR/smoke-validation.json"
+          echo "Smoke validation passed: $RESULT_DIR/results.json"
 
       - name: Upload smoke artifacts
         uses: actions/upload-artifact@v4
@@ -243,6 +203,8 @@ PY
               --current "$RELEASE_RELAXED" \
               --max-regression 0.10 \
               --check-decentdb-win \
+              --require-complete \
+              --expected-engines "DecentDB,SQLite" \
               --output "$PRIMARY_DIR/compare-ado-relaxed.json"
           fi
 
@@ -262,6 +224,8 @@ PY
               --current "$RELEASE_DURABLE" \
               --max-regression 0.10 \
               --check-decentdb-win \
+              --require-complete \
+              --expected-engines "DecentDB,SQLite" \
               --output "$PRIMARY_DIR/compare-ado-durable.json"
           fi
 

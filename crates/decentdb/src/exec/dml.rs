@@ -311,6 +311,12 @@ struct PreparedIntArithmeticUpdate {
     delta_source: PreparedSimpleValueSource,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedBoolUpdate {
+    column_index: usize,
+    value_source: PreparedSimpleValueSource,
+}
+
 impl EngineRuntime {
     fn record_sync_update_for_row(
         &mut self,
@@ -3044,6 +3050,145 @@ impl EngineRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn try_execute_paged_bool_update(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        matching_row_ids: &[i64],
+        prepared_update: &PreparedBoolUpdate,
+        indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(&table.name).cloned()
+        else {
+            return Ok(None);
+        };
+
+        let resolved_value = resolve_prepared_simple_value(&prepared_update.value_source, params)?;
+        let resolved_value = super::constraints::coerce_column_value(
+            &table.columns[prepared_update.column_index],
+            resolved_value,
+        )?;
+
+        let mut prepared_indexes = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
+        for index in indexes_to_update {
+            if !index.fresh || index.kind != IndexKind::Btree {
+                if !stale_indexes.contains(&index.name) {
+                    stale_indexes.push(index.name.clone());
+                }
+                continue;
+            }
+            match prepare_btree_insert_index(self, table, index)? {
+                Some(prepared_index) => prepared_indexes.push(prepared_index),
+                None => {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
+                    }
+                }
+            }
+        }
+
+        let mut affected_rows = 0_u64;
+        let mut changed_rows = 0_u64;
+        let mut row_changes = BTreeMap::new();
+        let mut returning_rows = Vec::new();
+
+        for &row_id in matching_row_ids {
+            let current_row = manifest
+                .row_by_id(row_id)?
+                .map(|row| StoredRow {
+                    row_id,
+                    values: row.values().to_vec(),
+                })
+                .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
+
+            let Some(current_value) = current_row.values.get(prepared_update.column_index) else {
+                return Err(DbError::internal(format!(
+                    "column index {} is invalid for {}",
+                    prepared_update.column_index, table.name
+                )));
+            };
+
+            if *current_value == resolved_value {
+                affected_rows += 1;
+                if !returning.is_empty() {
+                    returning_rows.push(current_row);
+                }
+                continue;
+            }
+
+            let mut next_values = current_row.values.clone();
+            next_values[prepared_update.column_index] = resolved_value.clone();
+            validate_assigned_not_null_columns(
+                table,
+                std::slice::from_ref(&prepared_update.column_index),
+                &next_values,
+                &table.name,
+            )?;
+            for index in &prepared_indexes {
+                if !apply_prepared_btree_index_update_for_row_change(
+                    self,
+                    &table.name,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
+                }
+            }
+
+            self.record_sync_update_for_row(table, &next_values);
+            row_changes.insert(row_id, Some(next_values.clone()));
+            if !returning.is_empty() {
+                returning_rows.push(StoredRow {
+                    row_id,
+                    values: next_values,
+                });
+            }
+            changed_rows += 1;
+            affected_rows += 1;
+        }
+
+        if changed_rows > 0 {
+            let updated_manifest =
+                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+            self.replace_table_row_source(
+                &table.name,
+                TableRowSource::Paged(Arc::new(updated_manifest)),
+            )?;
+            for (row_id, next_values) in &row_changes {
+                if let Some(values) = next_values {
+                    self.mark_table_row_dirty(&table.name, 0, *row_id, values);
+                }
+            }
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
+            }
+        }
+
+        self.execute_after_triggers(
+            &table.name,
+            TriggerEvent::Update,
+            affected_rows as usize,
+            page_size,
+        )?;
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn try_execute_resident_int_arithmetic_update(
         &mut self,
         table: &crate::catalog::TableSchema,
@@ -3249,6 +3394,215 @@ impl EngineRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_resident_bool_update(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        matching_row_ids: &[i64],
+        prepared_update: &PreparedBoolUpdate,
+        indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        let Some(TableRowSource::Resident(_)) = self.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+
+        let resolved_value = resolve_prepared_simple_value(&prepared_update.value_source, params)?;
+        let resolved_value = super::constraints::coerce_column_value(
+            &table.columns[prepared_update.column_index],
+            resolved_value,
+        )?;
+
+        let mut prepared_indexes = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
+        for index in indexes_to_update {
+            if !index.fresh || index.kind != IndexKind::Btree {
+                if !stale_indexes.contains(&index.name) {
+                    stale_indexes.push(index.name.clone());
+                }
+                continue;
+            }
+            match prepare_btree_insert_index(self, table, index)? {
+                Some(prepared_index) => prepared_indexes.push(prepared_index),
+                None => {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
+                    }
+                }
+            }
+        }
+
+        let mut affected_rows = 0_u64;
+        let mut changed_rows = 0_u64;
+        let mut returning_rows = Vec::new();
+
+        for &row_id in matching_row_ids {
+            let (row_index, current_value, old_values) = {
+                let Some(table_data) = self.table_data(&table.name) else {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        table.name
+                    )));
+                };
+                let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
+                    DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                })?;
+                let stored_row = &table_data.rows[row_index];
+                let current_value = stored_row.values.get(prepared_update.column_index).cloned();
+                let old_values = if prepared_indexes.is_empty() {
+                    None
+                } else {
+                    Some(stored_row.values.clone())
+                };
+                (row_index, current_value, old_values)
+            };
+
+            let Some(current_value) = current_value else {
+                return Err(DbError::internal(format!(
+                    "column index {} is invalid for {}",
+                    prepared_update.column_index, table.name
+                )));
+            };
+
+            if current_value == resolved_value {
+                affected_rows += 1;
+                if !returning.is_empty() {
+                    let values = if let Some(values) = old_values.as_ref() {
+                        values.clone()
+                    } else {
+                        let Some(table_data) = self.table_data(&table.name) else {
+                            return Err(DbError::internal(format!(
+                                "table data for {} is missing",
+                                table.name
+                            )));
+                        };
+                        table_data.rows[row_index].values.clone()
+                    };
+                    returning_rows.push(StoredRow { row_id, values });
+                }
+                continue;
+            }
+
+            if let Some(old_values) = old_values.as_ref() {
+                let mut next_values = old_values.clone();
+                next_values[prepared_update.column_index] = resolved_value.clone();
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                for index in &prepared_indexes {
+                    if !apply_prepared_btree_index_update_for_row_change(
+                        self,
+                        &table.name,
+                        index,
+                        row_id,
+                        old_values,
+                        &next_values,
+                    )? && !stale_indexes.contains(&index.name)
+                    {
+                        stale_indexes.push(index.name.clone());
+                    }
+                }
+                {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    table_data
+                        .replace_row_values(row_index, next_values.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                }
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    old_values,
+                    &next_values,
+                );
+                self.record_sync_update_for_row(table, &next_values);
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values,
+                    });
+                }
+            } else {
+                let (next_values, old_values) = {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    let old_values = table_data.rows[row_index].values.clone();
+                    table_data
+                        .replace_value(
+                            row_index,
+                            prepared_update.column_index,
+                            resolved_value.clone(),
+                        )
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                    let next_values = table_data.rows[row_index].values.clone();
+                    (next_values, old_values)
+                };
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values.clone(),
+                    });
+                }
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    &old_values,
+                    &next_values,
+                );
+                self.record_sync_update_for_row(table, &next_values);
+            }
+
+            changed_rows += 1;
+            affected_rows += 1;
+        }
+
+        if changed_rows > 0 && !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
+        }
+
+        self.execute_after_triggers(
+            &table.name,
+            TriggerEvent::Update,
+            affected_rows as usize,
+            page_size,
+        )?;
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
+        }
+    }
+
     pub(super) fn execute_update(
         &mut self,
         statement: &UpdateStatement,
@@ -3351,6 +3705,21 @@ impl EngineRuntime {
             && !updates_foreign_key_columns
         {
             if let Some(prepared_update) =
+                compile_prepared_bool_update(statement, &table, &assignment_columns)
+            {
+                if let Some(result) = self.try_execute_paged_bool_update(
+                    &table,
+                    &matching_row_ids,
+                    &prepared_update,
+                    &indexes_to_update,
+                    &statement.returning,
+                    params,
+                    page_size,
+                )? {
+                    return Ok(result);
+                }
+            }
+            if let Some(prepared_update) =
                 compile_int_arithmetic_update(statement, &table, &assignment_columns)
             {
                 if let Some(result) = self.try_execute_paged_int_arithmetic_update(
@@ -3385,6 +3754,21 @@ impl EngineRuntime {
             }
         }
         if assignment_only_validation && !has_referencing_tables && !updates_foreign_key_columns {
+            if let Some(prepared_update) =
+                compile_prepared_bool_update(statement, &table, &assignment_columns)
+            {
+                if let Some(result) = self.try_execute_resident_bool_update(
+                    &table,
+                    &matching_row_ids,
+                    &prepared_update,
+                    &indexes_to_update,
+                    &statement.returning,
+                    params,
+                    page_size,
+                )? {
+                    return Ok(result);
+                }
+            }
             if let Some(prepared_update) =
                 compile_int_arithmetic_update(statement, &table, &assignment_columns)
             {
@@ -5431,6 +5815,29 @@ fn compile_int_arithmetic_update(
     }
 }
 
+fn compile_prepared_bool_update(
+    statement: &UpdateStatement,
+    table: &crate::catalog::TableSchema,
+    assignment_columns: &[usize],
+) -> Option<PreparedBoolUpdate> {
+    let ([assignment], [assignment_column]) = (&statement.assignments[..], assignment_columns)
+    else {
+        return None;
+    };
+
+    let column = table.columns.get(*assignment_column)?;
+    if column.column_type != ColumnType::Bool {
+        return None;
+    }
+
+    let value_source = compile_prepared_simple_value_source(&assignment.expr)?;
+
+    Some(PreparedBoolUpdate {
+        column_index: *assignment_column,
+        value_source,
+    })
+}
+
 fn resolve_simple_update_assignments(
     table: &crate::catalog::TableSchema,
     assignments: &[Assignment],
@@ -5634,7 +6041,7 @@ fn prepare_btree_insert_index(
         let column_index = table
             .columns
             .iter()
-            .position(|entry| entry.name == *column_name)
+            .position(|entry| identifiers_equal(&entry.name, column_name))
             .ok_or_else(|| {
                 DbError::constraint(format!("index column {} does not exist", column_name))
             })?;
@@ -5670,7 +6077,7 @@ fn prepare_btree_insert_index(
                     table
                         .columns
                         .iter()
-                        .find(|entry| entry.name == *column_name)
+                        .find(|entry| identifiers_equal(&entry.name, column_name))
                 })
                 .is_some_and(|column| column.nullable)
         }),
@@ -6900,7 +7307,7 @@ fn compound_btree_range_row_ids_for_filter(
     Ok(None)
 }
 
-fn dml_flattened_and_predicates<'a>(expr: &'a Expr) -> Vec<&'a Expr> {
+fn dml_flattened_and_predicates(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::Binary {
             left,
@@ -7002,9 +7409,9 @@ enum DmlRangeBoundKind {
     Upper(bool),
 }
 
-fn dml_simple_range_bound<'a>(
-    predicate: &'a Expr,
-) -> Option<(Option<&'a str>, &'a str, DmlRangeBoundKind, &'a Expr)> {
+fn dml_simple_range_bound(
+    predicate: &Expr,
+) -> Option<(Option<&str>, &str, DmlRangeBoundKind, &Expr)> {
     let Expr::Binary { left, op, right } = predicate else {
         return None;
     };
