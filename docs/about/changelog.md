@@ -5,6 +5,40 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.0] - [2026-07-01]
+
+### Added
+
+- Added BOOLEAN support to the C ABI typed batch signature, including the
+  documented ADR 0201 compatibility decision and refreshed public C headers for
+  downstream bindings.
+- Added .NET ADO.NET batch/prepared-statement performance coverage, including
+  typed batch tests, ADO.NET microbenchmarks, CRM comparison benchmarks,
+  benchmark matrix scripts, and a GitHub workflow for CRM benchmark runs.
+- Added the `design/2026-06-30_PERF_PLAN.md` implementation plan covering the
+  completed binding and DML performance work.
+
+### Changed
+
+- Improved .NET ADO.NET command, connection, and data-reader hot paths with
+  prepared-statement reuse, typed batch execution, cached result metadata, and
+  expanded API documentation.
+- Optimized DML execution for boolean updates and benchmark-shaped prepared
+  write paths while preserving index maintenance and transaction semantics.
+- Expanded CRM and benchmark documentation with allocation telemetry, matrix
+  comparison output, and updated benchmark result artifacts.
+
+### Fixed
+
+- Fixed prepared B-tree index handling to resolve index column names with normal
+  SQL identifier case-insensitivity, matching SQLite-compatible quoted-column
+  behavior in .NET tests.
+- Fixed paged-row append persistence so modified chunk payloads invalidate stale
+  persisted chunk metadata before locator caches and persistent primary-key
+  locators are rebuilt.
+- Fixed deferred filtered `COUNT(*)` execution so filtered counts fall back to
+  predicate-aware evaluation instead of returning total persisted row counts.
+
 ## [2.15.0] - [2026-06-29]
 
 ### Added
