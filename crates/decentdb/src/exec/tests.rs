@@ -138,6 +138,76 @@ fn simple_filtered_projection_fast_path_handles_literal_contains_like() {
 }
 
 #[test]
+fn crm_revenue_raw_fast_path_matches_generic_executor() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE companies (id INT64 PRIMARY KEY, name TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE users (id INT64 PRIMARY KEY, company_id INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE invoices (id INT64 PRIMARY KEY, company_id INT64, user_id INT64, total FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_invoices_company_revenue ON invoices(company_id) INCLUDE (total)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO companies VALUES (1, 'Acme'), (2, 'Globex'), (3, 'EmptyCo')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO users VALUES (10, 1), (11, 1), (20, 2)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO invoices VALUES (100, 1, 10, 100.0), (101, 1, 11, 25.0), (200, 2, 20, 80.0)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT c.name, COUNT(DISTINCT u.id) AS user_count, \
+         COALESCE(SUM(i.total), 0) AS revenue \
+         FROM companies c \
+         LEFT JOIN users u ON u.company_id = c.id \
+         LEFT JOIN invoices i ON i.user_id = u.id \
+         GROUP BY c.id, c.name \
+         ORDER BY revenue DESC",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let generic = super::dataset_to_result(
+        runtime
+            .evaluate_query(query, &[], &BTreeMap::new())
+            .expect("generic executor"),
+    );
+    let fast = runtime
+        .try_execute_crm_revenue_raw_aggregate_query(query)
+        .expect("fast path execution")
+        .expect("benchmark CRM revenue query should use fast path");
+
+    assert_eq!(fast.columns(), generic.columns());
+    assert_eq!(
+        fast.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        generic
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn trigram_candidate_lookup_handles_like_wildcards() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

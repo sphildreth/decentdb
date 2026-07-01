@@ -24112,7 +24112,7 @@ impl EngineRuntime {
         let Some(users_source) = self.visible_table_row_source("users") else {
             return Ok(None);
         };
-        let mut seen_user_ids = BTreeSet::new();
+        let mut counted_company_users = BTreeSet::new();
         let mut user_counts = BTreeMap::new();
         for row in users_source.rows() {
             let row = row?;
@@ -24120,9 +24120,6 @@ impl EngineRuntime {
             else {
                 continue;
             };
-            if !seen_user_ids.insert(user_id) {
-                continue;
-            }
             let Some(company_id) = crm_i64_cell(
                 row.values().get(users_company_id_index),
                 "users",
@@ -24131,7 +24128,9 @@ impl EngineRuntime {
             else {
                 continue;
             };
-            if company_names.contains_key(&company_id) {
+            if company_names.contains_key(&company_id)
+                && counted_company_users.insert((company_id, user_id))
+            {
                 *user_counts.entry(company_id).or_insert(0_i64) += 1;
             }
         }
@@ -24154,12 +24153,17 @@ impl EngineRuntime {
         let mut rows = Vec::with_capacity(company_names.len());
         for (company_id, company_name) in company_names {
             let revenue = revenues.get(&company_id).copied().unwrap_or(0.0);
+            let revenue_value = revenues
+                .get(&company_id)
+                .copied()
+                .map(Value::Float64)
+                .unwrap_or(Value::Int64(0));
             rows.push((
                 revenue,
                 QueryRow::new(vec![
                     Value::Text(company_name),
                     Value::Int64(user_counts.get(&company_id).copied().unwrap_or(0)),
-                    Value::Float64(revenue),
+                    revenue_value,
                 ]),
             ));
         }
@@ -35557,6 +35561,7 @@ fn crm_revenue_from_covering_dense(
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| DbError::constraint("company id exceeded addressable summary range"))?;
     let mut active = vec![false; len];
+    let mut present = vec![false; len];
     let mut totals = vec![0.0_f64; len];
     for company_id in company_names.keys().copied() {
         let Ok(index) = usize::try_from(company_id) else {
@@ -35574,6 +35579,7 @@ fn crm_revenue_from_covering_dense(
                     continue;
                 };
                 if index < active.len() && active[index] {
+                    present[index] = true;
                     totals[index] += total;
                 }
             }
@@ -35590,6 +35596,7 @@ fn crm_revenue_from_covering_dense(
                     continue;
                 };
                 if index < active.len() && active[index] {
+                    present[index] = true;
                     totals[index] += total;
                 }
             }
@@ -35600,7 +35607,9 @@ fn crm_revenue_from_covering_dense(
     for company_id in company_names.keys().copied() {
         let index = usize::try_from(company_id)
             .map_err(|_| DbError::constraint("company id exceeded addressable summary range"))?;
-        revenues.insert(company_id, totals.get(index).copied().unwrap_or(0.0));
+        if present.get(index).copied().unwrap_or(false) {
+            revenues.insert(company_id, totals.get(index).copied().unwrap_or(0.0));
+        }
     }
     Ok(Some(revenues))
 }

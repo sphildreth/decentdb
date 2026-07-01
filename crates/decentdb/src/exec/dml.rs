@@ -7060,6 +7060,7 @@ fn materialize_company_revenue_summary(runtime: &EngineRuntime) -> Result<Option
     };
     let mut user_counts = BTreeMap::new();
     let mut user_company_ids = BTreeMap::new();
+    let mut counted_company_users = BTreeSet::new();
     users_source.visit_int64_column_values(users_company_id_index, |row_id, company_id| {
         if let Some(company_id) = company_id {
             if company_ids.contains(&company_id) {
@@ -7069,9 +7070,11 @@ fn materialize_company_revenue_summary(runtime: &EngineRuntime) -> Result<Option
         Ok(())
     })?;
     users_source.visit_int64_column_values(users_id_index, |row_id, user_id| {
-        if user_id.is_some() {
+        if let Some(user_id) = user_id {
             if let Some(company_id) = user_company_ids.get(&row_id).copied() {
-                *user_counts.entry(company_id).or_insert(0_i64) += 1;
+                if counted_company_users.insert((company_id, user_id)) {
+                    *user_counts.entry(company_id).or_insert(0_i64) += 1;
+                }
             }
         }
         Ok(())
@@ -7848,7 +7851,7 @@ fn compound_btree_range_row_ids_for_filter(
         else {
             continue;
         };
-        let Some((_lower, _upper)) = dml_range_bounds_for_column(
+        let Some((lower, upper)) = dml_range_bounds_for_column(
             runtime,
             &predicates,
             table_ref,
@@ -7863,9 +7866,17 @@ fn compound_btree_range_row_ids_for_filter(
         let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
             continue;
         };
+        let used_predicate_count =
+            prefix_values.len() + usize::from(lower.is_some()) + usize::from(upper.is_some());
         return Ok(Some(IndexedFilterRowIds {
-            row_ids: keys.row_ids_for_encoded_key_prefix(&prefix_values)?,
-            fully_covers_filter: false,
+            row_ids: compound_btree_range_row_ids(
+                keys,
+                &prefix_values,
+                prefix_values.len(),
+                lower.as_ref(),
+                upper.as_ref(),
+            )?,
+            fully_covers_filter: used_predicate_count == predicates.len(),
         }));
     }
 
@@ -8192,6 +8203,57 @@ fn single_btree_range_row_ids(
             }
         }
     }
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok(row_ids)
+}
+
+fn compound_btree_range_row_ids(
+    keys: &super::RuntimeBtreeKeys,
+    prefix_values: &[Value],
+    range_value_index: usize,
+    lower: Option<&DmlRangeBoundValue>,
+    upper: Option<&DmlRangeBoundValue>,
+) -> Result<Vec<i64>> {
+    let mut row_ids = Vec::new();
+    let mut collect_matching_row_ids =
+        |encoded_key: &[u8], entry_row_ids: &[i64], deleted: &BTreeSet<i64>| -> Result<()> {
+            if !Row::encoded_prefix_matches(encoded_key, prefix_values)? {
+                return Ok(());
+            }
+            let row = Row::decode(encoded_key)?;
+            let Some(range_value) = row.values().get(range_value_index) else {
+                return Ok(());
+            };
+            if dml_value_position_in_range(range_value, lower, upper)? != DmlRangePosition::Match {
+                return Ok(());
+            }
+            row_ids.extend(
+                entry_row_ids
+                    .iter()
+                    .copied()
+                    .filter(|row_id| !deleted.contains(row_id)),
+            );
+            Ok(())
+        };
+
+    match keys {
+        super::RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
+            for (encoded_key, row_id) in entries.iter() {
+                collect_matching_row_ids(encoded_key, std::slice::from_ref(row_id), deleted)?;
+            }
+        }
+        super::RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
+            for (encoded_key, entry_row_ids) in entries.iter() {
+                collect_matching_row_ids(encoded_key, entry_row_ids, deleted)?;
+            }
+        }
+        super::RuntimeBtreeKeys::UniqueInt64(_, _)
+        | super::RuntimeBtreeKeys::NonUniqueInt64(_, _)
+        | super::RuntimeBtreeKeys::UniqueUuid(_, _)
+        | super::RuntimeBtreeKeys::NonUniqueUuid(_, _) => {}
+    }
+
     row_ids.sort_unstable();
     row_ids.dedup();
     Ok(row_ids)
