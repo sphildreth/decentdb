@@ -59,6 +59,12 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
+
       - name: Run smoke benchmark
         run: |
           set -euo pipefail
@@ -110,6 +116,12 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
+
       - name: Run nightly matrix benchmark
         run: |
           set -euo pipefail
@@ -147,6 +159,12 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
 
       - name: Run release matrix benchmark
         id: run
