@@ -14015,6 +14015,7 @@ fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
         primary_auto_row_id_column_index: None,
         value_sources: vec![PreparedInsertValueSource::Null],
         required_columns: Vec::new(),
+        generated_columns: Vec::new(),
         foreign_keys: Vec::new(),
         unique_indexes: Vec::new(),
         insert_indexes: Vec::new(),

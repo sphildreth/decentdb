@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Threading;
@@ -17,23 +18,46 @@ namespace DecentDB.AdoNet
         private bool _hasRows;
         private bool _isClosed;
         private int _recordsAffected;
+        private int _fieldCount = -1;
+        private string[]? _columnNames;
+        private Dictionary<string, int>? _ordinalLookup;
 
         private readonly int _initialStepResult;
+        private readonly bool _knownMaxOneRow;
         private bool _initialStepConsumed;
+        private bool _exhausted;
 
-        internal DecentDBDataReader(DecentDBCommand command, PreparedStatement statement, int initialStepResult, SqlObservation? observation)
+        internal DecentDBDataReader(
+            DecentDBCommand command,
+            PreparedStatement statement,
+            int initialStepResult,
+            SqlObservation? observation,
+            bool knownMaxOneRow = false)
         {
             _command = command;
             _statement = statement;
             _initialStepResult = initialStepResult;
+            _knownMaxOneRow = knownMaxOneRow;
             _sqlObservation = observation;
             _hasRows = initialStepResult == 1;
+            _fieldCount = statement.CapturedRowColumnCount;
             _recordsAffected = -1;
         }
 
         public override int Depth => 0;
 
-        public override int FieldCount => _statement.ColumnCount;
+        public override int FieldCount
+        {
+            get
+            {
+                if (_fieldCount < 0)
+                {
+                    _fieldCount = _statement.ColumnCount;
+                }
+
+                return _fieldCount;
+            }
+        }
 
         public override bool HasRows => _hasRows;
 
@@ -87,7 +111,7 @@ namespace DecentDB.AdoNet
 
         public override string GetName(int ordinal)
         {
-            return _statement.ColumnName(ordinal);
+            return GetColumnName(ordinal);
         }
 
         public override string GetDataTypeName(int ordinal)
@@ -347,17 +371,60 @@ namespace DecentDB.AdoNet
             return _statement.IsNull(ordinal);
         }
 
+        private string GetColumnName(int ordinal)
+        {
+            var names = _columnNames;
+            if (names == null)
+            {
+                var count = FieldCount;
+                if ((uint)ordinal >= (uint)count)
+                {
+                    return _statement.ColumnName(ordinal);
+                }
+
+                names = new string[count];
+                _columnNames = names;
+            }
+            else if ((uint)ordinal >= (uint)names.Length)
+            {
+                return _statement.ColumnName(ordinal);
+            }
+
+            var name = names[ordinal];
+            if (name != null)
+            {
+                return name;
+            }
+
+            name = _statement.ColumnName(ordinal);
+            names[ordinal] = name;
+            return name;
+        }
+
         public override int GetOrdinal(string name)
         {
-            var count = _statement.ColumnCount;
-            for (int i = 0; i < count; i++)
+            _ordinalLookup ??= BuildOrdinalLookup();
+            if (_ordinalLookup.TryGetValue(name, out var ordinal))
             {
-                if (_statement.ColumnName(i).Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return i;
-                }
+                return ordinal;
             }
             throw new IndexOutOfRangeException($"Column '{name}' not found");
+        }
+
+        private Dictionary<string, int> BuildOrdinalLookup()
+        {
+            var lookup = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var count = FieldCount;
+            for (var i = 0; i < count; i++)
+            {
+                var columnName = GetColumnName(i);
+                if (!lookup.ContainsKey(columnName))
+                {
+                    lookup.Add(columnName, i);
+                }
+            }
+
+            return lookup;
         }
 
         public override int GetValues(object[] values)
@@ -386,7 +453,18 @@ namespace DecentDB.AdoNet
                     throw new DecentDBException(_initialStepResult, "Step failed", _command.CommandText);
                 }
 
-                return _initialStepResult == 1;
+                var hasRow = _initialStepResult == 1;
+                if (!hasRow || _knownMaxOneRow)
+                {
+                    _exhausted = true;
+                }
+
+                return hasRow;
+            }
+
+            if (_exhausted)
+            {
+                return false;
             }
 
             var result = _statement.Step();
@@ -397,7 +475,13 @@ namespace DecentDB.AdoNet
                 throw ex;
             }
 
-            return result == 1;
+            var hasNextRow = result == 1;
+            if (!hasNextRow)
+            {
+                _exhausted = true;
+            }
+
+            return hasNextRow;
         }
 
         public override Task<bool> ReadAsync(CancellationToken cancellationToken)
@@ -425,14 +509,17 @@ namespace DecentDB.AdoNet
             if (_isClosed) return;
             _isClosed = true;
 
-            CompleteSqlObservationOnce(exception: null);
+            if (_sqlObservation != null)
+            {
+                CompleteSqlObservationOnce(exception: null);
+            }
             _command.FinalizeStatement();
         }
 
         private void CompleteSqlObservationOnce(Exception? exception)
         {
-            if (_sqlObservationCompleted) return;
             if (_sqlObservation == null) return;
+            if (_sqlObservationCompleted) return;
 
             _sqlObservationCompleted = true;
             _command.OwnerConnection.CompleteSqlObservation(_sqlObservation, _statement.RowsAffected, exception);

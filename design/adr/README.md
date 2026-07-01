@@ -8,6 +8,7 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0201-c-abi-typed-batch-bool-signature.md**: Extends the existing `ddb_stmt_execute_batch_typed` signature grammar with `b` for BOOLEAN values encoded through the existing `values_i64` array, preserving the C function shape while letting bindings keep boolean DML on the typed prepared-batch path.
 - **0199-transaction-local-cascade-delete-batching.md**: Proposed transaction-local row-change delta design for making cascade deletes visible statement-by-statement while batching physical child-table compaction and index maintenance, targeting the MovieDB cascade SQLite gap without changing FK semantics or durability.
 - **0198-vectorized-returning-dml-execution.md**: Proposed prepared-plan, direct-projection, and transaction-local vectorized execution design for closing `UPDATE RETURNING` and `INSERT RETURNING` SQLite gaps through ordinary repeated execute calls without weakening durability or changing benchmark lanes.
 - **0197-fulltext-runtime-index-delta-overlays.md**: Proposed runtime fulltext base-plus-overlay design to remove whole-index copy-on-write clones during small DML, targeting the Showdown bulk delete and fulltext-index mutation gaps while preserving ADR 0175/0176 fulltext semantics.

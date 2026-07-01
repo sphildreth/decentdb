@@ -5,6 +5,7 @@ using System.Data.Common;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics.CodeAnalysis;
@@ -36,6 +37,8 @@ namespace DecentDB.AdoNet
         private DbParameter[]? _cachedRewriteParameterRefs;
         private string?[]? _cachedRewriteParameterNames;
         private bool _cachedRewriteNeedsOffsetClamp;
+        private SingleRowReadPlan? _cachedSingleRowReadPlan;
+        private SingleInt64NonQueryPlan? _cachedSingleInt64NonQueryPlan;
         private Int64TextFloat64NonQueryPlan? _cachedInt64TextFloat64NonQueryPlan;
         private bool _disposed;
 
@@ -338,6 +341,11 @@ namespace DecentDB.AdoNet
 
                     if (canUseSingleInt64Step)
                     {
+                        var knownMaxOneRow = TryGetCachedSingleRowReadPlan(
+                            sql,
+                            fastIndex,
+                            out var singleRowPlan) && singleRowPlan.KnownMaxOneRow;
+
                         _statement = stmt;
                         _statementCanSkipFinalizeReset = true;
 
@@ -359,6 +367,7 @@ namespace DecentDB.AdoNet
                             var ex = new DecentDBException(fastStepResult, db.LastErrorMessage, sql);
                             if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
                             {
+                                _cachedSingleRowReadPlan = null;
                                 _connection.ClearPreparedStatementCacheForSchemaChange();
                                 continue;
                             }
@@ -366,7 +375,7 @@ namespace DecentDB.AdoNet
                             throw ex;
                         }
 
-                        return new DecentDBDataReader(this, stmt, fastStepResult, observation);
+                        return new DecentDBDataReader(this, stmt, fastStepResult, observation, knownMaxOneRow);
                     }
 
                     _statementCanSkipFinalizeReset = false;
@@ -395,6 +404,7 @@ namespace DecentDB.AdoNet
                         var ex = new DecentDBException(stepResult, db.LastErrorMessage, sql);
                         if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
                         {
+                            _cachedSingleRowReadPlan = null;
                             _connection.ClearPreparedStatementCacheForSchemaChange();
                             continue;
                         }
@@ -561,6 +571,8 @@ namespace DecentDB.AdoNet
             _cachedRewriteParameterRefs = null;
             _cachedRewriteParameterNames = null;
             _cachedRewriteNeedsOffsetClamp = false;
+            _cachedSingleRowReadPlan = null;
+            _cachedSingleInt64NonQueryPlan = null;
             _cachedInt64TextFloat64NonQueryPlan = null;
         }
 
@@ -864,6 +876,612 @@ namespace DecentDB.AdoNet
             }
         }
 
+        private bool TryGetCachedSingleRowReadPlan(
+            string sql,
+            int parameterIndex1Based,
+            [NotNullWhen(true)] out SingleRowReadPlan? plan)
+        {
+            if (_cachedSingleRowReadPlan != null &&
+                _cachedSingleRowReadPlan.Matches(_commandText, sql, parameterIndex1Based, _parameters))
+            {
+                plan = _cachedSingleRowReadPlan;
+                return true;
+            }
+
+            plan = null;
+            if (_connection == null)
+            {
+                return false;
+            }
+
+            var knownMaxOneRow = TryDescribeKnownSingleRowRead(sql, parameterIndex1Based);
+            plan = new SingleRowReadPlan(_commandText, sql, parameterIndex1Based, _parameters, knownMaxOneRow);
+            _cachedSingleRowReadPlan = plan;
+            return true;
+        }
+
+        private bool TryDescribeKnownSingleRowRead(string sql, int parameterIndex1Based)
+        {
+            if (_connection == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (!TryParseSingleTablePrimaryKeyEquality(
+                        sql,
+                        parameterIndex1Based,
+                        out var sourceTable,
+                        out var sourceColumn))
+                {
+                    return false;
+                }
+
+                return TableHasSingleColumnPrimaryKey(sourceTable, sourceColumn);
+            }
+            catch (DecentDBException)
+            {
+                return false;
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
+        private bool TableHasSingleColumnPrimaryKey(string tableName, string columnName)
+        {
+            if (_connection == null)
+            {
+                return false;
+            }
+
+            using var columnsDocument = JsonDocument.Parse(_connection.GetTableColumnsJson(tableName));
+            if (columnsDocument.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            var primaryKeyCount = 0;
+            var matchedPrimaryKey = false;
+            foreach (var column in columnsDocument.RootElement.EnumerateArray())
+            {
+                if (!JsonBoolEquals(column, "primary_key", expected: true))
+                {
+                    continue;
+                }
+
+                primaryKeyCount++;
+                if (TryGetNonEmptyJsonString(column, "name", out var name) &&
+                    IdentifiersEqual(name, columnName))
+                {
+                    matchedPrimaryKey = true;
+                }
+            }
+
+            return primaryKeyCount == 1 && matchedPrimaryKey;
+        }
+
+        private static bool JsonBoolEquals(JsonElement element, string propertyName, bool expected)
+        {
+            return element.TryGetProperty(propertyName, out var property) &&
+                property.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                property.GetBoolean() == expected;
+        }
+
+        private static bool TryGetNonEmptyJsonString(
+            JsonElement element,
+            string propertyName,
+            [NotNullWhen(true)] out string? value)
+        {
+            value = null;
+            if (!element.TryGetProperty(propertyName, out var property) ||
+                property.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+
+            value = property.GetString();
+            return !string.IsNullOrWhiteSpace(value);
+        }
+
+        private static bool TryParseSingleTablePrimaryKeyEquality(
+            string sql,
+            int parameterIndex1Based,
+            [NotNullWhen(true)] out string? sourceTable,
+            [NotNullWhen(true)] out string? sourceColumn)
+        {
+            sourceTable = null;
+            sourceColumn = null;
+            var tokens = TokenizeSqlShape(sql);
+            var whereIndex = IndexOfTopLevelKeyword(tokens, "where", start: 0, end: tokens.Count);
+            if (whereIndex < 0 ||
+                !HasSingleTopLevelTableSource(tokens, whereIndex) ||
+                !TryGetSingleTopLevelTableName(tokens, whereIndex, out sourceTable))
+            {
+                return false;
+            }
+
+            var start = whereIndex + 1;
+            var end = FindWhereClauseEnd(tokens, start);
+            TrimTrivia(tokens, ref start, ref end);
+            TrimWrappingParentheses(tokens, ref start, ref end);
+
+            return TryMatchColumnParameterEquality(
+                tokens,
+                start,
+                end,
+                parameterIndex1Based,
+                out sourceColumn);
+        }
+
+        private static int IndexOfTopLevelKeyword(
+            List<SqlShapeToken> tokens,
+            string keyword,
+            int start,
+            int end)
+        {
+            var depth = 0;
+            for (var i = start; i < end; i++)
+            {
+                var token = tokens[i];
+                if (token.Kind == SqlShapeTokenKind.OpenParen)
+                {
+                    depth++;
+                    continue;
+                }
+
+                if (token.Kind == SqlShapeTokenKind.CloseParen)
+                {
+                    depth = Math.Max(0, depth - 1);
+                    continue;
+                }
+
+                if (depth == 0 && IsKeyword(token, keyword))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static bool HasSingleTopLevelTableSource(List<SqlShapeToken> tokens, int whereIndex)
+        {
+            var fromIndex = IndexOfTopLevelKeyword(tokens, "from", start: 0, end: whereIndex);
+            if (fromIndex < 0)
+            {
+                return false;
+            }
+
+            var depth = 0;
+            for (var i = fromIndex + 1; i < whereIndex; i++)
+            {
+                var token = tokens[i];
+                if (token.Kind == SqlShapeTokenKind.OpenParen)
+                {
+                    if (depth == 0)
+                    {
+                        return false;
+                    }
+
+                    depth++;
+                    continue;
+                }
+
+                if (token.Kind == SqlShapeTokenKind.CloseParen)
+                {
+                    depth = Math.Max(0, depth - 1);
+                    continue;
+                }
+
+                if (depth != 0)
+                {
+                    continue;
+                }
+
+                if (token.Kind == SqlShapeTokenKind.Comma ||
+                    IsKeyword(token, "join"))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool TryGetSingleTopLevelTableName(
+            List<SqlShapeToken> tokens,
+            int whereIndex,
+            [NotNullWhen(true)] out string? tableName)
+        {
+            tableName = null;
+            var fromIndex = IndexOfTopLevelKeyword(tokens, "from", start: 0, end: whereIndex);
+            if (fromIndex < 0 || fromIndex + 1 >= whereIndex)
+            {
+                return false;
+            }
+
+            var tableToken = tokens[fromIndex + 1];
+            if (tableToken.Kind != SqlShapeTokenKind.Identifier)
+            {
+                return false;
+            }
+
+            if (fromIndex + 3 < whereIndex &&
+                tokens[fromIndex + 2].Kind == SqlShapeTokenKind.Dot &&
+                tokens[fromIndex + 3].Kind == SqlShapeTokenKind.Identifier)
+            {
+                // GetTableColumnsJson is table-name scoped today; keep this
+                // conservative rather than guessing how to resolve schemas.
+                return false;
+            }
+
+            tableName = tableToken.Text;
+            return !string.IsNullOrWhiteSpace(tableName);
+        }
+
+        private static int FindWhereClauseEnd(List<SqlShapeToken> tokens, int start)
+        {
+            var depth = 0;
+            for (var i = start; i < tokens.Count; i++)
+            {
+                var token = tokens[i];
+                if (token.Kind == SqlShapeTokenKind.OpenParen)
+                {
+                    depth++;
+                    continue;
+                }
+
+                if (token.Kind == SqlShapeTokenKind.CloseParen)
+                {
+                    depth = Math.Max(0, depth - 1);
+                    continue;
+                }
+
+                if (depth != 0)
+                {
+                    continue;
+                }
+
+                if (token.Kind == SqlShapeTokenKind.Semicolon ||
+                    IsKeyword(token, "group") ||
+                    IsKeyword(token, "order") ||
+                    IsKeyword(token, "limit") ||
+                    IsKeyword(token, "offset") ||
+                    IsKeyword(token, "union") ||
+                    IsKeyword(token, "except") ||
+                    IsKeyword(token, "intersect"))
+                {
+                    return i;
+                }
+            }
+
+            return tokens.Count;
+        }
+
+        private static void TrimTrivia(List<SqlShapeToken> tokens, ref int start, ref int end)
+        {
+            while (start < end && tokens[start].Kind == SqlShapeTokenKind.Semicolon)
+            {
+                start++;
+            }
+
+            while (end > start && tokens[end - 1].Kind == SqlShapeTokenKind.Semicolon)
+            {
+                end--;
+            }
+        }
+
+        private static void TrimWrappingParentheses(List<SqlShapeToken> tokens, ref int start, ref int end)
+        {
+            while (end - start >= 2 &&
+                tokens[start].Kind == SqlShapeTokenKind.OpenParen &&
+                tokens[end - 1].Kind == SqlShapeTokenKind.CloseParen &&
+                MatchingCloseParenthesis(tokens, start, end) == end - 1)
+            {
+                start++;
+                end--;
+                TrimTrivia(tokens, ref start, ref end);
+            }
+        }
+
+        private static int MatchingCloseParenthesis(List<SqlShapeToken> tokens, int openIndex, int end)
+        {
+            var depth = 0;
+            for (var i = openIndex; i < end; i++)
+            {
+                if (tokens[i].Kind == SqlShapeTokenKind.OpenParen)
+                {
+                    depth++;
+                }
+                else if (tokens[i].Kind == SqlShapeTokenKind.CloseParen)
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return i;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        private static bool TryMatchColumnParameterEquality(
+            List<SqlShapeToken> tokens,
+            int start,
+            int end,
+            int parameterIndex1Based,
+            [NotNullWhen(true)] out string? sourceColumn)
+        {
+            sourceColumn = null;
+            var equalsIndex = -1;
+            for (var i = start; i < end; i++)
+            {
+                if (tokens[i].Kind != SqlShapeTokenKind.Equals)
+                {
+                    continue;
+                }
+
+                if (equalsIndex >= 0)
+                {
+                    return false;
+                }
+
+                equalsIndex = i;
+            }
+
+            if (equalsIndex < 0)
+            {
+                return false;
+            }
+
+            if (TryGetColumnReferenceName(tokens, start, equalsIndex, out var leftColumn) &&
+                IsParameterReference(tokens, equalsIndex + 1, end, parameterIndex1Based))
+            {
+                sourceColumn = leftColumn;
+                return true;
+            }
+
+            if (IsParameterReference(tokens, start, equalsIndex, parameterIndex1Based) &&
+                TryGetColumnReferenceName(tokens, equalsIndex + 1, end, out var rightColumn))
+            {
+                sourceColumn = rightColumn;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetColumnReferenceName(
+            List<SqlShapeToken> tokens,
+            int start,
+            int end,
+            [NotNullWhen(true)] out string? sourceColumn)
+        {
+            sourceColumn = null;
+            var length = end - start;
+            if (length == 1)
+            {
+                if (tokens[start].Kind != SqlShapeTokenKind.Identifier)
+                {
+                    return false;
+                }
+
+                sourceColumn = tokens[start].Text;
+                return !string.IsNullOrWhiteSpace(sourceColumn);
+            }
+
+            if (length == 3 &&
+                tokens[start].Kind == SqlShapeTokenKind.Identifier &&
+                tokens[start + 1].Kind == SqlShapeTokenKind.Dot &&
+                tokens[start + 2].Kind == SqlShapeTokenKind.Identifier)
+            {
+                sourceColumn = tokens[start + 2].Text;
+                return !string.IsNullOrWhiteSpace(sourceColumn);
+            }
+
+            return false;
+        }
+
+        private static bool IsParameterReference(
+            List<SqlShapeToken> tokens,
+            int start,
+            int end,
+            int parameterIndex1Based)
+        {
+            return end - start == 1 &&
+                tokens[start].Kind == SqlShapeTokenKind.Parameter &&
+                tokens[start].ParameterIndex == parameterIndex1Based;
+        }
+
+        private static bool IsKeyword(SqlShapeToken token, string keyword)
+        {
+            return token.Kind == SqlShapeTokenKind.Identifier &&
+                string.Equals(token.Text, keyword, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IdentifiersEqual(string left, string right)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<SqlShapeToken> TokenizeSqlShape(string sql)
+        {
+            var tokens = new List<SqlShapeToken>();
+            for (var i = 0; i < sql.Length;)
+            {
+                var ch = sql[i];
+                if (char.IsWhiteSpace(ch))
+                {
+                    i++;
+                    continue;
+                }
+
+                if (ch == '-' && i + 1 < sql.Length && sql[i + 1] == '-')
+                {
+                    i += 2;
+                    while (i < sql.Length && sql[i] != '\n')
+                    {
+                        i++;
+                    }
+                    continue;
+                }
+
+                if (ch == '/' && i + 1 < sql.Length && sql[i + 1] == '*')
+                {
+                    i += 2;
+                    while (i + 1 < sql.Length && (sql[i] != '*' || sql[i + 1] != '/'))
+                    {
+                        i++;
+                    }
+                    i = Math.Min(sql.Length, i + 2);
+                    continue;
+                }
+
+                if (ch == '\'')
+                {
+                    i = SkipQuotedString(sql, i, '\'');
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    var (identifier, next) = ReadDelimitedIdentifier(sql, i, '"', '"');
+                    tokens.Add(new SqlShapeToken(SqlShapeTokenKind.Identifier, identifier));
+                    i = next;
+                    continue;
+                }
+
+                if (ch == '[')
+                {
+                    var (identifier, next) = ReadDelimitedIdentifier(sql, i, '[', ']');
+                    tokens.Add(new SqlShapeToken(SqlShapeTokenKind.Identifier, identifier));
+                    i = next;
+                    continue;
+                }
+
+                if (IsIdentifierStart(ch))
+                {
+                    var start = i;
+                    i++;
+                    while (i < sql.Length && IsIdentifierPart(sql[i]))
+                    {
+                        i++;
+                    }
+
+                    tokens.Add(new SqlShapeToken(SqlShapeTokenKind.Identifier, sql[start..i]));
+                    continue;
+                }
+
+                if (ch == '$' && i + 1 < sql.Length && char.IsAsciiDigit(sql[i + 1]))
+                {
+                    var start = i + 1;
+                    i += 2;
+                    while (i < sql.Length && char.IsAsciiDigit(sql[i]))
+                    {
+                        i++;
+                    }
+
+                    if (int.TryParse(sql[start..i], NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+                    {
+                        tokens.Add(new SqlShapeToken(SqlShapeTokenKind.Parameter, parameterIndex: index));
+                    }
+                    continue;
+                }
+
+                tokens.Add(ch switch
+                {
+                    '=' => new SqlShapeToken(SqlShapeTokenKind.Equals),
+                    '.' => new SqlShapeToken(SqlShapeTokenKind.Dot),
+                    ',' => new SqlShapeToken(SqlShapeTokenKind.Comma),
+                    '(' => new SqlShapeToken(SqlShapeTokenKind.OpenParen),
+                    ')' => new SqlShapeToken(SqlShapeTokenKind.CloseParen),
+                    ';' => new SqlShapeToken(SqlShapeTokenKind.Semicolon),
+                    _ => new SqlShapeToken(SqlShapeTokenKind.Other)
+                });
+                i++;
+            }
+
+            return tokens;
+        }
+
+        private static int SkipQuotedString(string sql, int start, char quote)
+        {
+            var i = start + 1;
+            while (i < sql.Length)
+            {
+                if (sql[i] != quote)
+                {
+                    i++;
+                    continue;
+                }
+
+                if (i + 1 < sql.Length && sql[i + 1] == quote)
+                {
+                    i += 2;
+                    continue;
+                }
+
+                return i + 1;
+            }
+
+            return sql.Length;
+        }
+
+        private static (string Identifier, int Next) ReadDelimitedIdentifier(
+            string sql,
+            int start,
+            char open,
+            char close)
+        {
+            var value = new StringBuilder();
+            var i = start + 1;
+            while (i < sql.Length)
+            {
+                if (sql[i] != close)
+                {
+                    value.Append(sql[i]);
+                    i++;
+                    continue;
+                }
+
+                if (open == close && i + 1 < sql.Length && sql[i + 1] == close)
+                {
+                    value.Append(close);
+                    i += 2;
+                    continue;
+                }
+
+                return (value.ToString(), i + 1);
+            }
+
+            return (value.ToString(), sql.Length);
+        }
+
+        private static bool IsIdentifierStart(char ch)
+        {
+            return ch == '_' ||
+                (ch >= 'A' && ch <= 'Z') ||
+                (ch >= 'a' && ch <= 'z');
+        }
+
+        private static bool IsIdentifierPart(char ch)
+        {
+            return IsIdentifierStart(ch) ||
+                (ch >= '0' && ch <= '9');
+        }
+
         private static decimal NormalizeDecimalScale(DbParameter parameter, decimal value)
         {
             if (parameter is not DecentDBParameter decentParameter || !decentParameter.HasScale)
@@ -910,6 +1528,11 @@ namespace DecentDB.AdoNet
             if (_parameters.Count == 0 && TryExecutePragmaNonQuery(out var pragmaRowsAffected))
             {
                 return pragmaRowsAffected;
+            }
+
+            if (TryExecuteCachedSingleInt64NonQuery(out var singleInt64RowsAffected))
+            {
+                return singleInt64RowsAffected;
             }
 
             if (TryExecuteCachedInt64TextFloat64NonQuery(out var fastRowsAffected))
@@ -1014,6 +1637,88 @@ namespace DecentDB.AdoNet
                 textParameter,
                 floatParameter,
                 out rowsAffected);
+        }
+
+        private bool TryExecuteCachedSingleInt64NonQuery(out int rowsAffected)
+        {
+            rowsAffected = 0;
+            if (_connection == null ||
+                _connection.IsSqlObservationEnabled ||
+                !TryGetCachedSingleInt64NonQueryPlan(out var plan))
+            {
+                return false;
+            }
+
+            for (var attempt = 0; ; attempt++)
+            {
+                var stmt = EnsurePreparedStatement(plan.Sql, resetForExecution: false);
+                var rawValue = plan.Parameter.Value;
+                if (rawValue == null ||
+                    rawValue == DBNull.Value ||
+                    !TryGetOptimizedInt64(plan.Parameter, rawValue, out var intValue))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    rowsAffected = checked((int)stmt.RebindInt64Execute(intValue));
+                    return true;
+                }
+                catch (DecentDBException ex)
+                {
+                    InvalidatePreparedStatement(discardFromConnectionCache: true);
+                    if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                    {
+                        _connection.ClearPreparedStatementCacheForSchemaChange();
+                        continue;
+                    }
+
+                    throw;
+                }
+                catch
+                {
+                    InvalidatePreparedStatement(discardFromConnectionCache: true);
+                    throw;
+                }
+            }
+        }
+
+        private bool TryGetCachedSingleInt64NonQueryPlan(
+            [NotNullWhen(true)] out SingleInt64NonQueryPlan? plan)
+        {
+            if (_cachedSingleInt64NonQueryPlan != null &&
+                _cachedSingleInt64NonQueryPlan.Matches(_commandText, _parameters))
+            {
+                plan = _cachedSingleInt64NonQueryPlan;
+                return true;
+            }
+
+            plan = null;
+            if (_parameters.Count != 1 || GetSplitStatements().Count != 1)
+            {
+                return false;
+            }
+
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp ||
+                paramMap.Count != 1 ||
+                !paramMap.TryGetValue(1, out var parameter))
+            {
+                return false;
+            }
+
+            var value = parameter.Value;
+            if (value == null ||
+                value == DBNull.Value ||
+                !TryGetOptimizedInt64(parameter, value, out _))
+            {
+                return false;
+            }
+
+            plan = new SingleInt64NonQueryPlan(_commandText, sql, _parameters[0], parameter);
+            _cachedSingleInt64NonQueryPlan = plan;
+            return true;
         }
 
         private bool TryExecuteCachedInt64TextFloat64NonQuery(out int rowsAffected)
@@ -1189,6 +1894,7 @@ namespace DecentDB.AdoNet
             Span<double> f64Values = stackalloc double[paramMap.Count];
             byte[]? text0 = null;
             byte[]? text1 = null;
+            byte[]? text2 = null;
             var i64Count = 0;
             var f64Count = 0;
             var textCount = 0;
@@ -1213,6 +1919,13 @@ namespace DecentDB.AdoNet
                     continue;
                 }
 
+                if (TryGetOptimizedBoolean(parameter, value, out var boolValue))
+                {
+                    signatureUtf8[ordinal - 1] = (byte)'b';
+                    i64Values[i64Count++] = boolValue ? 1 : 0;
+                    continue;
+                }
+
                 if (TryGetOptimizedFloat64(value, out var floatValue))
                 {
                     signatureUtf8[ordinal - 1] = (byte)'f';
@@ -1230,6 +1943,10 @@ namespace DecentDB.AdoNet
                     else if (textCount == 1)
                     {
                         text1 = textBytes;
+                    }
+                    else if (textCount == 2)
+                    {
+                        text2 = textBytes;
                     }
                     else
                     {
@@ -1250,6 +1967,7 @@ namespace DecentDB.AdoNet
                 f64Values[..f64Count],
                 text0,
                 text1,
+                text2,
                 textCount));
             return true;
         }
@@ -1294,6 +2012,26 @@ namespace DecentDB.AdoNet
                 default:
                     return false;
             }
+        }
+
+        private static bool TryGetOptimizedBoolean(
+            DbParameter parameter,
+            object value,
+            out bool result)
+        {
+            result = default;
+            if (parameter.DbType == DbType.Guid)
+            {
+                return false;
+            }
+
+            if (value is bool boolValue)
+            {
+                result = boolValue;
+                return true;
+            }
+
+            return false;
         }
 
         private static bool TryGetOptimizedFloat64(object value, out double result)
@@ -1501,6 +2239,137 @@ namespace DecentDB.AdoNet
             pragmaName = pragmaNamePart;
             pragmaArgument = string.IsNullOrWhiteSpace(pragmaArgumentPart) ? null : pragmaArgumentPart;
             return true;
+        }
+
+        private readonly struct SqlShapeToken
+        {
+            public SqlShapeToken(
+                SqlShapeTokenKind kind,
+                string text = "",
+                int parameterIndex = 0)
+            {
+                Kind = kind;
+                Text = text;
+                ParameterIndex = parameterIndex;
+            }
+
+            public SqlShapeTokenKind Kind { get; }
+
+            public string Text { get; }
+
+            public int ParameterIndex { get; }
+        }
+
+        private enum SqlShapeTokenKind
+        {
+            Identifier,
+            Parameter,
+            Equals,
+            Dot,
+            Comma,
+            OpenParen,
+            CloseParen,
+            Semicolon,
+            Other
+        }
+
+        private sealed class SingleRowReadPlan
+        {
+            private readonly DbParameter[] _parameterRefs;
+            private readonly string?[] _parameterNames;
+
+            public SingleRowReadPlan(
+                string sourceSql,
+                string sql,
+                int parameterIndex1Based,
+                IReadOnlyList<DecentDBParameter> parameters,
+                bool knownMaxOneRow)
+            {
+                SourceSql = sourceSql;
+                Sql = sql;
+                ParameterIndex1Based = parameterIndex1Based;
+                KnownMaxOneRow = knownMaxOneRow;
+                _parameterRefs = new DbParameter[parameters.Count];
+                _parameterNames = new string?[parameters.Count];
+                for (var i = 0; i < parameters.Count; i++)
+                {
+                    _parameterRefs[i] = parameters[i];
+                    _parameterNames[i] = parameters[i].ParameterName;
+                }
+            }
+
+            public string SourceSql { get; }
+
+            public string Sql { get; }
+
+            public int ParameterIndex1Based { get; }
+
+            public bool KnownMaxOneRow { get; }
+
+            public bool Matches(
+                string sourceSql,
+                string sql,
+                int parameterIndex1Based,
+                IReadOnlyList<DecentDBParameter> parameters)
+            {
+                if (!string.Equals(SourceSql, sourceSql, StringComparison.Ordinal) ||
+                    !string.Equals(Sql, sql, StringComparison.Ordinal) ||
+                    ParameterIndex1Based != parameterIndex1Based ||
+                    _parameterRefs.Length != parameters.Count ||
+                    _parameterNames.Length != parameters.Count)
+                {
+                    return false;
+                }
+
+                for (var i = 0; i < parameters.Count; i++)
+                {
+                    if (!ReferenceEquals(_parameterRefs[i], parameters[i]) ||
+                        !string.Equals(_parameterNames[i], parameters[i].ParameterName, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        private sealed class SingleInt64NonQueryPlan
+        {
+            public SingleInt64NonQueryPlan(
+                string sourceSql,
+                string sql,
+                DecentDBParameter collectionParameter,
+                DbParameter parameter)
+            {
+                SourceSql = sourceSql;
+                Sql = sql;
+                CollectionParameter = collectionParameter;
+                CollectionParameterName = collectionParameter.ParameterName;
+                Parameter = parameter;
+                ParameterName = parameter.ParameterName;
+            }
+
+            public string SourceSql { get; }
+
+            public string Sql { get; }
+
+            public DbParameter Parameter { get; }
+
+            private DecentDBParameter CollectionParameter { get; }
+
+            private string CollectionParameterName { get; }
+
+            private string ParameterName { get; }
+
+            public bool Matches(string commandText, IReadOnlyList<DecentDBParameter> parameters)
+            {
+                return parameters.Count == 1 &&
+                       string.Equals(SourceSql, commandText, StringComparison.Ordinal) &&
+                       ReferenceEquals(CollectionParameter, parameters[0]) &&
+                       string.Equals(CollectionParameterName, parameters[0].ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(ParameterName, Parameter.ParameterName, StringComparison.Ordinal);
+            }
         }
 
         private sealed class Int64TextFloat64NonQueryPlan

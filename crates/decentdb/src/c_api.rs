@@ -3259,10 +3259,12 @@ pub extern "C" fn ddb_stmt_execute_batch_i64_text_f64(
 /// Execute a batch of rows using a type signature string.
 ///
 /// `signature` is a NUL-terminated ASCII string where each character describes
-/// one column per row: `'i'` = INT64, `'t'` = TEXT, `'f'` = FLOAT64.
+/// one column per row: `'i'` = INT64, `'b'` = BOOLEAN, `'t'` = TEXT,
+/// `'f'` = FLOAT64.
 ///
 /// The caller provides flat, row-major arrays for each type:
-/// - `values_i64`: all INT64 values, packed in row order
+/// - `values_i64`: all INT64 and BOOLEAN values, packed in row order. BOOLEAN
+///   uses `0` for false and non-zero for true.
 /// - `values_f64`: all FLOAT64 values, packed in row order
 /// - `values_text_ptrs` / `values_text_lens`: text pointer/length pairs, row order
 ///
@@ -3299,7 +3301,7 @@ pub extern "C" fn ddb_stmt_execute_batch_typed(
         let mut text_per_row: usize = 0;
         for &ch in sig {
             match ch {
-                b'i' => i64_per_row += 1,
+                b'i' | b'b' => i64_per_row += 1,
                 b'f' => f64_per_row += 1,
                 b't' => text_per_row += 1,
                 other => {
@@ -3352,6 +3354,11 @@ pub extern "C" fn ddb_stmt_execute_batch_typed(
                     match ch {
                         b'i' => {
                             params[col] = Value::Int64(i64_vals[row_idx * i64_per_row + i_off]);
+                            i_off += 1;
+                        }
+                        b'b' => {
+                            params[col] =
+                                Value::Bool(i64_vals[row_idx * i64_per_row + i_off] != 0);
                             i_off += 1;
                         }
                         b'f' => {

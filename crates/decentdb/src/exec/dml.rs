@@ -51,6 +51,7 @@ pub(crate) struct PreparedBtreeIndex {
     pub(crate) covering_payload_column_indexes: Vec<usize>,
     pub(crate) nullable: bool,
     pub(crate) unique: bool,
+    pub(crate) predicate_expr: Option<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +65,12 @@ pub(crate) struct PreparedInsertColumn {
 pub(crate) struct PreparedRequiredColumn {
     pub(crate) index: usize,
     pub(crate) name: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedGeneratedColumn {
+    pub(crate) index: usize,
+    pub(crate) expr: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +100,7 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) primary_auto_row_id_column_index: Option<usize>,
     pub(crate) value_sources: Vec<PreparedInsertValueSource>,
     pub(crate) required_columns: Vec<PreparedRequiredColumn>,
+    pub(crate) generated_columns: Vec<PreparedGeneratedColumn>,
     pub(crate) foreign_keys: Vec<PreparedForeignKey>,
     pub(crate) unique_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
@@ -252,6 +260,17 @@ impl PreparedSimpleDelete {
                     child.child_table.name.as_str(),
                     index_name,
                 );
+            }
+        }
+        for children in self.delete_children_by_table.values() {
+            for child in children {
+                if let Some(index_name) = child.child_index_name.as_deref() {
+                    push_unique_child_index_hydration_target(
+                        &mut targets,
+                        child.child_table.name.as_str(),
+                        index_name,
+                    );
+                }
             }
         }
         targets
@@ -619,17 +638,6 @@ impl EngineRuntime {
         {
             return false;
         }
-        if self
-            .table_schema(&statement.table_name)
-            .is_some_and(|table| {
-                table
-                    .columns
-                    .iter()
-                    .any(|column| column.generated_sql.is_some())
-            })
-        {
-            return false;
-        }
         if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
             return false;
         }
@@ -725,6 +733,7 @@ impl EngineRuntime {
             table
                 .columns
                 .iter()
+                .filter(|column| column.generated_sql.is_none())
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>()
         } else {
@@ -746,6 +755,12 @@ impl EngineRuntime {
                 .iter()
                 .position(|column| identifiers_equal(&column.name, column_name))
                 .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
+            if table.columns[column_index].generated_sql.is_some() {
+                return Err(DbError::sql(format!(
+                    "cannot INSERT into generated column {}.{}",
+                    table.name, column_name
+                )));
+            }
             if assigned[column_index].is_some() {
                 return Err(DbError::sql(format!(
                     "column {} was assigned more than once in INSERT",
@@ -760,6 +775,10 @@ impl EngineRuntime {
 
         let mut value_sources = Vec::with_capacity(table.columns.len());
         for (index, column) in table.columns.iter().enumerate() {
+            if column.generated_sql.is_some() {
+                value_sources.push(PreparedInsertValueSource::Null);
+                continue;
+            }
             if let Some(source) = assigned[index].take() {
                 value_sources.push(source);
                 continue;
@@ -801,6 +820,21 @@ impl EngineRuntime {
                 })
             })
             .collect::<Vec<_>>();
+        let generated_columns = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| {
+                if !column.generated_stored {
+                    return None;
+                }
+                let generated_sql = column.generated_sql.as_ref()?;
+                Some(
+                    parse_expression_sql(generated_sql)
+                        .map(|expr| PreparedGeneratedColumn { index, expr }),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let direct_positional_param_count =
             if value_sources
                 .iter()
@@ -825,9 +859,13 @@ impl EngineRuntime {
                 row_source_dependency_tables.push(foreign_key.referenced_table.clone());
             }
         }
-        let mut use_generic_validation =
-            table.columns.iter().any(|column| !column.checks.is_empty())
-                || !table.checks.is_empty();
+        let has_virtual_generated_columns = table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some() && !column.generated_stored);
+        let mut use_generic_validation = has_virtual_generated_columns
+            || table.columns.iter().any(|column| !column.checks.is_empty())
+            || !table.checks.is_empty();
         let mut foreign_keys = Vec::new();
         for foreign_key in &table.foreign_keys {
             let Some(prepared_foreign_key) = prepare_foreign_key(self, table, foreign_key)? else {
@@ -883,6 +921,7 @@ impl EngineRuntime {
             primary_auto_row_id_column_index,
             value_sources,
             required_columns,
+            generated_columns,
             foreign_keys,
             unique_indexes,
             insert_indexes,
@@ -1787,11 +1826,12 @@ impl EngineRuntime {
         page_size: u32,
     ) -> Result<QueryResult> {
         let mut next_row_id = prepared_next_row_id(self, prepared)?;
-        let candidate = if prepared.direct_positional_param_count == Some(params.len()) {
+        let mut candidate = if prepared.direct_positional_param_count == Some(params.len()) {
             materialize_direct_positional_insert_candidate(prepared, params, &mut next_row_id)?
         } else {
             materialize_prepared_insert_candidate(self, prepared, params, &mut next_row_id)?
         };
+        apply_prepared_generated_columns(self, prepared, &mut candidate, params)?;
         let sync_schema = if self.mutation_capture_active() {
             self.table_schema(prepared.table_name.as_str())
                 .filter(|schema| !schema.temporary)
@@ -1834,11 +1874,12 @@ impl EngineRuntime {
         page_size: u32,
     ) -> Result<QueryResult> {
         let mut next_row_id = prepared_next_row_id(self, prepared)?;
-        let candidate = if prepared.direct_positional_param_count == Some(params.len()) {
+        let mut candidate = if prepared.direct_positional_param_count == Some(params.len()) {
             materialize_direct_positional_insert_candidate(prepared, params, &mut next_row_id)?
         } else {
             materialize_prepared_insert_candidate(self, prepared, params, &mut next_row_id)?
         };
+        apply_prepared_generated_columns(self, prepared, &mut candidate, params)?;
         let sync_schema = if self.mutation_capture_active() {
             self.table_schema(prepared.table_name.as_str())
                 .filter(|schema| !schema.temporary)
@@ -1950,6 +1991,7 @@ impl EngineRuntime {
                 candidate.push(cast_prepared_owned_value(value, column.column_type)?);
             }
         }
+        apply_prepared_generated_columns(self, prepared, candidate, params)?;
 
         self.apply_prepared_simple_insert_candidate(
             prepared,
@@ -2014,6 +2056,7 @@ impl EngineRuntime {
                 candidate.push(cast_prepared_owned_value(value, column.column_type)?);
             }
         }
+        apply_prepared_generated_columns(self, prepared, candidate, params)?;
 
         let (affected, _stored_row, new_next_row_id) = self
             .apply_prepared_simple_insert_candidate_with_next_row_id_mode(
@@ -2306,6 +2349,44 @@ impl EngineRuntime {
         )
     }
 
+    fn apply_delete_row_ids_to_table_row_source(
+        &mut self,
+        table_name: &str,
+        row_ids: &BTreeSet<i64>,
+    ) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+        if self.temp_table_schema(table_name).is_some() {
+            let table_data = self.temp_table_data_mut(table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {table_name} is missing"))
+            })?;
+            table_data.mark_existing_row_set_deleted(row_ids);
+            return Ok(());
+        }
+        if matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Resident(_))
+        ) {
+            let table_data = self.table_data_mut(table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {table_name} is missing"))
+            })?;
+            table_data.mark_existing_row_set_deleted(row_ids);
+            return Ok(());
+        }
+        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        let updated_manifest =
+            super::apply_paged_row_deletions_to_manifest(manifest.as_ref(), row_ids)?;
+        self.replace_table_row_source(
+            table_name,
+            TableRowSource::Paged(Arc::new(updated_manifest)),
+        )
+    }
+
     fn apply_row_changes_to_resident_table_data(
         table_data: &mut super::TableData,
         row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
@@ -2515,6 +2596,20 @@ impl EngineRuntime {
         let mut returning_rows = Vec::new();
         let mut row_changes = BTreeMap::new();
         let mut stale_indexes: Vec<String> = Vec::new();
+        let index_predicates = indexes_to_update
+            .iter()
+            .map(super::prepare_index_predicate_expr)
+            .collect::<Result<Vec<_>>>()?;
+        let simple_resolved_assignments = resolve_simple_update_assignments(
+            table,
+            &statement.assignments,
+            assignment_columns,
+            params,
+        )?;
+        let has_generated_columns = table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some());
 
         for &row_id in matching_row_ids {
             let current_row = manifest
@@ -2524,23 +2619,38 @@ impl EngineRuntime {
                     values: row.values().to_vec(),
                 })
                 .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
-            let current_eval_values =
-                materialize_row_for_generated(self, table, &current_row.values)?.into_owned();
             let mut next_values = current_row.values.clone();
-            let dataset = table_row_dataset(table, &current_eval_values, &table.name);
-            for (assignment, column_index) in statement.assignments.iter().zip(assignment_columns) {
-                let value = self.eval_expr(
-                    &assignment.expr,
-                    &dataset,
-                    &current_eval_values,
-                    params,
-                    &std::collections::BTreeMap::new(),
-                    None,
-                )?;
-                next_values[*column_index] =
-                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
+            if let Some(simple_resolved_assignments) = simple_resolved_assignments.as_ref() {
+                for (column_index, value) in simple_resolved_assignments {
+                    next_values[*column_index] = value.clone();
+                }
+            } else {
+                let current_eval_values = if has_generated_columns {
+                    materialize_row_for_generated(self, table, &current_row.values)?
+                } else {
+                    Cow::Borrowed(current_row.values.as_slice())
+                };
+                let dataset = table_row_dataset(table, current_eval_values.as_ref(), &table.name);
+                for (assignment, column_index) in
+                    statement.assignments.iter().zip(assignment_columns)
+                {
+                    let value = self.eval_expr(
+                        &assignment.expr,
+                        &dataset,
+                        current_eval_values.as_ref(),
+                        params,
+                        &std::collections::BTreeMap::new(),
+                        None,
+                    )?;
+                    next_values[*column_index] = super::constraints::coerce_column_value(
+                        &table.columns[*column_index],
+                        value,
+                    )?;
+                }
             }
-            apply_generated_columns(self, table, &mut next_values, params)?;
+            if has_generated_columns {
+                apply_generated_columns(self, table, &mut next_values, params)?;
+            }
             if next_values == current_row.values {
                 affected_rows += 1;
                 if !statement.returning.is_empty() {
@@ -2568,7 +2678,7 @@ impl EngineRuntime {
                     page_size,
                 )?;
             }
-            for index in indexes_to_update {
+            for (index, predicate_expr) in indexes_to_update.iter().zip(&index_predicates) {
                 if !index.fresh {
                     if !stale_indexes.contains(&index.name) {
                         stale_indexes.push(index.name.clone());
@@ -2582,6 +2692,7 @@ impl EngineRuntime {
                     row_id,
                     &current_row.values,
                     &next_values,
+                    predicate_expr.as_ref(),
                 )? && !stale_indexes.contains(&index.name)
                 {
                     stale_indexes.push(index.name.clone());
@@ -2878,6 +2989,7 @@ impl EngineRuntime {
                     row_id,
                     &current_row.values,
                     &next_values,
+                    None,
                 )? && !stale_indexes.contains(&index.name)
                 {
                     stale_indexes.push(index.name.clone());
@@ -3042,6 +3154,7 @@ impl EngineRuntime {
                         row_id,
                         old_values,
                         &next_values,
+                        None,
                     )? && !stale_indexes.contains(&index.name)
                     {
                         stale_indexes.push(index.name.clone());
@@ -3171,8 +3284,14 @@ impl EngineRuntime {
             .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
-        let matching_row_ids =
-            matching_row_ids(self, &table_name, &table, statement.filter.as_ref(), params)?;
+        let matching_row_ids = matching_row_ids(
+            self,
+            &table_name,
+            &table_name,
+            &table,
+            statement.filter.as_ref(),
+            params,
+        )?;
         let table_indexes = self
             .catalog
             .indexes
@@ -3423,6 +3542,7 @@ impl EngineRuntime {
                             single_row_id,
                             &current_row.values,
                             &next_values,
+                            None,
                         )? && !stale_indexes.contains(&index.name)
                         {
                             stale_indexes.push(index.name.clone());
@@ -3508,6 +3628,16 @@ impl EngineRuntime {
         let mut changed_rows = 0_u64;
         let mut returning_rows = Vec::new();
         let mut stale_indexes: Vec<String> = Vec::new();
+        let simple_resolved_assignments = resolve_simple_update_assignments(
+            &table,
+            &statement.assignments,
+            &assignment_columns,
+            params,
+        )?;
+        let has_generated_columns = table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some());
         for row_id in matching_row_ids {
             let (row_index, current_row) = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
@@ -3518,24 +3648,38 @@ impl EngineRuntime {
                 })?;
                 (row_index, table_data.rows[row_index].clone())
             };
-            let current_eval_values =
-                materialize_row_for_generated(self, &table, &current_row.values)?.into_owned();
             let mut next_values = current_row.values.clone();
-            let dataset = table_row_dataset(&table, &current_eval_values, &table_name);
-            for (assignment, column_index) in statement.assignments.iter().zip(&assignment_columns)
-            {
-                let value = self.eval_expr(
-                    &assignment.expr,
-                    &dataset,
-                    &current_eval_values,
-                    params,
-                    &std::collections::BTreeMap::new(),
-                    None,
-                )?;
-                next_values[*column_index] =
-                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
+            if let Some(simple_resolved_assignments) = simple_resolved_assignments.as_ref() {
+                for (column_index, value) in simple_resolved_assignments {
+                    next_values[*column_index] = value.clone();
+                }
+            } else {
+                let current_eval_values = if has_generated_columns {
+                    materialize_row_for_generated(self, &table, &current_row.values)?
+                } else {
+                    Cow::Borrowed(current_row.values.as_slice())
+                };
+                let dataset = table_row_dataset(&table, current_eval_values.as_ref(), &table_name);
+                for (assignment, column_index) in
+                    statement.assignments.iter().zip(&assignment_columns)
+                {
+                    let value = self.eval_expr(
+                        &assignment.expr,
+                        &dataset,
+                        current_eval_values.as_ref(),
+                        params,
+                        &std::collections::BTreeMap::new(),
+                        None,
+                    )?;
+                    next_values[*column_index] = super::constraints::coerce_column_value(
+                        &table.columns[*column_index],
+                        value,
+                    )?;
+                }
             }
-            apply_generated_columns(self, &table, &mut next_values, params)?;
+            if has_generated_columns {
+                apply_generated_columns(self, &table, &mut next_values, params)?;
+            }
             if next_values == current_row.values {
                 affected_rows += 1;
                 if !statement.returning.is_empty() {
@@ -3577,6 +3721,7 @@ impl EngineRuntime {
                     row_id,
                     &current_row.values,
                     &next_values,
+                    None,
                 )? && !stale_indexes.contains(&index.name)
                 {
                     stale_indexes.push(index.name.clone());
@@ -3654,8 +3799,14 @@ impl EngineRuntime {
             .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
-        let matching_row_ids =
-            matching_row_ids(self, &table_name, &table, statement.filter.as_ref(), params)?;
+        let matching_row_ids = matching_row_ids(
+            self,
+            &table_name,
+            &table_name,
+            &table,
+            statement.filter.as_ref(),
+            params,
+        )?;
         let restrict_children_prepared = if table.temporary {
             Some(Vec::new())
         } else {
@@ -4522,6 +4673,7 @@ impl EngineRuntime {
                             row_id,
                             &current_row.values,
                             &next_values,
+                            None,
                         )? {
                             stale_indexes.push(index.name.clone());
                         }
@@ -4554,6 +4706,7 @@ impl EngineRuntime {
                             row_id,
                             &current_row.values,
                             &next_values,
+                            None,
                         )? {
                             stale_indexes.push(index.name.clone());
                         }
@@ -4626,19 +4779,7 @@ impl EngineRuntime {
             return Ok(());
         }
         for child in delete_children {
-            let matching_children =
-                matching_foreign_key_children_for_parent_rows(self, table, rows, child)?;
-            if matching_children.is_empty() {
-                continue;
-            }
             match child.foreign_key.on_delete {
-                crate::catalog::ForeignKeyAction::NoAction
-                | crate::catalog::ForeignKeyAction::Restrict => {
-                    return Err(DbError::constraint(format!(
-                        "DELETE on {} violates a foreign key from {}",
-                        table_name, child.child_table.name
-                    )))
-                }
                 crate::catalog::ForeignKeyAction::Cascade => {
                     let child_delete_children = match delete_children_by_table
                         .and_then(|cache| cache.get(&child.child_table.name))
@@ -4650,16 +4791,6 @@ impl EngineRuntime {
                             Cow::Owned(collect_parent_delete_children(self, &child.child_table)?)
                         }
                     };
-                    self.apply_parent_delete_actions_rows(
-                        &child.child_table.name,
-                        &child.child_table,
-                        &matching_children,
-                        child_delete_children.as_ref(),
-                        delete_children_by_table,
-                        table_indexes_by_table,
-                        params,
-                        page_size,
-                    )?;
                     let child_table_indexes = match table_indexes_by_table
                         .and_then(|cache| cache.get(&child.child_table.name))
                     {
@@ -4675,29 +4806,167 @@ impl EngineRuntime {
                                 .collect::<Vec<_>>(),
                         ),
                     };
-                    let stale_indexes = incremental_delete_indexes(
+                    if can_apply_terminal_cascade_delete_by_row_id(
+                        self,
+                        child,
+                        child_delete_children.as_ref(),
+                        child_table_indexes.as_ref(),
+                    ) {
+                        let deleted_child_row_ids =
+                            matching_foreign_key_child_row_ids_for_parent_rows_by_index(
+                                self, rows, child,
+                            )?;
+                        if deleted_child_row_ids.is_empty() {
+                            continue;
+                        }
+                        let row_source = self
+                            .table_row_source(&child.child_table.name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "table data for {} is missing",
+                                    child.child_table.name
+                                ))
+                            })?;
+                        let stale_indexes = incremental_delete_indexes_by_row_id(
+                            self,
+                            &child.child_table,
+                            child_table_indexes.as_ref(),
+                            &deleted_child_row_ids,
+                            &row_source,
+                        )?;
+                        self.apply_delete_row_ids_to_table_row_source(
+                            &child.child_table.name,
+                            &deleted_child_row_ids,
+                        )?;
+                        if !stale_indexes.is_empty() {
+                            self.mark_named_indexes_stale(&stale_indexes);
+                        }
+                        self.mark_table_rows_deleted(
+                            &child.child_table.name,
+                            &deleted_child_row_ids,
+                        );
+                        continue;
+                    }
+                    if can_apply_row_id_parent_cascade_delete(
+                        self,
+                        child,
+                        child_delete_children.as_ref(),
+                        child_table_indexes.as_ref(),
+                    ) {
+                        let deleted_child_row_ids =
+                            matching_foreign_key_child_row_ids_for_parent_rows_by_index(
+                                self, rows, child,
+                            )?;
+                        if deleted_child_row_ids.is_empty() {
+                            continue;
+                        }
+                        let synthetic_child_rows = synthesize_row_id_parent_rows(
+                            &child.child_table,
+                            &deleted_child_row_ids,
+                        )?;
+                        self.apply_parent_delete_actions_rows(
+                            &child.child_table.name,
+                            &child.child_table,
+                            &synthetic_child_rows,
+                            child_delete_children.as_ref(),
+                            delete_children_by_table,
+                            table_indexes_by_table,
+                            params,
+                            page_size,
+                        )?;
+                        let row_source = self
+                            .table_row_source(&child.child_table.name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "table data for {} is missing",
+                                    child.child_table.name
+                                ))
+                            })?;
+                        let stale_indexes = incremental_delete_indexes_by_row_id(
+                            self,
+                            &child.child_table,
+                            child_table_indexes.as_ref(),
+                            &deleted_child_row_ids,
+                            &row_source,
+                        )?;
+                        self.apply_delete_row_ids_to_table_row_source(
+                            &child.child_table.name,
+                            &deleted_child_row_ids,
+                        )?;
+                        if !stale_indexes.is_empty() {
+                            self.mark_named_indexes_stale(&stale_indexes);
+                        }
+                        self.mark_table_rows_deleted(
+                            &child.child_table.name,
+                            &deleted_child_row_ids,
+                        );
+                        continue;
+                    }
+
+                    let matching_children =
+                        matching_foreign_key_children_for_parent_rows(self, table, rows, child)?;
+                    if matching_children.is_empty() {
+                        continue;
+                    }
+                    self.apply_parent_delete_actions_rows(
+                        &child.child_table.name,
+                        &child.child_table,
+                        &matching_children,
+                        child_delete_children.as_ref(),
+                        delete_children_by_table,
+                        table_indexes_by_table,
+                        params,
+                        page_size,
+                    )?;
+                    let deleted_child_row_ids = matching_children
+                        .iter()
+                        .map(|row| row.row_id)
+                        .collect::<BTreeSet<_>>();
+                    let row_source = self
+                        .table_row_source(&child.child_table.name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "table data for {} is missing",
+                                child.child_table.name
+                            ))
+                        })?;
+                    let stale_indexes = incremental_delete_indexes_by_row_id(
                         self,
                         &child.child_table,
                         child_table_indexes.as_ref(),
-                        &matching_children,
+                        &deleted_child_row_ids,
+                        &row_source,
                     )?;
-                    let row_changes = matching_children
-                        .iter()
-                        .map(|row| (row.row_id, None))
-                        .collect::<BTreeMap<_, _>>();
-                    self.apply_row_changes_to_table_row_source(
+                    self.apply_delete_row_ids_to_table_row_source(
                         &child.child_table.name,
-                        &row_changes,
-                        page_size,
+                        &deleted_child_row_ids,
                     )?;
                     if !stale_indexes.is_empty() {
                         self.mark_named_indexes_stale(&stale_indexes);
                     }
-                    for child_row in &matching_children {
-                        self.mark_table_row_deleted(&child.child_table.name, child_row.row_id);
+                    self.mark_table_rows_deleted(&child.child_table.name, &deleted_child_row_ids);
+                }
+                crate::catalog::ForeignKeyAction::NoAction
+                | crate::catalog::ForeignKeyAction::Restrict => {
+                    let matching_children =
+                        matching_foreign_key_children_for_parent_rows(self, table, rows, child)?;
+                    if matching_children.is_empty() {
+                        continue;
                     }
+                    return Err(DbError::constraint(format!(
+                        "DELETE on {} violates a foreign key from {}",
+                        table_name, child.child_table.name
+                    )));
                 }
                 crate::catalog::ForeignKeyAction::SetNull => {
+                    let matching_children =
+                        matching_foreign_key_children_for_parent_rows(self, table, rows, child)?;
+                    if matching_children.is_empty() {
+                        continue;
+                    }
                     let mut row_changes = BTreeMap::new();
                     for child_row in matching_children {
                         let mut updated_values = child_row.values.clone();
@@ -5162,6 +5431,28 @@ fn compile_int_arithmetic_update(
     }
 }
 
+fn resolve_simple_update_assignments(
+    table: &crate::catalog::TableSchema,
+    assignments: &[Assignment],
+    assignment_columns: &[usize],
+    params: &[Value],
+) -> Result<Option<Vec<(usize, Value)>>> {
+    let mut resolved = Vec::with_capacity(assignments.len());
+    for (assignment, column_index) in assignments.iter().zip(assignment_columns) {
+        let Some(source) = compile_prepared_simple_value_source(&assignment.expr) else {
+            return Ok(None);
+        };
+        let column = table
+            .columns
+            .get(*column_index)
+            .ok_or_else(|| DbError::internal("assignment column index is out of range"))?;
+        let value = resolve_prepared_simple_value(&source, params)?;
+        let value = super::constraints::coerce_column_value(column, value)?;
+        resolved.push((*column_index, value));
+    }
+    Ok(Some(resolved))
+}
+
 pub(super) fn build_insert_row_values(
     runtime: &EngineRuntime,
     table: &mut crate::catalog::TableSchema,
@@ -5324,7 +5615,6 @@ fn prepare_btree_insert_index(
 ) -> Result<Option<PreparedBtreeIndex>> {
     if index.kind != IndexKind::Btree
         || !index.fresh
-        || index.predicate_sql.is_some()
         || !matches!(
             runtime.index(&index.name),
             Some(super::RuntimeIndex::Btree { .. })
@@ -5357,6 +5647,11 @@ fn prepare_btree_insert_index(
     let uuid_key = index.columns.len() == 1
         && table.columns[column_indexes[0]].column_type == ColumnType::Uuid
         && !table.columns[column_indexes[0]].nullable;
+    let predicate_expr = index
+        .predicate_sql
+        .as_deref()
+        .map(parse_expression_sql)
+        .transpose()?;
 
     Ok(Some(PreparedBtreeIndex {
         name: index.name.clone(),
@@ -5380,6 +5675,7 @@ fn prepare_btree_insert_index(
                 .is_some_and(|column| column.nullable)
         }),
         unique: index.unique,
+        predicate_expr,
     }))
 }
 
@@ -5459,6 +5755,9 @@ fn prepare_foreign_key(
     else {
         return Ok(None);
     };
+    if prepared_parent_index.predicate_expr.is_some() {
+        return Ok(None);
+    }
     Ok(Some(PreparedForeignKey {
         child_column_indexes,
         parent_table_name: foreign_key.referenced_table.clone(),
@@ -5481,11 +5780,29 @@ fn validate_prepared_insert(
         }
     }
     if prepared.use_generic_index_updates {
+        let table =
+            if prepared
+                .unique_indexes
+                .iter()
+                .any(|index| index.predicate_expr.is_some())
+            {
+                Some(runtime.table_schema(&prepared.table_name).ok_or_else(|| {
+                    DbError::sql(format!("unknown table {}", prepared.table_name))
+                })?)
+            } else {
+                None
+            };
         for index in &prepared.unique_indexes {
-            if prepared_index_contains_null(index, row) {
+            let Some(key) = prepared_btree_index_key_if_row_should_be_indexed(
+                runtime,
+                table,
+                &prepared.table_name,
+                index,
+                row,
+            )?
+            else {
                 continue;
-            }
-            let key = prepared_btree_index_key(index, row)?;
+            };
             let Some(super::RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
@@ -5674,6 +5991,41 @@ fn resolve_prepared_insert_value_source(
     }
 }
 
+fn apply_prepared_generated_columns(
+    runtime: &EngineRuntime,
+    prepared: &PreparedSimpleInsert,
+    row: &mut [Value],
+    params: &[Value],
+) -> Result<()> {
+    if prepared.generated_columns.is_empty() {
+        return Ok(());
+    }
+
+    let table = runtime
+        .table_schema(prepared.table_name.as_str())
+        .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)))?;
+    for generated in &prepared.generated_columns {
+        let column = table.columns.get(generated.index).ok_or_else(|| {
+            DbError::internal("prepared generated column index exceeded table width")
+        })?;
+        let dataset = table_row_dataset(table, row, &table.name);
+        let value = runtime.eval_expr(
+            &generated.expr,
+            &dataset,
+            row,
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+        let slot = row.get_mut(generated.index).ok_or_else(|| {
+            DbError::internal("prepared generated column index exceeded row width")
+        })?;
+        *slot = super::constraints::coerce_column_value(column, value)?;
+    }
+
+    Ok(())
+}
+
 fn materialize_direct_positional_insert_candidate(
     prepared: &PreparedSimpleInsert,
     params: &[Value],
@@ -5830,7 +6182,7 @@ fn apply_prepared_insert_index_updates(
     let table = if prepared
         .insert_indexes
         .iter()
-        .any(|index| index.has_covering_payload)
+        .any(|index| index.has_covering_payload || index.predicate_expr.is_some())
     {
         Some(
             runtime
@@ -5849,19 +6201,20 @@ fn apply_prepared_insert_index_updates(
                 .and_then(|table_name| runtime.tables.get(table_name))
                 .is_none_or(|row_source| row_source.has_tombstoned_rows());
     for index in &prepared.insert_indexes {
+        let Some(key) = prepared_btree_index_key_if_row_should_be_indexed(
+            runtime,
+            table.as_ref(),
+            &prepared.table_name,
+            index,
+            &row.values,
+        )?
+        else {
+            continue;
+        };
         if index.int64_key {
-            let [column_index] = index.column_indexes.as_slice() else {
+            let RuntimeBtreeKey::Int64(key) = key else {
                 return Err(DbError::internal(
-                    "typed INT64 prepared index expected exactly one indexed column",
-                ));
-            };
-            let Value::Int64(key) = row
-                .values
-                .get(*column_index)
-                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
-            else {
-                return Err(DbError::internal(
-                    "typed INT64 prepared index expected an INT64 value",
+                    "typed INT64 prepared index produced a non-INT64 key",
                 ));
             };
             let covering_values = if let Some(table) = table.as_ref() {
@@ -5880,7 +6233,7 @@ fn apply_prepared_insert_index_updates(
                     runtime,
                     &prepared.table_name,
                     &index.name,
-                    &RuntimeBtreeKey::Int64(*key),
+                    &RuntimeBtreeKey::Int64(key),
                 )?;
             }
             let Some(super::RuntimeIndex::Btree { keys, covering }) =
@@ -5891,7 +6244,7 @@ fn apply_prepared_insert_index_updates(
                     index.name
                 )));
             };
-            let key = RuntimeBtreeKey::Int64(*key);
+            let key = RuntimeBtreeKey::Int64(key);
             if check_unique && index.unique {
                 if keys.insert_row_id(key, row.row_id).is_err() {
                     return Err(DbError::constraint(format!(
@@ -5908,18 +6261,9 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
         if index.uuid_key {
-            let [column_index] = index.column_indexes.as_slice() else {
+            let RuntimeBtreeKey::Uuid(key) = key else {
                 return Err(DbError::internal(
-                    "typed UUID prepared index expected exactly one indexed column",
-                ));
-            };
-            let Value::Uuid(key) = row
-                .values
-                .get(*column_index)
-                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
-            else {
-                return Err(DbError::internal(
-                    "typed UUID prepared index expected a UUID value",
+                    "typed UUID prepared index produced a non-UUID key",
                 ));
             };
             let covering_values = if let Some(table) = table.as_ref() {
@@ -5938,7 +6282,7 @@ fn apply_prepared_insert_index_updates(
                     runtime,
                     &prepared.table_name,
                     &index.name,
-                    &RuntimeBtreeKey::Uuid(*key),
+                    &RuntimeBtreeKey::Uuid(key),
                 )?;
             }
             let Some(super::RuntimeIndex::Btree { keys, covering }) =
@@ -5949,7 +6293,7 @@ fn apply_prepared_insert_index_updates(
                     index.name
                 )));
             };
-            let key = RuntimeBtreeKey::Uuid(*key);
+            let key = RuntimeBtreeKey::Uuid(key);
             if check_unique && index.unique {
                 if keys.insert_row_id(key, row.row_id).is_err() {
                     return Err(DbError::constraint(format!(
@@ -5966,10 +6310,6 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
 
-        if index.unique && prepared_index_contains_null(index, &row.values) {
-            continue;
-        }
-        let key = prepared_btree_index_key(index, &row.values)?;
         let covering_values = if let Some(table) = table.as_ref() {
             runtime
                 .catalog
@@ -5996,7 +6336,7 @@ fn apply_prepared_insert_index_updates(
                 index.name
             )));
         };
-        if check_unique && index.unique && !prepared_index_contains_null(index, &row.values) {
+        if check_unique && index.unique {
             if keys.insert_row_id(key, row.row_id).is_err() {
                 return Err(DbError::constraint(format!(
                     "unique constraint {} on {} was violated",
@@ -6082,6 +6422,45 @@ fn prepared_index_contains_null(index: &PreparedBtreeIndex, row: &[Value]) -> bo
         .any(|&column_index| matches!(row.get(column_index), Some(Value::Null)))
 }
 
+fn prepared_index_row_satisfies_predicate(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &PreparedBtreeIndex,
+    row: &[Value],
+) -> Result<bool> {
+    let Some(predicate_expr) = index.predicate_expr.as_ref() else {
+        return Ok(true);
+    };
+    let Some(index_schema) = runtime.catalog.indexes.get(&index.name) else {
+        return Err(DbError::internal(format!(
+            "catalog index {} is missing",
+            index.name
+        )));
+    };
+    row_satisfies_index_predicate_with_expr(runtime, index_schema, table, row, Some(predicate_expr))
+}
+
+fn prepared_btree_index_key_if_row_should_be_indexed(
+    runtime: &EngineRuntime,
+    table: Option<&crate::catalog::TableSchema>,
+    table_name: &str,
+    index: &PreparedBtreeIndex,
+    row: &[Value],
+) -> Result<Option<RuntimeBtreeKey>> {
+    if index.predicate_expr.is_some() {
+        let table = table.ok_or_else(|| {
+            DbError::internal(format!("table schema for {table_name} is missing"))
+        })?;
+        if !prepared_index_row_satisfies_predicate(runtime, table, index, row)? {
+            return Ok(None);
+        }
+    }
+    if index.unique && prepared_index_contains_null(index, row) {
+        return Ok(None);
+    }
+    prepared_btree_index_key(index, row).map(Some)
+}
+
 fn prepared_index_covering_payload_values(
     index: &PreparedBtreeIndex,
     row_values: &[Value],
@@ -6110,25 +6489,40 @@ fn apply_prepared_btree_index_update_for_row_change(
     old_row_values: &[Value],
     new_row_values: &[Value],
 ) -> Result<bool> {
-    let old_key = if index.unique && prepared_index_contains_null(index, old_row_values) {
-        None
+    let table = if index.predicate_expr.is_some() {
+        Some(
+            runtime
+                .table_schema(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?,
+        )
     } else {
-        Some(prepared_btree_index_key(index, old_row_values)?)
-    };
-    let new_key = if index.unique && prepared_index_contains_null(index, new_row_values) {
         None
-    } else {
-        Some(prepared_btree_index_key(index, new_row_values)?)
     };
+    let old_key = prepared_btree_index_key_if_row_should_be_indexed(
+        runtime,
+        table,
+        table_name,
+        index,
+        old_row_values,
+    )?;
+    let new_key = prepared_btree_index_key_if_row_should_be_indexed(
+        runtime,
+        table,
+        table_name,
+        index,
+        new_row_values,
+    )?;
 
     let Some(super::RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name) else {
         return Ok(false);
     };
 
     if old_key == new_key {
-        let covering_values = prepared_index_covering_payload_values(index, new_row_values)?;
-        if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
-            covering.insert_row_values(row_id, values);
+        if old_key.is_some() {
+            let covering_values = prepared_index_covering_payload_values(index, new_row_values)?;
+            if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                covering.insert_row_values(row_id, values);
+            }
         }
         return Ok(true);
     }
@@ -6234,19 +6628,43 @@ pub(super) fn primary_row_id(table: &crate::catalog::TableSchema, row: &[Value])
     }
 }
 
-fn matching_row_ids(
+pub(super) fn matching_row_ids(
     runtime: &EngineRuntime,
-    table_ref: &str,
+    table_name: &str,
+    filter_table_ref: &str,
     table: &crate::catalog::TableSchema,
     filter: Option<&Expr>,
     params: &[Value],
 ) -> Result<Vec<i64>> {
     if let Some(indexed_row_ids) =
-        indexed_row_ids_for_filter(runtime, table_ref, table, filter, params)?
+        indexed_row_ids_for_filter(runtime, filter_table_ref, table, filter, params)?
     {
-        return Ok(indexed_row_ids);
+        let Some(row_source) = runtime.visible_table_row_source(table_name) else {
+            return Ok(Vec::new());
+        };
+        if indexed_row_ids.fully_covers_filter && !row_source.has_tombstoned_rows() {
+            return Ok(indexed_row_ids.row_ids);
+        }
+        let mut matching = Vec::new();
+        for row_id in indexed_row_ids.row_ids {
+            let Some(row) = row_source.row_by_id(row_id)? else {
+                continue;
+            };
+            if indexed_row_ids.fully_covers_filter {
+                matching.push(row_id);
+                continue;
+            }
+            let candidate = StoredRow {
+                row_id,
+                values: row.values().to_vec(),
+            };
+            if row_matches_filter(runtime, filter_table_ref, table, &candidate, filter, params)? {
+                matching.push(row_id);
+            }
+        }
+        return Ok(matching);
     }
-    let Some(row_source) = runtime.visible_table_row_source(table_ref) else {
+    let Some(row_source) = runtime.visible_table_row_source(table_name) else {
         return Ok(Vec::new());
     };
     let mut matching = Vec::new();
@@ -6256,11 +6674,17 @@ fn matching_row_ids(
             row_id: row.row_id(),
             values: row.values().to_vec(),
         };
-        if row_matches_filter(runtime, table, &candidate, filter, params)? {
+        if row_matches_filter(runtime, filter_table_ref, table, &candidate, filter, params)? {
             matching.push(row.row_id());
         }
     }
     Ok(matching)
+}
+
+#[derive(Debug)]
+struct IndexedFilterRowIds {
+    row_ids: Vec<i64>,
+    fully_covers_filter: bool,
 }
 
 fn indexed_row_ids_for_filter(
@@ -6269,7 +6693,7 @@ fn indexed_row_ids_for_filter(
     table: &crate::catalog::TableSchema,
     filter: Option<&Expr>,
     params: &[Value],
-) -> Result<Option<Vec<i64>>> {
+) -> Result<Option<IndexedFilterRowIds>> {
     if !generated_columns_are_stored(table) {
         return Ok(None);
     }
@@ -6278,6 +6702,14 @@ fn indexed_row_ids_for_filter(
     };
     if let Some(row_ids) =
         row_id_range_row_ids_for_filter(runtime, table_ref, table, filter, params)?
+    {
+        return Ok(Some(IndexedFilterRowIds {
+            row_ids,
+            fully_covers_filter: true,
+        }));
+    }
+    if let Some(row_ids) =
+        compound_btree_range_row_ids_for_filter(runtime, table_ref, table, filter, params)?
     {
         return Ok(Some(row_ids));
     }
@@ -6300,15 +6732,21 @@ fn indexed_row_ids_for_filter(
         None,
     )?;
     if matches!(value, Value::Null) {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(IndexedFilterRowIds {
+            row_ids: Vec::new(),
+            fully_covers_filter: true,
+        }));
     }
     if row_id_alias_column_name(table).is_some_and(|entry| identifiers_equal(entry, column_name)) {
-        return Ok(Some(match value {
-            Value::Int64(row_id) => match runtime.visible_table_row_source(table_ref) {
-                Some(row_source) if row_source.row_by_id(row_id)?.is_some() => vec![row_id],
+        return Ok(Some(IndexedFilterRowIds {
+            row_ids: match value {
+                Value::Int64(row_id) => match runtime.visible_table_row_source(table_ref) {
+                    Some(row_source) if row_source.row_by_id(row_id)?.is_some() => vec![row_id],
+                    _ => Vec::new(),
+                },
                 _ => Vec::new(),
             },
-            _ => Vec::new(),
+            fully_covers_filter: true,
         }));
     }
     if runtime.visible_table_is_temporary(table_ref) {
@@ -6339,7 +6777,399 @@ fn indexed_row_ids_for_filter(
     {
         return Ok(None);
     }
-    Ok(Some(row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)))
+    Ok(Some(IndexedFilterRowIds {
+        row_ids: row_id_set_to_vec(keys.row_ids_for_value_set(&value)?),
+        fully_covers_filter: true,
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct DmlRangeBoundValue {
+    value: Value,
+    inclusive: bool,
+}
+
+fn compound_btree_range_row_ids_for_filter(
+    runtime: &EngineRuntime,
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    filter: &Expr,
+    params: &[Value],
+) -> Result<Option<IndexedFilterRowIds>> {
+    if runtime.visible_table_is_temporary(table_ref) {
+        return Ok(None);
+    }
+    let predicates = dml_flattened_and_predicates(filter);
+
+    for index in runtime.catalog.indexes.values() {
+        if !identifiers_equal(&index.table_name, &table.name)
+            || !index.fresh
+            || index.kind != IndexKind::Btree
+            || index.predicate_sql.is_some()
+            || index.columns.len() < 2
+            || index
+                .columns
+                .iter()
+                .any(|column| column.expression_sql.is_some() || column.column_name.is_none())
+        {
+            continue;
+        }
+
+        let mut prefix_values = Vec::new();
+        for index_column in &index.columns {
+            let Some(column_name) = index_column.column_name.as_deref() else {
+                break;
+            };
+            let Some(table_column) = table
+                .columns
+                .iter()
+                .find(|column| identifiers_equal(&column.name, column_name))
+            else {
+                break;
+            };
+            let Some(value_expr) =
+                dml_equality_expr_for_column(&predicates, table_ref, table, column_name)
+            else {
+                break;
+            };
+            let value = runtime.eval_expr(
+                value_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                &std::collections::BTreeMap::new(),
+                None,
+            )?;
+            if matches!(value, Value::Null) {
+                return Ok(Some(IndexedFilterRowIds {
+                    row_ids: Vec::new(),
+                    fully_covers_filter: true,
+                }));
+            }
+            prefix_values.push(super::constraints::coerce_column_value(
+                table_column,
+                value,
+            )?);
+        }
+
+        if prefix_values.is_empty() || prefix_values.len() >= index.columns.len() {
+            continue;
+        }
+
+        let range_column_name = index.columns[prefix_values.len()]
+            .column_name
+            .as_deref()
+            .ok_or_else(|| DbError::internal("prepared compound index column missing name"))?;
+        let Some(range_column) = table
+            .columns
+            .iter()
+            .find(|column| identifiers_equal(&column.name, range_column_name))
+        else {
+            continue;
+        };
+        let Some((lower, upper)) = dml_range_bounds_for_column(
+            runtime,
+            &predicates,
+            table_ref,
+            table,
+            range_column_name,
+            range_column,
+            params,
+        )?
+        else {
+            continue;
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
+            continue;
+        };
+        let used_predicate_count =
+            prefix_values.len() + usize::from(lower.is_some()) + usize::from(upper.is_some());
+        return Ok(Some(IndexedFilterRowIds {
+            row_ids: compound_btree_range_row_ids(
+                keys,
+                &prefix_values,
+                prefix_values.len(),
+                range_column.column_type,
+                lower.as_ref(),
+                upper.as_ref(),
+            )?,
+            fully_covers_filter: used_predicate_count == predicates.len(),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn dml_flattened_and_predicates<'a>(expr: &'a Expr) -> Vec<&'a Expr> {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let mut predicates = dml_flattened_and_predicates(left);
+            predicates.extend(dml_flattened_and_predicates(right));
+            predicates
+        }
+        _ => vec![expr],
+    }
+}
+
+fn dml_filter_table_matches(
+    filter_table: Option<&str>,
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+) -> bool {
+    filter_table.is_none_or(|name| {
+        identifiers_equal(name, &table.name) || identifiers_equal(name, table_ref)
+    })
+}
+
+fn dml_equality_expr_for_column<'a>(
+    predicates: &[&'a Expr],
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    column_name: &str,
+) -> Option<&'a Expr> {
+    predicates.iter().find_map(|predicate| {
+        let (filter_table, candidate_column, value_expr) = simple_btree_lookup_filter(predicate)?;
+        (identifiers_equal(candidate_column, column_name)
+            && dml_filter_table_matches(filter_table, table_ref, table))
+        .then_some(value_expr)
+    })
+}
+
+fn dml_range_bounds_for_column(
+    runtime: &EngineRuntime,
+    predicates: &[&Expr],
+    table_ref: &str,
+    table: &crate::catalog::TableSchema,
+    column_name: &str,
+    column: &crate::catalog::ColumnSchema,
+    params: &[Value],
+) -> Result<Option<(Option<DmlRangeBoundValue>, Option<DmlRangeBoundValue>)>> {
+    let mut lower = None;
+    let mut upper = None;
+    for predicate in predicates {
+        let Some((filter_table, candidate_column, kind, value_expr)) =
+            dml_simple_range_bound(predicate)
+        else {
+            continue;
+        };
+        if !identifiers_equal(candidate_column, column_name)
+            || !dml_filter_table_matches(filter_table, table_ref, table)
+        {
+            continue;
+        }
+        let value = runtime.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        let value = super::constraints::coerce_column_value(column, value)?;
+        match kind {
+            DmlRangeBoundKind::Lower(inclusive) => {
+                if lower.is_some() {
+                    return Ok(None);
+                }
+                lower = Some(DmlRangeBoundValue { value, inclusive });
+            }
+            DmlRangeBoundKind::Upper(inclusive) => {
+                if upper.is_some() {
+                    return Ok(None);
+                }
+                upper = Some(DmlRangeBoundValue { value, inclusive });
+            }
+        }
+    }
+
+    if lower.is_none() && upper.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some((lower, upper)))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DmlRangeBoundKind {
+    Lower(bool),
+    Upper(bool),
+}
+
+fn dml_simple_range_bound<'a>(
+    predicate: &'a Expr,
+) -> Option<(Option<&'a str>, &'a str, DmlRangeBoundKind, &'a Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    dml_range_bound_from_column_left(left, *op, right)
+        .or_else(|| dml_range_bound_from_column_left(right, reverse_dml_range_op(*op)?, left))
+}
+
+fn dml_range_bound_from_column_left<'a>(
+    left: &'a Expr,
+    op: BinaryOp,
+    right: &'a Expr,
+) -> Option<(Option<&'a str>, &'a str, DmlRangeBoundKind, &'a Expr)> {
+    let Expr::Column { table, column } = left else {
+        return None;
+    };
+    if !simple_constant_bound_expr(right) {
+        return None;
+    }
+    let kind = match op {
+        BinaryOp::Gt => DmlRangeBoundKind::Lower(false),
+        BinaryOp::GtEq => DmlRangeBoundKind::Lower(true),
+        BinaryOp::Lt => DmlRangeBoundKind::Upper(false),
+        BinaryOp::LtEq => DmlRangeBoundKind::Upper(true),
+        _ => return None,
+    };
+    Some((table.as_deref(), column.as_str(), kind, right))
+}
+
+fn reverse_dml_range_op(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::GtEq => Some(BinaryOp::LtEq),
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::LtEq => Some(BinaryOp::GtEq),
+        _ => None,
+    }
+}
+
+fn compound_btree_range_row_ids(
+    keys: &super::RuntimeBtreeKeys,
+    prefix_values: &[Value],
+    range_column_position: usize,
+    range_column_type: ColumnType,
+    lower: Option<&DmlRangeBoundValue>,
+    upper: Option<&DmlRangeBoundValue>,
+) -> Result<Vec<i64>> {
+    let mut row_ids = Vec::new();
+    match keys {
+        super::RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
+            let mut saw_matching_prefix = false;
+            for (encoded_key, row_id) in entries.iter() {
+                if !Row::encoded_prefix_matches(encoded_key, prefix_values)? {
+                    if saw_matching_prefix {
+                        break;
+                    }
+                    continue;
+                }
+                saw_matching_prefix = true;
+                if deleted.contains(row_id)
+                    || !compound_range_value_matches(
+                        encoded_key,
+                        range_column_position,
+                        range_column_type,
+                        lower,
+                        upper,
+                    )?
+                {
+                    continue;
+                }
+                row_ids.push(*row_id);
+            }
+        }
+        super::RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
+            let mut saw_matching_prefix = false;
+            for (encoded_key, entry_row_ids) in entries.iter() {
+                if !Row::encoded_prefix_matches(encoded_key, prefix_values)? {
+                    if saw_matching_prefix {
+                        break;
+                    }
+                    continue;
+                }
+                saw_matching_prefix = true;
+                if !compound_range_value_matches(
+                    encoded_key,
+                    range_column_position,
+                    range_column_type,
+                    lower,
+                    upper,
+                )? {
+                    continue;
+                }
+                row_ids.extend(
+                    entry_row_ids
+                        .iter()
+                        .copied()
+                        .filter(|row_id| !deleted.contains(row_id)),
+                );
+            }
+        }
+        super::RuntimeBtreeKeys::UniqueInt64(_, _)
+        | super::RuntimeBtreeKeys::NonUniqueInt64(_, _)
+        | super::RuntimeBtreeKeys::UniqueUuid(_, _)
+        | super::RuntimeBtreeKeys::NonUniqueUuid(_, _) => return Ok(Vec::new()),
+    }
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok(row_ids)
+}
+
+fn compound_range_value_matches(
+    encoded_key: &[u8],
+    range_column_position: usize,
+    range_column_type: ColumnType,
+    lower: Option<&DmlRangeBoundValue>,
+    upper: Option<&DmlRangeBoundValue>,
+) -> Result<bool> {
+    match range_column_type {
+        ColumnType::Float64 => {
+            let Some(value) = Row::decode_float64_at(encoded_key, range_column_position)? else {
+                return Ok(false);
+            };
+            return dml_value_within_range(&Value::Float64(value), lower, upper);
+        }
+        ColumnType::Int64 => {
+            let Some(value) = Row::decode_int64_at(encoded_key, range_column_position)? else {
+                return Ok(false);
+            };
+            return dml_value_within_range(&Value::Int64(value), lower, upper);
+        }
+        _ => {}
+    }
+    let range_values = Row::decode_projection_with_overflow::<
+        crate::storage::page::InMemoryPageStore,
+    >(encoded_key, None, &[range_column_position])?;
+    let Some(range_value) = range_values.first() else {
+        return Ok(false);
+    };
+    dml_value_within_range(range_value, lower, upper)
+}
+
+fn dml_value_within_range(
+    value: &Value,
+    lower: Option<&DmlRangeBoundValue>,
+    upper: Option<&DmlRangeBoundValue>,
+) -> Result<bool> {
+    if matches!(value, Value::Null) {
+        return Ok(false);
+    }
+    if let Some(bound) = lower {
+        let ordering = compare_values(value, &bound.value)?;
+        if ordering == std::cmp::Ordering::Less
+            || (!bound.inclusive && ordering == std::cmp::Ordering::Equal)
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(bound) = upper {
+        let ordering = compare_values(value, &bound.value)?;
+        if ordering == std::cmp::Ordering::Greater
+            || (!bound.inclusive && ordering == std::cmp::Ordering::Equal)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn row_id_range_row_ids_for_filter(
@@ -6419,6 +7249,14 @@ pub(crate) fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> O
         .iter()
         .find(|column| identifiers_equal(&column.name, primary_key_column) && column.auto_increment)
         .map(|column| column.name.as_str())
+}
+
+fn row_id_alias_column_index(table: &crate::catalog::TableSchema) -> Option<usize> {
+    let row_id_alias = row_id_alias_column_name(table)?;
+    table
+        .columns
+        .iter()
+        .position(|column| identifiers_equal(&column.name, row_id_alias))
 }
 
 fn simple_row_id_between_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr, &Expr)> {
@@ -6966,6 +7804,180 @@ fn prepare_delete_children_and_indexes(
     Ok((delete_children_by_table, table_indexes_by_table))
 }
 
+fn can_apply_terminal_cascade_delete_by_row_id(
+    runtime: &EngineRuntime,
+    child: &PreparedDeleteCascadeChild,
+    child_delete_children: &[PreparedDeleteCascadeChild],
+    child_table_indexes: &[IndexSchema],
+) -> bool {
+    if !child_delete_children.is_empty()
+        || runtime.has_table_trigger(&child.child_table.name, TriggerEvent::Delete)
+    {
+        return false;
+    }
+    if child.foreign_key.columns.len() != 1
+        || child.parent_column_indexes.len() != 1
+        || child.child_column_indexes.len() != 1
+        || child.child_index_prefix_len != Some(1)
+    {
+        return false;
+    }
+    let Some(index_name) = child.child_index_name.as_deref() else {
+        return false;
+    };
+    let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+        return false;
+    };
+    if !index_schema.fresh
+        || index_schema.kind != IndexKind::Btree
+        || index_schema.predicate_sql.is_some()
+        || index_schema.columns.len() != 1
+        || !index_schema.columns[0]
+            .column_name
+            .as_ref()
+            .is_some_and(|column_name| {
+                identifiers_equal(column_name, &child.foreign_key.columns[0])
+            })
+        || index_schema.columns[0].expression_sql.is_some()
+        || !matches!(runtime.index(index_name), Some(RuntimeIndex::Btree { .. }))
+    {
+        return false;
+    }
+    child_table_indexes.iter().all(|index| {
+        index.fresh
+            && index.kind == IndexKind::Btree
+            && index.predicate_sql.is_none()
+            && index
+                .columns
+                .iter()
+                .all(|column| column.expression_sql.is_none())
+            && matches!(runtime.index(&index.name), Some(RuntimeIndex::Btree { .. }))
+    })
+}
+
+fn can_apply_row_id_parent_cascade_delete(
+    runtime: &EngineRuntime,
+    child: &PreparedDeleteCascadeChild,
+    child_delete_children: &[PreparedDeleteCascadeChild],
+    child_table_indexes: &[IndexSchema],
+) -> bool {
+    if child_delete_children.is_empty()
+        || runtime.has_table_trigger(&child.child_table.name, TriggerEvent::Delete)
+    {
+        return false;
+    }
+    if child.foreign_key.columns.len() != 1
+        || child.parent_column_indexes.len() != 1
+        || child.child_column_indexes.len() != 1
+        || child.child_index_prefix_len != Some(1)
+    {
+        return false;
+    }
+    let Some(index_name) = child.child_index_name.as_deref() else {
+        return false;
+    };
+    let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+        return false;
+    };
+    if !index_schema.fresh
+        || index_schema.kind != IndexKind::Btree
+        || index_schema.predicate_sql.is_some()
+        || index_schema.columns.len() != 1
+        || !index_schema.columns[0]
+            .column_name
+            .as_ref()
+            .is_some_and(|column_name| {
+                identifiers_equal(column_name, &child.foreign_key.columns[0])
+            })
+        || index_schema.columns[0].expression_sql.is_some()
+        || !matches!(runtime.index(index_name), Some(RuntimeIndex::Btree { .. }))
+    {
+        return false;
+    }
+    if !child_table_indexes.iter().all(|index| {
+        index.fresh
+            && index.kind == IndexKind::Btree
+            && matches!(runtime.index(&index.name), Some(RuntimeIndex::Btree { .. }))
+    }) {
+        return false;
+    }
+    let Some(row_id_alias_index) = row_id_alias_column_index(&child.child_table) else {
+        return false;
+    };
+    child_delete_children.iter().all(|recursive_child| {
+        recursive_child.foreign_key.on_delete == ForeignKeyAction::Cascade
+            && recursive_child.parent_column_indexes.len() == 1
+            && recursive_child.parent_column_indexes[0] == row_id_alias_index
+    })
+}
+
+fn synthesize_row_id_parent_rows(
+    table: &crate::catalog::TableSchema,
+    row_ids: &BTreeSet<i64>,
+) -> Result<Vec<StoredRow>> {
+    let Some(row_id_alias_index) = row_id_alias_column_index(table) else {
+        return Err(DbError::internal(format!(
+            "table {} has no row-id alias",
+            table.name
+        )));
+    };
+    let mut rows = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        let mut values = vec![Value::Null; table.columns.len()];
+        values[row_id_alias_index] = Value::Int64(*row_id);
+        rows.push(StoredRow {
+            row_id: *row_id,
+            values,
+        });
+    }
+    Ok(rows)
+}
+
+fn matching_foreign_key_child_row_ids_for_parent_rows_by_index(
+    runtime: &EngineRuntime,
+    parent_rows: &[StoredRow],
+    child: &PreparedDeleteCascadeChild,
+) -> Result<BTreeSet<i64>> {
+    let Some(parent_column_index) = child.parent_column_indexes.first().copied() else {
+        return Err(DbError::internal("parent foreign-key column is missing"));
+    };
+    let mut parent_values = Vec::with_capacity(parent_rows.len());
+    for row in parent_rows {
+        let Some(value) = row.values.get(parent_column_index) else {
+            return Err(DbError::internal(format!(
+                "parent column index {parent_column_index} is invalid"
+            )));
+        };
+        if !matches!(value, Value::Null) {
+            parent_values.push(value.clone());
+        }
+    }
+    if parent_values.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let Some(index_name) = child.child_index_name.as_deref() else {
+        return Err(DbError::internal("child foreign-key index is missing"));
+    };
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+        return Err(DbError::internal(
+            "child foreign-key runtime index is missing",
+        ));
+    };
+    let Some(row_source) = runtime.visible_table_row_source(&child.child_table.name) else {
+        return Ok(BTreeSet::new());
+    };
+    let parent_value_refs = parent_values.iter().collect::<Vec<_>>();
+    let row_ids = keys.row_ids_for_values(&parent_value_refs)?;
+    let mut matching = BTreeSet::new();
+    for row_id in row_ids {
+        if row_source.row_by_id(row_id)?.is_some() {
+            matching.insert(row_id);
+        }
+    }
+    Ok(matching)
+}
+
 fn matching_foreign_key_children_for_parent_rows(
     runtime: &EngineRuntime,
     _table: &crate::catalog::TableSchema,
@@ -7053,30 +8065,41 @@ fn matching_foreign_key_children_for_parent_rows(
             }
         }
     } else {
-        for parent_key in &parent_keys {
-            let row_ids = if child.foreign_key.columns.len() == 1 {
-                let Some(parent_value) = parent_key.first() else {
-                    continue;
-                };
-                keys.row_ids_for_value(parent_value)?
-            } else {
-                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
-                    Row::new(parent_key.clone()).encode()?,
-                ))
-            };
+        if child.foreign_key.columns.len() == 1 {
+            let parent_values = parent_keys
+                .iter()
+                .filter_map(|parent_key| parent_key.first())
+                .collect::<Vec<_>>();
+            let row_ids = keys.row_ids_for_values(&parent_values)?;
             for row_id in row_ids {
                 let Some(row) = row_source.row_by_id(row_id)? else {
                     continue;
                 };
                 let stored_row =
                     materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
-                if foreign_key_child_matches_parent_key(
-                    &stored_row.values,
-                    &child.child_column_indexes,
-                    parent_key,
-                )? {
-                    matching_children.insert(stored_row.row_id, stored_row);
-                }
+                matching_children.insert(stored_row.row_id, stored_row);
+            }
+        } else {
+            for parent_key in &parent_keys {
+                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+                    Row::new(parent_key.clone()).encode()?,
+                ))
+                .into_iter()
+                .try_for_each(|row_id| -> Result<()> {
+                    let Some(row) = row_source.row_by_id(row_id)? else {
+                        return Ok(());
+                    };
+                    let stored_row =
+                        materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
+                    if foreign_key_child_matches_parent_key(
+                        &stored_row.values,
+                        &child.child_column_indexes,
+                        parent_key,
+                    )? {
+                        matching_children.insert(stored_row.row_id, stored_row);
+                    }
+                    Ok(())
+                })?;
             }
         }
     }
@@ -7229,19 +8252,38 @@ fn apply_runtime_index_update_for_row_change(
     row_id: i64,
     old_row_values: &[Value],
     new_row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
 ) -> Result<bool> {
     let kind = index.kind;
     let _table_name = table.name.clone();
     let _index_name = index.name.clone();
     match kind {
         IndexKind::Btree => {
-            let old_key = compute_index_key(runtime, index, table, old_row_values)?;
-            let new_key = compute_index_key(runtime, index, table, new_row_values)?;
-            let covering_values = covering_payload_values_for_row(index, table, new_row_values);
+            let old_key = super::compute_index_key_with_predicate(
+                runtime,
+                index,
+                table,
+                old_row_values,
+                pre_parsed_predicate,
+            )?;
+            let new_key = super::compute_index_key_with_predicate(
+                runtime,
+                index,
+                table,
+                new_row_values,
+                pre_parsed_predicate,
+            )?;
             if old_key == new_key {
-                if let Some(RuntimeIndex::Btree { covering, .. }) = runtime.index_mut(&index.name) {
-                    if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
-                        covering.insert_row_values(row_id, values);
+                if old_key.is_some() {
+                    if let Some(RuntimeIndex::Btree { covering, .. }) =
+                        runtime.index_mut(&index.name)
+                    {
+                        let covering_values =
+                            covering_payload_values_for_row(index, table, new_row_values);
+                        if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values)
+                        {
+                            covering.insert_row_values(row_id, values);
+                        }
                     }
                 }
                 return Ok(true);
@@ -7267,6 +8309,7 @@ fn apply_runtime_index_update_for_row_change(
                 (None, None) => {}
             }
             if new_key_present {
+                let covering_values = covering_payload_values_for_row(index, table, new_row_values);
                 if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                     covering.insert_row_values(row_id, values);
                 }
@@ -7731,6 +8774,7 @@ fn incremental_update_indexes(
                 old_row.row_id,
                 &old_row.values,
                 &new_row.values,
+                None,
             )? {
                 failed = true;
                 break;
@@ -7803,6 +8847,7 @@ fn trigram_index_text_for_row_with_expr(
 
 fn row_matches_filter(
     runtime: &EngineRuntime,
+    table_ref: &str,
     table: &crate::catalog::TableSchema,
     row: &StoredRow,
     filter: Option<&Expr>,
@@ -7812,7 +8857,7 @@ fn row_matches_filter(
         return Ok(true);
     };
     let eval_values = materialize_row_for_generated(runtime, table, &row.values)?;
-    let dataset = table_row_dataset(table, eval_values.as_ref(), &table.name);
+    let dataset = table_row_dataset(table, eval_values.as_ref(), table_ref);
     Ok(matches!(
         runtime.eval_expr(
             filter,
@@ -8996,6 +10041,7 @@ mod tests {
             covering_payload_column_indexes: vec![],
             nullable: true,
             unique: false,
+            predicate_expr: None,
         };
         let row = vec![Value::Text("a".to_string()), Value::Null];
         assert!(prepared_index_contains_null(&index, &row));
@@ -9009,6 +10055,7 @@ mod tests {
             covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
+            predicate_expr: None,
         };
         let key = prepared_btree_index_key(&index2, &[Value::Int64(99)]).unwrap();
         assert_eq!(key, RuntimeBtreeKey::Int64(99));
@@ -9026,6 +10073,7 @@ mod tests {
             covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
+            predicate_expr: None,
         };
         let key = prepared_btree_index_key(&index_uuid, &[Value::Uuid(uuid)]).unwrap();
         assert_eq!(key, RuntimeBtreeKey::Uuid(uuid));
@@ -9039,6 +10087,7 @@ mod tests {
             covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
+            predicate_expr: None,
         };
         if let RuntimeBtreeKey::Encoded(bytes) =
             prepared_btree_index_key(&index3, &[Value::Text("x".to_string())]).unwrap()
@@ -9476,6 +10525,49 @@ mod tests {
             keys.row_ids_for_value(&Value::Text("keep".to_string()))
                 .unwrap(),
             vec![12]
+        );
+    }
+
+    #[test]
+    fn apply_parent_delete_cascade_batches_child_deleted_row_tracking() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(&mut runtime, "CREATE TABLE parent (id INT64 PRIMARY KEY)");
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE child (
+                id INT64 PRIMARY KEY,
+                parent_id INT64 NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                label TEXT NOT NULL
+            )",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_child_parent ON child(parent_id)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO parent VALUES (1), (2)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO child VALUES
+                (10, 1, 'drop-a'),
+                (11, 1, 'drop-b'),
+                (12, 1, 'drop-c'),
+                (20, 2, 'keep')",
+        );
+
+        execute_sql(&mut runtime, "DELETE FROM parent WHERE id = 1");
+
+        let remaining = query_sql(&mut runtime, "SELECT id FROM child ORDER BY id");
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values(), &[Value::Int64(20)]);
+        let deleted_rows = runtime
+            .paged_mutations
+            .get("child")
+            .expect("child mutation delta")
+            .deleted_rows
+            .clone();
+        assert_eq!(
+            deleted_rows,
+            [10_i64, 11, 12].into_iter().collect::<BTreeSet<_>>()
         );
     }
 
@@ -11026,6 +12118,7 @@ mod dml_private_tests {
             covering_payload_column_indexes: vec![],
             nullable: true,
             unique: false,
+            predicate_expr: None,
         };
         let row = vec![Value::Null];
         assert!(prepared_index_contains_null(&index, &row));
@@ -11044,6 +12137,7 @@ mod dml_private_tests {
             covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
+            predicate_expr: None,
         };
         let row3 = vec![Value::Text("x".to_string())];
         let key2 = prepared_btree_index_key(&idx2, &row3).unwrap();
@@ -11061,6 +12155,7 @@ mod dml_private_tests {
             covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
+            predicate_expr: None,
         };
         let row4 = vec![Value::Text("a".to_string()), Value::Int64(2)];
         let key3 = prepared_btree_index_key(&idx3, &row4).unwrap();
