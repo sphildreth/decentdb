@@ -341,8 +341,8 @@ ddb_status_t ddb_stmt_execute_batch_i64_text_f64(
 ddb_status_t ddb_stmt_execute_batch_typed(
     ddb_stmt_t *stmt,
     size_t row_count,
-    const char *signature,
-    const int64_t *values_i64,
+    const char *signature, /* 'i'=INT64, 'b'=BOOLEAN, 'f'=FLOAT64, 't'=TEXT */
+    const int64_t *values_i64, /* INT64 plus BOOLEAN slots; BOOLEAN uses 0/non-zero */
     const double *values_f64,
     const char *const *values_text_ptrs,
     const size_t *values_text_lens,

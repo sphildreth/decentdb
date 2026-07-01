@@ -505,13 +505,12 @@ var inspection = await connection.Sync.InspectChangesetAsync(changeset);
 var applyResult = await connection.Sync.ApplyChangesetAsync(changeset);
 ```
 
-## Performance sanity guidance
+## Performance guidance
 
-### Embedded performance profile
+### Embedded profile
 
-Use an explicit performance profile when comparing DecentDB to a tuned SQLite
-connection. SQLite benchmark harnesses commonly set WAL mode, cache size,
-`mmap_size`, and temp-store PRAGMAs; the closest DecentDB .NET starting point is:
+Use an explicit profile before comparing DecentDB to a tuned SQLite connection.
+For a durable .NET application, start with:
 
 ```csharp
 var csb = new DecentDBConnectionStringBuilder
@@ -519,50 +518,324 @@ var csb = new DecentDBConnectionStringBuilder
     DataSource = "/path/to/app.ddb",
     PerformanceProfile = "embedded_fast",
     CacheSize = "64MB",
-    ProcessCoordination = "single_process_unsafe", // only for one-process apps
 };
 ```
 
-The named profile maps to the native `DbConfig::embedded_fast()` profile:
-durable WAL sync remains enabled, the cache is raised, hot row sources are
-retained after commits, paged row storage is disabled for cheaper repeated
-small writes, and size-triggered auto-checkpointing is disabled so bulk loads
-are not interrupted mid-flight.
+`embedded_fast` keeps durable WAL sync enabled, raises the cache, keeps hot row
+sources across commits, uses the lower-overhead row-source layout for repeated
+access, and disables size-triggered auto-checkpoints. Use
+`ProcessCoordination = "single_process_unsafe"` only when one OS process can
+open the database file.
 
-Native prepared statements are reusable, but each repeated execution must reset
-the cursor and clear old bindings unless you use one of the `Rebind*Execute` or
-`ExecuteBatch*` helpers:
+When comparing to SQLite `PRAGMA synchronous = NORMAL`, make the durability
+tradeoff explicit:
 
 ```csharp
-using var stmt = db.Prepare("UPDATE movies SET box_office = $1 WHERE id = $2");
-foreach (var movie in movies)
+var csb = new DecentDBConnectionStringBuilder
 {
-    stmt.Reset()
-        .ClearBindings()
-        .BindDecimal(1, movie.BoxOffice)
-        .BindGuid(2, movie.Id)
-        .StepRowsAffected();
+    DataSource = "/path/to/app.ddb",
+    PerformanceProfile = "embedded_fast",
+    CacheSize = "64MB",
+    WalAutoCheckpoint = "0",
+    ProcessCoordination = "single_process_unsafe",
+};
+
+var connectionString = csb.ConnectionString
+    + ";wal_sync_mode=async_commit:10"
+    + ";plan_cache_max_bytes=2097152";
+```
+
+`async_commit` can acknowledge recent commits before the covering fsync. Use it
+only when that bounded post-crash durability window is acceptable, and run
+`connection.Checkpoint()` at controlled application or benchmark boundaries.
+
+### ADO.NET hot loops
+
+For repeated inserts, updates, and point reads, keep one `DbCommand`, create its
+parameters once, call `Prepare()`, and mutate parameter values inside the loop.
+Creating a new command and parameter objects for every row can dominate a small
+statement benchmark even though the provider also has connection-level statement
+and plan caches.
+
+```csharp
+using System.Data;
+using DecentDB.AdoNet;
+
+using var connection = new DecentDBConnection(connectionString);
+connection.Open();
+
+using var transaction = connection.BeginTransaction();
+using var command = connection.CreateCommand();
+command.Transaction = transaction;
+command.CommandText = """
+    INSERT INTO events (id, category, amount)
+    VALUES (@id, @category, @amount)
+    """;
+
+var id = command.CreateParameter();
+id.ParameterName = "@id";
+id.DbType = DbType.Int64;
+command.Parameters.Add(id);
+
+var category = command.CreateParameter();
+category.ParameterName = "@category";
+category.DbType = DbType.String;
+command.Parameters.Add(category);
+
+var amount = command.CreateParameter();
+amount.ParameterName = "@amount";
+amount.DbType = DbType.Double;
+command.Parameters.Add(amount);
+
+command.Prepare();
+
+foreach (var row in rows)
+{
+    id.Value = row.Id;
+    category.Value = row.Category;
+    amount.Value = row.Amount;
+    command.ExecuteNonQuery();
+}
+
+transaction.Commit();
+```
+
+ADO.NET accepts normal named parameters such as `@id`; the provider rewrites them
+to DecentDB's native positional parameters internally. Prefer provider
+parameters over ad-hoc SQL string replacement.
+
+#### Typed batch inserts
+
+For import tools and benchmark loops where every row has the same primitive
+shape, `DecentDBConnection.ExecutePreparedBatchTyped(...)` exposes the native
+typed batch path without manually managing a native statement. The API uses
+DecentDB positional parameters (`$1`, `$2`, ...) and a NUL-terminated ASCII
+signature:
+
+- `i` for INT64 values
+- `b` for BOOLEAN values, supplied as `0` for false and non-zero for true in the
+  INT64 array
+- `f` for FLOAT64 values
+- `t` for UTF-8 TEXT byte arrays
+
+The value arrays are flat and row-major for each type. For signature `itfb`,
+each row contributes two INT64 slots (`i` and `b`), one FLOAT64 slot, and one
+TEXT byte array:
+
+```csharp
+using System.Text;
+using DecentDB.AdoNet;
+
+using var tx = connection.BeginTransaction();
+
+long affected = connection.ExecutePreparedBatchTyped(
+    """
+    INSERT INTO events (id, category, amount, active)
+    VALUES ($1, $2, $3, $4)
+    """,
+    Encoding.ASCII.GetBytes("itfb\0"),
+    rowCount: 3,
+    i64Values: new long[] { 1, 1, 2, 0, 3, 1 },
+    f64Values: new double[] { 10.5, 20.0, 30.25 },
+    textValues: new[]
+    {
+        Encoding.UTF8.GetBytes("alpha"),
+        Encoding.UTF8.GetBytes("beta"),
+        Encoding.UTF8.GetBytes("gamma"),
+    });
+
+tx.Commit();
+```
+
+Use this only for hot homogeneous batches. It bypasses normal `DbParameter`
+objects, so the caller owns UTF-8 encoding, array sizing, boolean encoding, and
+matching the signature to the SQL parameter order.
+
+#### Runnable mini benchmark shape
+
+This console-program-sized example shows the expected ADO.NET benchmark shape:
+one prepared insert command, one prepared point-read command, `ExplainQuery`, and
+an explicit checkpoint boundary.
+
+```bash
+dotnet new console -n DecentDbMiniBench
+cd DecentDbMiniBench
+dotnet add package DecentDB.AdoNet --prerelease
+```
+
+Replace `Program.cs` with:
+
+```csharp
+using System.Data;
+using System.Diagnostics;
+using DecentDB.AdoNet;
+
+const int RowCount = 50_000;
+const int ReadCount = 100_000;
+var path = Path.Combine(Path.GetTempPath(), "decentdb-mini-bench.ddb");
+
+DecentDBConnection.DeleteDatabaseFiles(path);
+
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = path,
+    PerformanceProfile = "embedded_fast",
+    CacheSize = "64MB",
+    ProcessCoordination = "single_process_unsafe",
+    WalAutoCheckpoint = "0",
+};
+
+using var connection = new DecentDBConnection(csb.ConnectionString);
+connection.Open();
+
+using (var schema = connection.CreateCommand())
+{
+    schema.CommandText = """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            category TEXT NOT NULL,
+            amount FLOAT64 NOT NULL
+        );
+        CREATE INDEX events_category_idx ON events(category);
+        """;
+    schema.ExecuteNonQuery();
+}
+
+using var insertTx = connection.BeginTransaction();
+using var insert = connection.CreateCommand();
+insert.Transaction = insertTx;
+insert.CommandText = """
+    INSERT INTO events (id, category, amount)
+    VALUES (@id, @category, @amount)
+    """;
+
+var insertId = insert.CreateParameter();
+insertId.ParameterName = "@id";
+insertId.DbType = DbType.Int64;
+insert.Parameters.Add(insertId);
+
+var insertCategory = insert.CreateParameter();
+insertCategory.ParameterName = "@category";
+insertCategory.DbType = DbType.String;
+insert.Parameters.Add(insertCategory);
+
+var insertAmount = insert.CreateParameter();
+insertAmount.ParameterName = "@amount";
+insertAmount.DbType = DbType.Double;
+insert.Parameters.Add(insertAmount);
+
+insert.Prepare();
+
+var sw = Stopwatch.StartNew();
+for (var i = 1; i <= RowCount; i++)
+{
+    insertId.Value = i;
+    insertCategory.Value = "cat-" + (i % 20);
+    insertAmount.Value = i * 1.25;
+    insert.ExecuteNonQuery();
+}
+
+insertTx.Commit();
+connection.Checkpoint();
+Console.WriteLine($"insert+checkpoint: {sw.Elapsed}");
+
+using var read = connection.CreateCommand();
+read.CommandText = "SELECT amount FROM events WHERE id = @id";
+var readId = read.CreateParameter();
+readId.ParameterName = "@id";
+readId.DbType = DbType.Int64;
+read.Parameters.Add(readId);
+read.Prepare();
+
+var checksum = 0.0;
+sw.Restart();
+for (var i = 0; i < ReadCount; i++)
+{
+    readId.Value = (i % RowCount) + 1;
+    checksum += Convert.ToDouble(read.ExecuteScalar());
+}
+
+Console.WriteLine($"point reads: {sw.Elapsed}; checksum={checksum:0.00}");
+
+var plan = connection.ExplainQuery(
+    "SELECT amount FROM events WHERE id = @id",
+    analyze: true);
+Console.WriteLine(plan.Text);
+```
+
+Run it in Release mode:
+
+```bash
+dotnet run -c Release
+```
+
+For the lowest-overhead microbenchmarks or import tools, use the native
+`DecentDB.Native.DecentDB` surface directly. Native prepared statements are
+reusable, but each repeated execution must reset the cursor and clear old
+bindings unless you use a fused `Rebind*Execute` or `ExecuteBatch*` helper:
+
+```csharp
+using var db = new DecentDB.Native.DecentDB("/path/to/app.ddb");
+using var stmt = db.Prepare("UPDATE counters SET value = value + 1 WHERE id = $1");
+
+stmt.BindInt64(1, 1).StepRowsAffected();
+
+foreach (var id in ids)
+{
+    stmt.RebindInt64Execute(id);
 }
 ```
 
-`PersistentPkIndex = true` can improve some reopened primary-key lookup patterns,
-but it adds write-time and file-size overhead. Benchmark it with your workload
-before enabling it globally; it is not part of the default embedded-fast profile.
+Native fused and batch helpers are useful for import tools and microbenchmarks,
+but they are a lower-level surface than ADO.NET. They still require explicit
+statement lifetime management, correct reset/binding behavior, and benchmark
+coverage that matches the application's transaction and durability settings.
+
+### Query diagnostics
+
+Use `ExplainQuery` before attributing a slow query to binding overhead:
+
+```csharp
+var plan = connection.ExplainQuery(
+    "SELECT id, email FROM users WHERE id = @id",
+    analyze: true);
+
+Console.WriteLine(plan.Text);
+```
+
+`EXPLAIN` and `EXPLAIN ANALYZE` currently support `SELECT` queries. For UPDATE
+or DELETE performance, first verify that an equivalent SELECT predicate uses the
+expected index, then benchmark the mutation separately.
+
+### Benchmarking against SQLite from .NET
+
+For useful DecentDB-vs-SQLite measurements:
+
+- run Release builds, warm up the JIT, repeat each case, and alternate engine
+  order between runs
+- use the same transaction boundaries and checkpoint both engines at the same
+  logical boundaries
+- keep durability modes honest; do not compare DecentDB's durable default
+  against SQLite `synchronous = NORMAL` or `OFF` without labeling the result as
+  a relaxed-durability comparison
+- reuse prepared `DbCommand` instances for both providers in hot loops
+- do not allocate a new command and new parameter objects for every row in an
+  insert, update, delete, or point-read loop
+- time materialized-summary maintenance if the measured query reads a summary
+  table instead of doing the original aggregate
+- verify that search patterns return comparable rows; no-result LIKE queries
+  mostly measure planning and binding overhead
+- add indexes that match the tested predicate and ordering, for example
+  `(paid, total)` for `WHERE paid = FALSE AND total < @max` or `due_at DESC`
+  for `ORDER BY due_at DESC LIMIT 1000`
+- compare query plans before drawing planner conclusions
 
 The in-tree `DecentDb.ShowCase` sample includes a `PERFORMANCE PATTERNS`
-section, but it should be read as a sanity-check aid rather than a benchmark
-suite. The current showcase and tests intentionally focus on:
-
-- projection vs tracked reads
-- `AsNoTracking()` for read-mostly paths
-- `AsSplitQuery()` over included relationship graphs
-- keyset-style paging
-- async materialization vs `AsAsyncEnumerable()` result ordering
-- bulk update/delete rowcount sanity
-
-These checks are meant to catch obviously pathological provider behavior and to
-teach reasonable defaults for embedded workloads. They are not claims of
-cross-provider performance parity.
+section, but it is a sanity-check aid rather than a benchmark suite. The
+`bindings/dotnet/benchmarks` projects are better starting points for measuring
+provider overhead, native fast paths, point reads, scans, and SQLite comparison
+cases. The canonical CRM comparison benchmark lives at
+[`bindings/dotnet/benchmarks/DecentDB.CrmComparison/`](../../bindings/dotnet/benchmarks/DecentDB.CrmComparison/).
 
 ## Build the native library
 

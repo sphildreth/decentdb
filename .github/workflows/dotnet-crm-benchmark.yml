@@ -1,0 +1,255 @@
+name: .NET CRM Benchmark Gates
+
+on:
+  pull_request:
+  schedule:
+    - cron: "30 3 * * *"
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      baseline-ado-relaxed:
+        description: "Optional path to baseline `ado-relaxed/results.json`"
+        required: false
+        default: ""
+      baseline-ado-durable:
+        description: "Optional path to baseline `ado-durable/results.json`"
+        required: false
+        default: ""
+      benchmark-size:
+        description: "Primary benchmark scale for scheduled/release runs"
+        required: false
+        default: "Small"
+      extra-size:
+        description: "Optional extra scale for release validation (e.g. Large)"
+        required: false
+        default: ""
+      iterations:
+        description: "Measured iterations per mode"
+        required: false
+        default: "3"
+      warmup:
+        description: "Warmup iterations per mode"
+        required: false
+        default: "1"
+      include-native:
+        description: "Run DecentDB native-only modes in matrix"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  smoke:
+    if: github.event_name == 'pull_request'
+    name: PR Smoke
+    runs-on: ubuntu-latest
+    env:
+      BENCH_SIZE: "Tiny"
+      DURABILITY: "relaxed"
+      ITERATIONS: "1"
+      WARMUP: "0"
+      SEED: "42"
+      OUT_ROOT: ".tmp/dotnet-crm-smoke"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
+
+      - name: Run smoke benchmark
+        run: |
+          set -euo pipefail
+          bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark.sh \
+            "$OUT_ROOT" \
+            "$BENCH_SIZE" \
+            "$DURABILITY" \
+            "$ITERATIONS" \
+            "$WARMUP" \
+            0 \
+            "$SEED" \
+            all
+
+          RESULT_DIR="$(find "$OUT_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
+          if [[ -z "$RESULT_DIR" || ! -f "$RESULT_DIR/results.json" ]]; then
+            echo "::error::Smoke benchmark did not produce results at $RESULT_DIR/results.json" >&2
+            exit 1
+          fi
+          python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
+            --current "$RESULT_DIR/results.json" \
+            --require-complete \
+            --expected-engines "DecentDB,SQLite" \
+            --max-mean-ms 60000 \
+            --output "$RESULT_DIR/smoke-validation.json"
+          echo "Smoke validation passed: $RESULT_DIR/results.json"
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-crm-smoke-${{ github.run_id }}
+          path: .tmp/dotnet-crm-smoke
+          retention-days: 7
+
+  nightly:
+    if: github.event_name == 'schedule'
+    name: Nightly Small Matrix
+    runs-on: ubuntu-latest
+    env:
+      SIZE: ${{ github.event.inputs.benchmark-size || 'Small' }}
+      ITERATIONS: ${{ github.event.inputs.iterations || '3' }}
+      WARMUP: ${{ github.event.inputs.warmup || '1' }}
+      OUT_ROOT: .tmp/dotnet-crm-nightly
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
+
+      - name: Run nightly matrix benchmark
+        run: |
+          set -euo pipefail
+          bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark-matrix.sh \
+            --size "${SIZE}" \
+            --iterations "${ITERATIONS}" \
+            --warmup "${WARMUP}" \
+            --out-dir "$OUT_ROOT" \
+            --run-id "nightly-${GITHUB_RUN_ID}"
+
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-crm-nightly-${{ github.run_id }}
+          path: .tmp/dotnet-crm-nightly
+          retention-days: 30
+
+  release:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    name: Release Benchmark
+    runs-on: ubuntu-latest
+    env:
+      SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark-size || 'Small' }}
+      EXTRA_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.extra-size || '' }}
+      ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '3' }}
+      WARMUP: ${{ github.event_name == 'workflow_dispatch' && inputs.warmup || '1' }}
+      INCLUDE_NATIVE: ${{ github.event_name == 'workflow_dispatch' && inputs.include-native || 'false' }}
+      BASELINE_RELAXED: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline-ado-relaxed || '' }}
+      BASELINE_DURABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline-ado-durable || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native DecentDB
+        run: cargo build --release -p decentdb
+
+      - name: Run release matrix benchmark
+        id: run
+        run: |
+          set -euo pipefail
+          OUT_ROOT=".tmp/dotnet-crm-release"
+          PRIMARY_RUN_ID="release-${GITHUB_RUN_ID}-$SIZE"
+          bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark-matrix.sh \
+            --size "$SIZE" \
+            --iterations "$ITERATIONS" \
+            --warmup "$WARMUP" \
+            --out-dir "$OUT_ROOT" \
+            --run-id "$PRIMARY_RUN_ID" \
+            $(if [[ "$INCLUDE_NATIVE" == "true" ]]; then echo "--native-on"; fi)
+
+          if [[ -n "${EXTRA_SIZE:-}" ]]; then
+            EXTRA_RUN_ID="release-${GITHUB_RUN_ID}-${EXTRA_SIZE}"
+            bash bindings/dotnet/benchmarks/DecentDB.CrmComparison/run-crm-benchmark-matrix.sh \
+              --size "$EXTRA_SIZE" \
+              --iterations "$ITERATIONS" \
+              --warmup "$WARMUP" \
+              --out-dir "$OUT_ROOT" \
+              --run-id "$EXTRA_RUN_ID" \
+              $(if [[ "$INCLUDE_NATIVE" == "true" ]]; then echo "--native-on"; fi)
+          fi
+
+          echo "primary_release_dir=$OUT_ROOT/$PRIMARY_RUN_ID" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${EXTRA_SIZE:-}" ]]; then
+            echo "extra_release_dir=$OUT_ROOT/$EXTRA_RUN_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compare release baseline (when provided)
+        if: env.BASELINE_RELAXED != '' || env.BASELINE_DURABLE != ''
+        run: |
+          set -euo pipefail
+          PRIMARY_DIR="${{ steps.run.outputs.primary_release_dir }}"
+          RELEASE_RELAXED="$PRIMARY_DIR/ado-relaxed/results.json"
+          RELEASE_DURABLE="$PRIMARY_DIR/ado-durable/results.json"
+
+          if [[ -n "${BASELINE_RELAXED}" ]]; then
+            if [[ ! -f "$BASELINE_RELAXED" ]]; then
+              echo "::error::Baseline path not found: $BASELINE_RELAXED" >&2
+              exit 1
+            fi
+
+            if [[ ! -f "$RELEASE_RELAXED" ]]; then
+              echo "::error::Missing release current results: $RELEASE_RELAXED" >&2
+              exit 1
+            fi
+
+            python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
+              --baseline "$BASELINE_RELAXED" \
+              --current "$RELEASE_RELAXED" \
+              --max-regression 0.10 \
+              --check-decentdb-win \
+              --require-complete \
+              --expected-engines "DecentDB,SQLite" \
+              --output "$PRIMARY_DIR/compare-ado-relaxed.json"
+          fi
+
+          if [[ -n "${BASELINE_DURABLE}" ]]; then
+            if [[ ! -f "$BASELINE_DURABLE" ]]; then
+              echo "::error::Baseline path not found: $BASELINE_DURABLE" >&2
+              exit 1
+            fi
+
+            if [[ ! -f "$RELEASE_DURABLE" ]]; then
+              echo "::error::Missing release current results: $RELEASE_DURABLE" >&2
+              exit 1
+            fi
+
+            python bindings/dotnet/benchmarks/DecentDB.CrmComparison/compare-crm-benchmark.py \
+              --baseline "$BASELINE_DURABLE" \
+              --current "$RELEASE_DURABLE" \
+              --max-regression 0.10 \
+              --check-decentdb-win \
+              --require-complete \
+              --expected-engines "DecentDB,SQLite" \
+              --output "$PRIMARY_DIR/compare-ado-durable.json"
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-crm-release-${{ github.run_id }}
+          path: .tmp/dotnet-crm-release
+          retention-days: 90

@@ -846,6 +846,7 @@ mod tests {
             primary_auto_row_id_column_index: None,
             value_sources: vec![],
             required_columns: vec![],
+            generated_columns: vec![],
             foreign_keys: vec![],
             unique_indexes: vec![],
             insert_indexes: vec![],

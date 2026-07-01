@@ -251,6 +251,24 @@ namespace DecentDB.AdoNet
         public static string EngineVersion() => Native.DecentDB.EngineVersion();
 
         /// <summary>
+        /// Executes many rows against one prepared statement using DecentDB's typed native batch path.
+        /// Signature characters are <c>i</c> for INT64, <c>b</c> for BOOLEAN, <c>f</c> for FLOAT64,
+        /// and <c>t</c> for TEXT. BOOLEAN values are supplied in <paramref name="i64Values"/> as
+        /// 0 for false and non-zero for true.
+        /// </summary>
+        public long ExecutePreparedBatchTyped(
+            string sql,
+            ReadOnlySpan<byte> signatureUtf8,
+            int rowCount,
+            ReadOnlySpan<long> i64Values,
+            ReadOnlySpan<double> f64Values,
+            IReadOnlyList<byte[]> textValues)
+        {
+            var statement = GetOrAddPreparedStatement(sql);
+            return statement.ExecuteBatchTyped(signatureUtf8, rowCount, i64Values, f64Values, textValues);
+        }
+
+        /// <summary>
         /// Deletes the database file and all associated sidecar files (WAL, SHM, coordination).
         /// This operation ignores missing files — each path is deleted if present,
         /// and no exception is thrown for absent files. The data file itself is

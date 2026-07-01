@@ -2,6 +2,11 @@
 
 This is a lightweight, dependency-free benchmark harness for the ADO.NET provider and the Micro-ORM.
 
+Additional benchmark suites:
+
+- `DecentDB.CrmComparison`: canonical CRM-style DecentDB vs SQLite comparison with JSON artifacts, matrix runner, validation, and optional allocation telemetry.
+- `DecentDB.AdoNetMicrobenchmarks`: BenchmarkDotNet ADO.NET hot-path microbenchmarks with memory diagnostics for prepared inserts, point reads, updates, reader creation, and sync vs async wrappers.
+
 ## Run
 
 From repo root:

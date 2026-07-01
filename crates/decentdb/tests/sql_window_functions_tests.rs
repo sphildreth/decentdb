@@ -535,6 +535,41 @@ fn window_rank_dense_rank() {
 }
 
 #[test]
+fn window_row_number_and_rank_share_window_spec() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(user_id INT64, invoice TEXT, total FLOAT64)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES
+            (1, 'a', 50.0),
+            (1, 'b', 75.0),
+            (1, 'c', 75.0),
+            (2, 'd', 10.0),
+            (2, 'e', 20.0)",
+    )
+    .unwrap();
+
+    let r = db
+        .execute(
+            "SELECT user_id, invoice,
+                    ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY total DESC) AS rn,
+                    RANK() OVER (PARTITION BY user_id ORDER BY total DESC) AS rnk
+             FROM t
+             ORDER BY user_id, invoice",
+        )
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][2], Value::Int64(3));
+    assert_eq!(v[0][3], Value::Int64(3));
+    assert_eq!(v[1][3], Value::Int64(1));
+    assert_eq!(v[2][3], Value::Int64(1));
+    assert_eq!(v[3][2], Value::Int64(2));
+    assert_eq!(v[3][3], Value::Int64(2));
+    assert_eq!(v[4][2], Value::Int64(1));
+    assert_eq!(v[4][3], Value::Int64(1));
+}
+
+#[test]
 fn window_row_number_basic() {
     let db = mem_db();
     db.execute("CREATE TABLE t(category TEXT, val INT64)")

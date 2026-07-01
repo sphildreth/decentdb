@@ -399,7 +399,36 @@ fn explain_update() {
     exec(&db, "CREATE TABLE eu (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO eu VALUES (1, 10)");
     let r = exec(&db, "EXPLAIN UPDATE eu SET val = 20 WHERE id = 1");
-    assert!(!r.explain_lines().is_empty());
+    let lines = format!("{:?}", r.explain_lines());
+    assert!(lines.contains("Mutation: UPDATE eu"));
+    assert!(lines.contains("Assignment 1: val = 20"));
+    assert!(lines.contains("Candidate rows: 1"));
+    assert!(lines.contains("Returning: OFF"));
+}
+
+#[test]
+fn explain_update_without_filter_counts_all_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE eu (id INT PRIMARY KEY, val INT)");
+    exec(&db, "INSERT INTO eu VALUES (1, 10), (2, 20)");
+    let r = exec(&db, "EXPLAIN UPDATE eu SET val = 20");
+    let lines = format!("{:?}", r.explain_lines());
+    assert!(lines.contains("Mutation: UPDATE eu"));
+    assert!(lines.contains("Filter: <none>"));
+    assert!(lines.contains("Candidate rows: 2"));
+    assert!(lines.contains("Returning: OFF"));
+}
+
+#[test]
+fn explain_analyze_update_is_not_supported() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE eu (id INT PRIMARY KEY, val INT)");
+    exec(&db, "INSERT INTO eu VALUES (1, 10)");
+    let err = exec_err(&db, "EXPLAIN ANALYZE UPDATE eu SET val = 20 WHERE id = 1");
+    assert!(
+        err.contains("EXPLAIN ANALYZE is not supported for UPDATE"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

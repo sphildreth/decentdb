@@ -1331,6 +1331,25 @@ public sealed class PreparedStatement : IDisposable
         byte[]? text1,
         int textCount)
     {
+        return ExecuteBatchTypedOneRow(
+            signatureUtf8,
+            i64Values,
+            f64Values,
+            text0,
+            text1,
+            null,
+            textCount);
+    }
+
+    public long ExecuteBatchTypedOneRow(
+        ReadOnlySpan<byte> signatureUtf8,
+        ReadOnlySpan<long> i64Values,
+        ReadOnlySpan<double> f64Values,
+        byte[]? text0,
+        byte[]? text1,
+        byte[]? text2,
+        int textCount)
+    {
         InvalidateRowViewCache();
         unsafe
         {
@@ -1347,6 +1366,7 @@ public sealed class PreparedStatement : IDisposable
                             null,
                             text0,
                             text1,
+                            text2,
                             textCount);
                     }
                     else
@@ -1359,6 +1379,7 @@ public sealed class PreparedStatement : IDisposable
                                 pF64,
                                 text0,
                                 text1,
+                                text2,
                                 textCount);
                         }
                     }
@@ -1375,6 +1396,7 @@ public sealed class PreparedStatement : IDisposable
                                 null,
                                 text0,
                                 text1,
+                                text2,
                                 textCount);
                         }
                         else
@@ -1387,6 +1409,7 @@ public sealed class PreparedStatement : IDisposable
                                     pF64,
                                     text0,
                                     text1,
+                                    text2,
                                     textCount);
                             }
                         }
@@ -1398,12 +1421,199 @@ public sealed class PreparedStatement : IDisposable
         }
     }
 
+    public long ExecuteBatchTyped(
+        ReadOnlySpan<byte> signatureUtf8,
+        int rowCount,
+        ReadOnlySpan<long> i64Values,
+        ReadOnlySpan<double> f64Values,
+        IReadOnlyList<byte[]> textValues)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(rowCount);
+        if (signatureUtf8.IsEmpty || signatureUtf8[^1] != 0)
+        {
+            throw new ArgumentException("Signature must be NUL-terminated.", nameof(signatureUtf8));
+        }
+
+        var i64PerRow = 0;
+        var f64PerRow = 0;
+        var textPerRow = 0;
+        for (var i = 0; i < signatureUtf8.Length - 1; i++)
+        {
+            switch (signatureUtf8[i])
+            {
+                case (byte)'i':
+                case (byte)'b':
+                    i64PerRow++;
+                    break;
+                case (byte)'f':
+                    f64PerRow++;
+                    break;
+                case (byte)'t':
+                    textPerRow++;
+                    break;
+                default:
+                    throw new ArgumentException(
+                        $"Unsupported typed batch signature character '{(char)signatureUtf8[i]}'.",
+                        nameof(signatureUtf8));
+            }
+        }
+
+        if (i64Values.Length != checked(rowCount * i64PerRow))
+        {
+            throw new ArgumentException("INT64/BOOLEAN value count does not match signature and row count.", nameof(i64Values));
+        }
+        if (f64Values.Length != checked(rowCount * f64PerRow))
+        {
+            throw new ArgumentException("FLOAT64 value count does not match signature and row count.", nameof(f64Values));
+        }
+        if (textValues.Count != checked(rowCount * textPerRow))
+        {
+            throw new ArgumentException("TEXT value count does not match signature and row count.", nameof(textValues));
+        }
+
+        if (rowCount == 0)
+        {
+            return 0;
+        }
+
+        InvalidateRowViewCache();
+        unsafe
+        {
+            fixed (byte* pSignature = signatureUtf8)
+            {
+                if (i64Values.IsEmpty)
+                {
+                    if (f64Values.IsEmpty)
+                    {
+                        return ExecuteBatchTypedCore(
+                            pSignature,
+                            checked((nuint)rowCount),
+                            null,
+                            null,
+                            textValues);
+                    }
+
+                    fixed (double* pF64 = f64Values)
+                    {
+                        return ExecuteBatchTypedCore(
+                            pSignature,
+                            checked((nuint)rowCount),
+                            null,
+                            pF64,
+                            textValues);
+                    }
+                }
+
+                fixed (long* pI64 = i64Values)
+                {
+                    if (f64Values.IsEmpty)
+                    {
+                        return ExecuteBatchTypedCore(
+                            pSignature,
+                            checked((nuint)rowCount),
+                            pI64,
+                            null,
+                            textValues);
+                    }
+
+                    fixed (double* pF64 = f64Values)
+                    {
+                        return ExecuteBatchTypedCore(
+                            pSignature,
+                            checked((nuint)rowCount),
+                            pI64,
+                            pF64,
+                            textValues);
+                    }
+                }
+            }
+        }
+    }
+
+    private unsafe long ExecuteBatchTypedCore(
+        byte* signatureUtf8,
+        nuint rowCount,
+        long* valuesI64,
+        double* valuesF64,
+        IReadOnlyList<byte[]> textValues)
+    {
+        const int StackallocTextPointerLimit = 8192;
+        if (textValues.Count == 0)
+        {
+            var res = _db.RecordStatus(
+                DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                    Handle,
+                    rowCount,
+                    signatureUtf8,
+                    valuesI64,
+                    valuesF64,
+                    null,
+                    null,
+                    out var affected));
+            if (res != 0)
+            {
+                throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            }
+
+            return (long)affected;
+        }
+
+        if (textValues.Count > StackallocTextPointerLimit)
+        {
+            throw new ArgumentException(
+                $"Typed batch text value count must be {StackallocTextPointerLimit} or fewer per call.",
+                nameof(textValues));
+        }
+
+        var handles = new GCHandle[textValues.Count];
+        byte** textPtrs = stackalloc byte*[textValues.Count];
+        nuint* textLens = stackalloc nuint[textValues.Count];
+        try
+        {
+            for (var i = 0; i < textValues.Count; i++)
+            {
+                var value = textValues[i] ?? throw new ArgumentException("TEXT batch values cannot be null.", nameof(textValues));
+                handles[i] = GCHandle.Alloc(value, GCHandleType.Pinned);
+                textPtrs[i] = (byte*)handles[i].AddrOfPinnedObject();
+                textLens[i] = checked((nuint)value.Length);
+            }
+
+            var res = _db.RecordStatus(
+                DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                    Handle,
+                    rowCount,
+                    signatureUtf8,
+                    valuesI64,
+                    valuesF64,
+                    textPtrs,
+                    textLens,
+                    out var affected));
+            if (res != 0)
+            {
+                throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            }
+
+            return (long)affected;
+        }
+        finally
+        {
+            for (var i = 0; i < handles.Length; i++)
+            {
+                if (handles[i].IsAllocated)
+                {
+                    handles[i].Free();
+                }
+            }
+        }
+    }
+
     private unsafe long ExecuteBatchTypedOneRowCore(
         byte* signatureUtf8,
         long* valuesI64,
         double* valuesF64,
         byte[]? text0,
         byte[]? text1,
+        byte[]? text2,
         int textCount)
     {
         unsafe
@@ -1466,6 +1676,38 @@ public sealed class PreparedStatement : IDisposable
                         textPtrs[1] = pText1;
                         textLens[0] = (nuint)(text0?.Length ?? 0);
                         textLens[1] = (nuint)(text1?.Length ?? 0);
+                        var res = _db.RecordStatus(
+                            DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                                Handle,
+                                1,
+                                signatureUtf8,
+                                valuesI64,
+                                valuesF64,
+                                textPtrs,
+                                textLens,
+                                out var affected));
+                        if (res != 0)
+                        {
+                            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                        }
+
+                        return (long)affected;
+                    }
+                }
+                case 3:
+                {
+                    fixed (byte* pText0 = text0)
+                    fixed (byte* pText1 = text1)
+                    fixed (byte* pText2 = text2)
+                    {
+                        byte** textPtrs = stackalloc byte*[3];
+                        nuint* textLens = stackalloc nuint[3];
+                        textPtrs[0] = pText0;
+                        textPtrs[1] = pText1;
+                        textPtrs[2] = pText2;
+                        textLens[0] = (nuint)(text0?.Length ?? 0);
+                        textLens[1] = (nuint)(text1?.Length ?? 0);
+                        textLens[2] = (nuint)(text2?.Length ?? 0);
                         var res = _db.RecordStatus(
                             DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
                                 Handle,
@@ -1603,6 +1845,15 @@ public sealed class PreparedStatement : IDisposable
     private void InvalidateRowViewCache()
     {
         _currentRowViewsCaptured = false;
+    }
+
+    internal int CapturedRowColumnCount
+    {
+        get
+        {
+            var views = _currentRowViews;
+            return _currentRowViewsCaptured && views != null ? views.Length : -1;
+        }
     }
 
     private unsafe void CaptureRowViews(IntPtr values, nuint count)

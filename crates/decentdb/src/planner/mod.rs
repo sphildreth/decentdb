@@ -2261,7 +2261,6 @@ fn maybe_expand_view(name: &str, catalog: &CatalogState) -> Result<Option<Physic
     };
     if view_select.distinct
         || !view_select.distinct_on.is_empty()
-        || view_select.filter.is_some()
         || !view_select.group_by.is_empty()
         || view_select.having.is_some()
         || projection_has_aggregate_items(&view_select.projection)
@@ -2272,7 +2271,7 @@ fn maybe_expand_view(name: &str, catalog: &CatalogState) -> Result<Option<Physic
     Ok(Some(PhysicalPlan::ExpandedView {
         name: view.name.clone(),
         input: Box::new(inner_plan),
-        pushed_filter: false,
+        pushed_filter: view_select.filter.is_some(),
         pushed_projection: false,
         pushed_limit: false,
         estimate: PlanEstimate::ZERO,
@@ -2421,6 +2420,23 @@ mod tests {
         catalog
     }
 
+    fn catalog_with_filtered_artist_view() -> CatalogState {
+        let mut catalog = catalog_with_artist_table();
+        catalog.views.insert(
+            "v_filtered_artist".to_string(),
+            ViewSchema {
+                name: "v_filtered_artist".to_string(),
+                temporary: false,
+                sql_text:
+                    "SELECT Id, NameNormalized FROM Artist WHERE NameNormalized = 'MOTLEYCRUE'"
+                        .to_string(),
+                column_names: vec!["Id".to_string(), "NameNormalized".to_string()],
+                dependencies: vec!["Artist".to_string()],
+            },
+        );
+        catalog
+    }
+
     fn single_table_select(filter: Expr) -> Select {
         Select {
             distinct: false,
@@ -2519,6 +2535,28 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Filter((namenormalized = 'MOTLEYCRUE')")),
             "expected rendered plan to retain visible outer filter, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explain_plan_expands_filtered_view_for_ordered_limit_query() {
+        let catalog = catalog_with_filtered_artist_view();
+        let statement = parse_sql_statement("SELECT Id FROM v_filtered_artist ORDER BY Id LIMIT 5")
+            .expect("parse");
+
+        let lines = plan_statement(&statement, &catalog).expect("plan").render();
+
+        assert!(
+            lines.iter().any(|line| line.contains(
+                "ExpandedView(name=v_filtered_artist, pushedFilter=true, pushedProjection=true, pushedLimit=false"
+            )),
+            "expected filtered view expansion with projection pushdown, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("predicate=(namenormalized = 'MOTLEYCRUE')")),
+            "expected expanded filtered view to retain the view predicate in an indexed or filtered path, got: {lines:?}"
         );
     }
 

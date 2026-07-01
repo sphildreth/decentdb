@@ -56,6 +56,97 @@ helper:
 stmt.Reset().ClearBindings().BindInt64(1, id).StepRowsAffected();
 ```
 
+## Performance checklist
+
+For hot ADO.NET insert, update, delete, or point-read loops, create one command,
+create its parameters once, call `Prepare()`, and mutate `DbParameter.Value`
+inside the loop. Allocating a new command and new parameter objects for every
+row can dominate small-statement benchmarks.
+
+```csharp
+using System.Data;
+using DecentDB.AdoNet;
+
+using var connection = new DecentDBConnection(connectionString);
+connection.Open();
+
+using var transaction = connection.BeginTransaction();
+using var command = connection.CreateCommand();
+command.Transaction = transaction;
+command.CommandText = "INSERT INTO events (id, category) VALUES (@id, @category)";
+
+var id = command.CreateParameter();
+id.ParameterName = "@id";
+id.DbType = DbType.Int64;
+command.Parameters.Add(id);
+
+var category = command.CreateParameter();
+category.ParameterName = "@category";
+category.DbType = DbType.String;
+command.Parameters.Add(category);
+
+command.Prepare();
+
+foreach (var row in rows)
+{
+    id.Value = row.Id;
+    category.Value = row.Category;
+    command.ExecuteNonQuery();
+}
+
+transaction.Commit();
+connection.Checkpoint();
+```
+
+For hot homogeneous import batches, `DecentDBConnection.ExecutePreparedBatchTyped`
+uses the native typed batch path while keeping ADO.NET connection management. The
+SQL must use positional parameters (`$1`, `$2`, ...), and the signature is a
+NUL-terminated ASCII string where `i` = INT64, `b` = BOOLEAN encoded in the
+INT64 array as `0` or non-zero, `f` = FLOAT64, and `t` = UTF-8 TEXT. Arrays are
+flat and row-major for each type:
+
+```csharp
+long affected = connection.ExecutePreparedBatchTyped(
+    "INSERT INTO events (id, category, amount, active) VALUES ($1, $2, $3, $4)",
+    Encoding.ASCII.GetBytes("itfb\0"),
+    rowCount: 3,
+    i64Values: new long[] { 1, 1, 2, 0, 3, 1 },
+    f64Values: new double[] { 10.5, 20.0, 30.25 },
+    textValues: new[]
+    {
+        Encoding.UTF8.GetBytes("alpha"),
+        Encoding.UTF8.GetBytes("beta"),
+        Encoding.UTF8.GetBytes("gamma"),
+    });
+```
+
+This is an advanced import path. For ordinary application code, prefer prepared
+`DbCommand` loops unless profiling shows binding overhead dominates.
+
+Use `ExplainQuery(...)` before assuming a slow query is ADO.NET overhead:
+
+```csharp
+var plan = connection.ExplainQuery(
+    "SELECT category FROM events WHERE id = @id",
+    analyze: true);
+Console.WriteLine(plan.Text);
+```
+
+When comparing DecentDB to SQLite:
+
+- use Release builds, warm up the JIT, repeat each case, and alternate engine
+  order between runs
+- keep durability settings equivalent and label any relaxed-durability run, for
+  example SQLite `synchronous=NORMAL` versus DecentDB `async_commit`
+- reuse prepared commands and parameters for both providers
+- avoid no-result `LIKE` probes unless that is the intended workload; they
+  mostly measure planning and binding overhead
+- time materialized-summary maintenance if the measured query reads a summary
+  table instead of computing the original aggregate
+
+The canonical .NET CRM comparison benchmark lives at
+[`bindings/dotnet/benchmarks/DecentDB.CrmComparison/`](../../benchmarks/DecentDB.CrmComparison/).
+
 ## Cleanup helper
 
 Use `DecentDBConnection.DeleteDatabaseFiles(path)` to safely delete the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) in the correct order. This prevents stale WAL or coordination artifacts when recreating databases.

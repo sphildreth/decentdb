@@ -18,7 +18,7 @@ use super::{
     encode_manifest_payload, encode_paged_table_chunks, encode_paged_table_chunks_from_rows,
     encode_runtime_payload, encode_table_payload, like_match, persist_paged_table,
     read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
-    rewrite_paged_table_from_resident, simple_trigram_lookup,
+    rewrite_paged_table_from_manifest, rewrite_paged_table_from_resident, simple_trigram_lookup,
     try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
     EngineRuntime, OverflowPointer, PersistedTableState, QueryRow, RuntimeBtreeKeys, RuntimeIndex,
     SimpleOrderByPlan, StoredRow, TableData, TablePageManifest, TablePageManifestChunk,
@@ -4342,6 +4342,141 @@ fn sparse_paged_row_deletions_do_not_decode_changed_base_chunk() {
 }
 
 #[test]
+fn rewrite_paged_manifest_update_reuses_changed_base_chunk_pointer() {
+    let body = "x".repeat(2048);
+    let initial = TableData::from_rows(
+        (1_i64..=96_i64)
+            .map(|row_id| StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+            })
+            .collect(),
+    );
+    let mut store = InMemoryPageStore::new(PAGE_SIZE);
+    let initial_chunks =
+        encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
+    let initial_state = persist_paged_table(
+        &mut store,
+        PersistedTableState::default(),
+        &initial_chunks,
+        initial.rows.len(),
+    )
+    .expect("persist initial paged table");
+    let initial_manifest_payload =
+        crate::record::overflow::read_overflow(&store, initial_state.pointer)
+            .expect("read initial manifest");
+    let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
+        .expect("decode initial manifest");
+    let page_manifest =
+        read_table_page_manifest_from_state(&store, initial_state).expect("read page manifest");
+    let changed_chunk_index = page_manifest
+        .chunk_index_for_row_id(6)
+        .expect("changed row chunk");
+    let changed_chunk_pointer = initial_manifest.chunks[changed_chunk_index].pointer;
+
+    let mut row_changes = BTreeMap::new();
+    row_changes.insert(
+        6,
+        Some(vec![Value::Int64(6), Value::Text("updated".to_string())]),
+    );
+    let updated_manifest =
+        apply_paged_row_changes_to_manifest(&page_manifest, &row_changes).expect("update row");
+    let (updated_state, persisted_chunks) =
+        rewrite_paged_table_from_manifest(&mut store, initial_state, &updated_manifest)
+            .expect("rewrite paged table from manifest");
+    let updated_manifest_payload =
+        crate::record::overflow::read_overflow(&store, updated_state.pointer)
+            .expect("read updated manifest");
+    let updated_persisted = decode_paged_table_manifest_payload(&updated_manifest_payload)
+        .expect("decode updated manifest");
+    let updated_page_manifest =
+        TablePageManifest::from_chunks(persisted_chunks).expect("read persisted chunks");
+    let row = updated_page_manifest
+        .row_by_id(6)
+        .expect("read updated row")
+        .expect("updated row should exist");
+
+    assert_eq!(
+        updated_persisted.chunks[changed_chunk_index].pointer, changed_chunk_pointer,
+        "overlay update should preserve the changed chunk base payload pointer"
+    );
+    assert!(updated_persisted.chunks[changed_chunk_index]
+        .tombstoned_row_ids
+        .contains(&6));
+    assert!(updated_persisted.chunks[changed_chunk_index]
+        .overlay_pointer
+        .is_some());
+    assert_eq!(
+        row.values(),
+        &[Value::Int64(6), Value::Text("updated".to_string())]
+    );
+}
+
+#[test]
+fn rewrite_paged_manifest_delete_reuses_changed_base_chunk_pointer() {
+    let body = "x".repeat(2048);
+    let initial = TableData::from_rows(
+        (1_i64..=96_i64)
+            .map(|row_id| StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+            })
+            .collect(),
+    );
+    let mut store = InMemoryPageStore::new(PAGE_SIZE);
+    let initial_chunks =
+        encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
+    let initial_state = persist_paged_table(
+        &mut store,
+        PersistedTableState::default(),
+        &initial_chunks,
+        initial.rows.len(),
+    )
+    .expect("persist initial paged table");
+    let initial_manifest_payload =
+        crate::record::overflow::read_overflow(&store, initial_state.pointer)
+            .expect("read initial manifest");
+    let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
+        .expect("decode initial manifest");
+    let page_manifest =
+        read_table_page_manifest_from_state(&store, initial_state).expect("read page manifest");
+    let changed_chunk_index = page_manifest
+        .chunk_index_for_row_id(6)
+        .expect("deleted row chunk");
+    let changed_chunk_pointer = initial_manifest.chunks[changed_chunk_index].pointer;
+    let deleted_row_ids = [6_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated_manifest = apply_paged_row_deletions_to_manifest(&page_manifest, &deleted_row_ids)
+        .expect("delete row");
+    let (updated_state, persisted_chunks) =
+        rewrite_paged_table_from_manifest(&mut store, initial_state, &updated_manifest)
+            .expect("rewrite paged table from manifest");
+    let updated_manifest_payload =
+        crate::record::overflow::read_overflow(&store, updated_state.pointer)
+            .expect("read updated manifest");
+    let updated_persisted = decode_paged_table_manifest_payload(&updated_manifest_payload)
+        .expect("decode updated manifest");
+    let updated_page_manifest =
+        TablePageManifest::from_chunks(persisted_chunks).expect("read persisted chunks");
+
+    assert_eq!(
+        updated_persisted.chunks[changed_chunk_index].pointer, changed_chunk_pointer,
+        "delete should preserve the changed chunk base payload pointer"
+    );
+    assert!(updated_persisted.chunks[changed_chunk_index]
+        .tombstoned_row_ids
+        .contains(&6));
+    assert!(updated_persisted.chunks[changed_chunk_index]
+        .overlay_pointer
+        .is_none());
+    assert_eq!(updated_page_manifest.row_count(), 95);
+    assert!(updated_page_manifest
+        .row_by_id(6)
+        .expect("read deleted row")
+        .is_none());
+}
+
+#[test]
 fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers() {
     let body = "x".repeat(2048);
     let config = DbConfig {
@@ -4444,6 +4579,96 @@ fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers()
         updated_row.values(),
         &[Value::Int64(6), Value::Text(updated_body)]
     );
+}
+
+#[test]
+fn persist_to_db_paged_row_delete_succeeds_after_materialized_snapshot() {
+    let body = "x".repeat(2048);
+    let config = DbConfig {
+        paged_row_storage: true,
+        defer_table_materialization: false,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(":memory:", config).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
+        .expect("create table");
+    for row_id in 1_i64..=96_i64 {
+        db.execute(&format!(
+            "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
+            body
+        ))
+        .expect("insert row");
+    }
+
+    let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
+    let initial_state = runtime.persisted_tables["docs"];
+    let store = DbTxnPageStore { db: &db };
+    db.begin_write().expect("begin write transaction");
+    let initial_manifest_payload =
+        crate::record::overflow::read_overflow(&store, initial_state.pointer)
+            .expect("read manifest payload");
+    let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
+        .expect("decode manifest payload");
+    let initial_page_manifest =
+        read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
+    db.commit().expect("commit write transaction");
+    assert!(
+        initial_manifest.chunks.len() > 2,
+        "expected multiple chunks to observe pointer preservation"
+    );
+    let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
+    let untouched_pointers = initial_manifest
+        .chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (index != changed_chunk_index).then_some(chunk.pointer))
+        .collect::<Vec<_>>();
+
+    let statement = parse_sql_statement("DELETE FROM docs WHERE id = 6").expect("parse delete");
+    let crate::sql::ast::Statement::Delete(delete) = statement else {
+        panic!("expected delete statement");
+    };
+    let prepared = runtime
+        .prepare_simple_delete(&delete)
+        .expect("prepare delete")
+        .expect("expected prepared delete");
+    runtime
+        .execute_prepared_simple_delete(&prepared, &[], PAGE_SIZE)
+        .expect("execute prepared delete");
+
+    db.begin_write().expect("begin write txn");
+    runtime.persist_to_db(&db).expect("persist runtime");
+    db.commit().expect("commit write txn");
+
+    let rewritten_state = runtime.persisted_tables["docs"];
+    db.begin_write().expect("begin write transaction");
+    let rewritten_manifest_payload =
+        crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
+            .expect("read manifest payload");
+    let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
+        .expect("decode manifest payload");
+    let rewritten_page_manifest =
+        read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
+    db.commit().expect("commit write transaction");
+    let preserved_untouched = rewritten_manifest
+        .chunks
+        .iter()
+        .filter_map(|chunk| {
+            untouched_pointers
+                .contains(&chunk.pointer)
+                .then_some(chunk.pointer)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        preserved_untouched, untouched_pointers,
+        "materialized snapshot delete should preserve untouched chunk pointers"
+    );
+    assert_eq!(rewritten_page_manifest.row_count(), 95);
+    assert!(rewritten_page_manifest
+        .row_by_id(6)
+        .expect("read deleted row")
+        .is_none());
 }
 
 #[test]
