@@ -5,7 +5,7 @@ This page collects the current Python embedded comparison charts and a plain-lan
 ## Benchmark snapshot metadata
 
 <!-- BENCHMARK_AUTOGEN_METADATA_START -->
-- Document updated: 2026-07-01 02:45:56 UTC
+- Document updated: 2026-07-01 13:41:15 UTC
 - Ranking snapshot: final sweep point at `500` operations from the exported benchmark bundles in `docs/assets/benchmarks/python-embedded-compare/`
 <!-- BENCHMARK_AUTOGEN_METADATA_END -->
 
@@ -60,14 +60,14 @@ The summary table below uses the latest sweep point shown in the charts: `500` o
 <!-- BENCHMARK_AUTOGEN_SUMMARY_START -->
 | Workload | Benchmark | Leader at 500 ops | Leader mean latency (us/op) | DecentDB mean latency (us/op) | DecentDB rank | Reading |
 | --- | --- | --- | ---: | ---: | --- | --- |
-| Workload C | Full scan | SQLite_wal_full | 668.88 | 1271.04 | 3rd of 6 | Trailing |
-| Workload C | Point select | SQLite_wal_full | 6.43 | 15.06 | 2nd of 6 | Near the front |
-| Workload A | Point select | SQLite_wal_full | 6.19 | 16.78 | 2nd of 6 | Near the front |
-| Workload A | Aggregate | SQLite_wal_full | 57.64 | 137.27 | 2nd of 6 | Near the front |
-| Workload A | Join | SQLite_wal_full | 29.58 | 223.22 | 2nd of 6 | Near the front |
-| Workload A | Range scan | SQLite_wal_full | 5.99 | 29.06 | 2nd of 6 | Near the front |
-| Workload A | Delete | H2(JDBC) | 36.07 | 883.29 | 5th of 6 | Trailing |
-| Workload A | Update | H2(JDBC) | 42.89 | 938.35 | 5th of 6 | Trailing |
+| Workload C | Full scan | DuckDB | 355.35 | 741.99 | 3rd of 6 | Trailing |
+| Workload C | Point select | SQLite_wal_full | 4.07 | 7.64 | 2nd of 6 | Near the front |
+| Workload A | Point select | SQLite_wal_full | 4.03 | 8.59 | 2nd of 6 | Near the front |
+| Workload A | Aggregate | SQLite_wal_full | 32.50 | 71.94 | 2nd of 6 | Near the front |
+| Workload A | Join | SQLite_wal_full | 17.91 | 126.89 | 2nd of 6 | Near the front |
+| Workload A | Range scan | SQLite_wal_full | 3.99 | 14.20 | 2nd of 6 | Near the front |
+| Workload A | Delete | H2(JDBC) | 15.97 | 1797.29 | 6th of 6 | Trailing heavily |
+| Workload A | Update | H2(JDBC) | 20.20 | 1609.37 | 4th of 6 | Trailing |
 <!-- BENCHMARK_AUTOGEN_SUMMARY_END -->
 
 Notes:
@@ -95,7 +95,7 @@ Example:
 
 <!-- BENCHMARK_AUTOGEN_EXAMPLES_START -->
 - In `workload_c / full_scan`, DecentDB is `3rd of 6`, so it leads that benchmark at `500` ops.
-- In `workload_a / update`, DecentDB is `5th of 6`, so it trails the pack on that specific write-path measurement.
+- In `workload_a / update`, DecentDB is `4th of 6`, so it trails the pack on that specific write-path measurement.
 - In `workload_a / point_select`, DecentDB is `2nd of 6`, which is a competitive result even though it is not the leader.
 <!-- BENCHMARK_AUTOGEN_EXAMPLES_END -->
 
