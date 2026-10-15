@@ -214,6 +214,8 @@ pub(crate) struct WindowFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
+    /// A column's declared default, resolved by INSERT/UPDATE execution.
+    Default,
     Literal(Value),
     Column {
         table: Option<String>,
@@ -790,7 +792,7 @@ impl FromItem {
                         right.to_sql(),
                         columns.join(", ")
                     ),
-                    JoinConstraint::On(on) if *kind == JoinKind::Cross => {
+                    JoinConstraint::On(_) if *kind == JoinKind::Cross => {
                         format!("{} {} {}", left.to_sql(), join_kw, right.to_sql())
                     }
                     JoinConstraint::On(on) => format!(
@@ -885,6 +887,7 @@ impl Expr {
     #[must_use]
     pub(crate) fn to_sql(&self) -> String {
         match self {
+            Self::Default => "DEFAULT".to_string(),
             Self::Literal(value) => literal_to_sql(value),
             Self::Column { table, column } => match table {
                 Some(table) => format!("{table}.{column}"),
@@ -1534,7 +1537,7 @@ fn is_safe_expr(
     local_ctes: &BTreeSet<String>,
 ) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => true,
+        Expr::Default | Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => true,
         // Function and aggregate args may be expressions — walk them.
         Expr::Function { args, .. } | Expr::Aggregate { args, .. } => args
             .iter()

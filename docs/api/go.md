@@ -34,7 +34,7 @@ The Go package:
 | `string` | TEXT | |
 | `[]byte` | BLOB | Also reads UUID |
 | `time.Time` | TIMESTAMP | Microsecond precision |
-| `Decimal{Unscaled, Scale}` | DECIMAL | Explicit decimal type |
+| `Decimal{Unscaled, Scale}` | DECIMAL | Exact `String`, `sql.Scanner`, and `driver.Valuer` support |
 | `EnumValue{TypeID, LabelID}` | ENUM | Read result value |
 | `string` | IPADDR / CIDR / MACADDR | Read as canonical text |
 | `time.Time` | DATE / TIMESTAMPTZ | DATE uses UTC midnight; TIMESTAMPTZ uses UTC instant |
@@ -63,6 +63,28 @@ import (
 
 db, err := sql.Open("decentdb", "file:/tmp/app.ddb")
 ```
+
+## Bun ORM
+
+Use the native driver with Bun's standard PostgreSQL dialect:
+
+```go
+sqldb, err := sql.Open("decentdb", "file:/tmp/app.ddb")
+// Handle err and configure the pool before use.
+db := bun.NewDB(sqldb, pgdialect.New())
+```
+
+The [complete Bun example](https://github.com/sphildreth/decentdb/tree/main/bindings/go/examples/bun) includes
+model-generated schema, generated IDs, CRUD/RETURNING, bulk inserts and upserts,
+relations, migrations, soft deletes, transactions, JSON/blobs/timestamps,
+pagination, and exact decimal reports. Its integration tests run against the
+native engine. PostgreSQL dialect selection follows DecentDB's supported SQL
+surface; PostgreSQL server catalogs and sequence objects are separate APIs.
+
+Use `decentdb.Decimal` with `bun:",type:NUMERIC"` for exact decimals. It scans
+native decimals and exact decimal strings; scanning FLOAT64 into Decimal returns
+an error because the original decimal precision cannot be recovered. Use a
+nullable `*decentdb.Decimal` field for SQL NULL.
 
 ### Write Queue
 

@@ -43,7 +43,7 @@ wasm-bindgen = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
-iai-callgrind = "0.14"
+gungraun = "0.20.0"
 proptest = "1.5"
 insta = { version = "1.39", features = ["json"] }
 rusqlite = "0.31"

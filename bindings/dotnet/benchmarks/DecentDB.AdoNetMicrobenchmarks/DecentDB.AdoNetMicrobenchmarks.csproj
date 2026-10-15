@@ -9,6 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/DecentDB.AdoNet/DecentDB.AdoNet.csproj" />
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
   </ItemGroup>
 </Project>

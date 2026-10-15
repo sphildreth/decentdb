@@ -476,6 +476,7 @@ fn classify_read(kind: FileKind) -> &'static str {
         FileKind::Database => "db.read",
         FileKind::Wal => "wal.read",
         FileKind::SyncJournal => "sync.read",
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => "coord.read",
     }
 }
@@ -485,6 +486,7 @@ fn classify_sync(kind: FileKind) -> &'static str {
         FileKind::Database => "db.fsync",
         FileKind::Wal => "wal.fsync",
         FileKind::SyncJournal => "sync.fsync",
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => "coord.fsync",
     }
 }
@@ -494,6 +496,7 @@ fn classify_metadata_sync(kind: FileKind) -> &'static str {
         FileKind::Database => "db.sync_metadata",
         FileKind::Wal => "wal.sync_metadata",
         FileKind::SyncJournal => "sync.sync_metadata",
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => "coord.sync_metadata",
     }
 }
@@ -509,6 +512,7 @@ fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
         }
         FileKind::Wal => classify_wal_write(offset, buf),
         FileKind::SyncJournal => "sync.write",
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => "coord.write",
     }
 }

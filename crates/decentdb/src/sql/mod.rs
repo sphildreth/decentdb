@@ -2,6 +2,8 @@
 
 pub(crate) mod ast;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod dml_aliases;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod normalize;
 pub(crate) mod parser;
 pub(crate) mod parser_tests;

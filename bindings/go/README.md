@@ -7,6 +7,11 @@ The driver decodes semantic result values into `EnumValue`, `IntervalValue`,
 canonical strings for network/MAC types, `time.Time` for `DATE` and
 `TIMESTAMPTZ`, and `time.Duration` for `TIME`.
 
+`Decimal` supports exact formatting and the standard `sql.Scanner` and
+`driver.Valuer` interfaces. See the [Bun ORM example](examples/bun/README.md) for
+model-generated schema, CRUD, relations, migrations, transactions, and exact
+financial reports using Bun's standard PostgreSQL dialect.
+
 ## Benchmark
 
 From the repository root:

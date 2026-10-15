@@ -713,6 +713,7 @@ fn infer_params_from_expr(
     expected: Option<&DescribedType>,
 ) {
     match expr {
+        Expr::Default => {}
         Expr::Parameter(position) => params.observe(*position, expected.cloned()),
         Expr::Literal(_) | Expr::Column { .. } => {}
         Expr::Cast { expr, target_type } => {
@@ -871,6 +872,7 @@ fn infer_expr_type(
     diagnostics: &mut Vec<String>,
 ) -> Option<DescribedType> {
     match expr {
+        Expr::Default => None,
         Expr::Literal(value) => Some(DescribedType::scalar(
             value_column_type(value)?,
             value_nullable(value),
@@ -1402,6 +1404,7 @@ fn collect_params_in_from_item(item: &FromItem, params: &mut ParameterAccumulato
 
 fn collect_params_in_expr(expr: &Expr, params: &mut ParameterAccumulator) {
     match expr {
+        Expr::Default => {}
         Expr::Parameter(position) => params.observe(*position, None),
         Expr::Literal(_) | Expr::Column { .. } | Expr::RowNumber { .. } => {}
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {

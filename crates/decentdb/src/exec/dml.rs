@@ -806,8 +806,16 @@ impl EngineRuntime {
                     column_name
                 )));
             }
-            let Some(source) = compile_prepared_insert_value_source(expr) else {
-                return Ok(None);
+            let source = if matches!(expr, Expr::Default) {
+                match table.columns[column_index].default_sql.as_deref() {
+                    Some(sql) => PreparedInsertValueSource::DefaultExpr(parse_expression_sql(sql)?),
+                    None => PreparedInsertValueSource::Null,
+                }
+            } else {
+                let Some(source) = compile_prepared_insert_value_source(expr) else {
+                    return Ok(None);
+                };
+                source
             };
             assigned[column_index] = Some(source);
         }
@@ -1002,7 +1010,9 @@ impl EngineRuntime {
         let lookup = if row_id_alias_column_name(table)
             .is_some_and(|name| identifiers_equal(name, column_name))
         {
-            let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
+            let Some(row_id_source) =
+                compile_prepared_lookup_value_source(table, column_name, value_expr)?
+            else {
                 return Ok(None);
             };
             PreparedSimpleUpdateLookup::RowId(row_id_source)
@@ -1022,7 +1032,9 @@ impl EngineRuntime {
             }) else {
                 return Ok(None);
             };
-            let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+            let Some(value_source) =
+                compile_prepared_lookup_value_source(table, column_name, value_expr)?
+            else {
                 return Ok(None);
             };
             PreparedSimpleUpdateLookup::UniqueIndex {
@@ -1428,7 +1440,9 @@ impl EngineRuntime {
             if !prepared_timestamp_lookup_matches_schema(&table, column_name, value_expr) {
                 return Ok(None);
             }
-            let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+            let Some(value_source) =
+                compile_prepared_lookup_value_source(&table, column_name, value_expr)?
+            else {
                 return Ok(None);
             };
             if row_id_alias_column_name(&table)
@@ -2647,7 +2661,7 @@ impl EngineRuntime {
                     "INSERT ... RETURNING is not supported for view INSTEAD OF triggers",
                 ));
             }
-            let source_rows = materialize_insert_source(self, &statement.source, params)?;
+            let source_rows = materialize_insert_statement(self, statement, params)?;
             let affected_rows = self.execute_instead_of_triggers(
                 &statement.table_name,
                 TriggerEvent::Insert,
@@ -2670,7 +2684,7 @@ impl EngineRuntime {
         let source_rows = if let Some(rows) = materialize_insert_summary_source(self, statement)? {
             rows
         } else {
-            materialize_insert_source(self, &statement.source, params)?
+            materialize_insert_statement(self, statement, params)?
         };
         let mut affected_rows = 0_u64;
         let mut returning_rows = Vec::new();
@@ -2857,14 +2871,18 @@ impl EngineRuntime {
                 for (assignment, column_index) in
                     statement.assignments.iter().zip(assignment_columns)
                 {
-                    let value = self.eval_expr(
-                        &assignment.expr,
-                        &dataset,
-                        current_eval_values.as_ref(),
-                        params,
-                        &std::collections::BTreeMap::new(),
-                        None,
-                    )?;
+                    let value = if matches!(assignment.expr, Expr::Default) {
+                        self.default_value_for_column(&table.columns[*column_index], params)?
+                    } else {
+                        self.eval_expr(
+                            &assignment.expr,
+                            &dataset,
+                            current_eval_values.as_ref(),
+                            params,
+                            &std::collections::BTreeMap::new(),
+                            None,
+                        )?
+                    };
                     next_values[*column_index] = super::constraints::coerce_column_value(
                         &table.columns[*column_index],
                         value,
@@ -4264,14 +4282,18 @@ impl EngineRuntime {
                 for (assignment, column_index) in
                     statement.assignments.iter().zip(&assignment_columns)
                 {
-                    let value = self.eval_expr(
-                        &assignment.expr,
-                        &dataset,
-                        current_eval_values.as_ref(),
-                        params,
-                        &std::collections::BTreeMap::new(),
-                        None,
-                    )?;
+                    let value = if matches!(assignment.expr, Expr::Default) {
+                        self.default_value_for_column(&table.columns[*column_index], params)?
+                    } else {
+                        self.eval_expr(
+                            &assignment.expr,
+                            &dataset,
+                            current_eval_values.as_ref(),
+                            params,
+                            &std::collections::BTreeMap::new(),
+                            None,
+                        )?
+                    };
                     next_values[*column_index] = super::constraints::coerce_column_value(
                         &table.columns[*column_index],
                         value,
@@ -4689,7 +4711,7 @@ impl EngineRuntime {
             return Ok(Some(result));
         }
 
-        let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let mut source_rows = materialize_insert_statement(self, statement, params)?;
         let Some(source_row) = source_rows.pop() else {
             return Ok(None);
         };
@@ -5761,7 +5783,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let table_name = statement.table_name.clone();
-        let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let mut source_rows = materialize_insert_statement(self, statement, params)?;
         let source_row = source_rows
             .pop()
             .ok_or_else(|| DbError::internal("simple in-place insert expected one source row"))?;
@@ -5903,6 +5925,7 @@ fn try_render_simple_returning(
 
 fn can_execute_row_local_update_assignment_expr(expr: &Expr, table_name: &str) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => true,
         Expr::Column { table, .. } => table
             .as_deref()
@@ -6128,11 +6151,10 @@ pub(super) fn build_insert_row_values(
 
     let mut resolved = Vec::with_capacity(table.columns.len());
     for (index, column) in table.columns.iter().enumerate() {
-        let mut value = values[index].take().unwrap_or_else(|| {
-            runtime
-                .default_value_for_column(column, params)
-                .unwrap_or(Value::Null)
-        });
+        let mut value = match values[index].take() {
+            Some(value) => value,
+            None => runtime.default_value_for_column(column, params)?,
+        };
         if column.auto_increment {
             match value {
                 Value::Null => {
@@ -7260,6 +7282,69 @@ fn materialize_insert_source(
     }
 }
 
+fn materialize_insert_statement(
+    runtime: &EngineRuntime,
+    statement: &InsertStatement,
+    params: &[Value],
+) -> Result<Vec<Vec<Value>>> {
+    let InsertSource::Values(rows) = &statement.source else {
+        return materialize_insert_source(runtime, &statement.source, params);
+    };
+    if !rows
+        .iter()
+        .flatten()
+        .any(|expr| matches!(expr, Expr::Default))
+    {
+        return materialize_insert_source(runtime, &statement.source, params);
+    }
+    let table = runtime
+        .table_schema(&statement.table_name)
+        .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+    let columns = if statement.columns.is_empty() {
+        table
+            .columns
+            .iter()
+            .filter(|column| column.generated_sql.is_none())
+            .collect::<Vec<_>>()
+    } else {
+        statement
+            .columns
+            .iter()
+            .map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| identifiers_equal(&column.name, name))
+                    .ok_or_else(|| DbError::sql(format!("unknown column {name}")))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    rows.iter()
+        .map(|row| {
+            if row.len() != columns.len() {
+                return Err(DbError::sql("INSERT column/value count mismatch"));
+            }
+            row.iter()
+                .zip(&columns)
+                .map(|(expr, column)| {
+                    if matches!(expr, Expr::Default) {
+                        runtime.default_value_for_column(column, params)
+                    } else {
+                        runtime.eval_expr(
+                            expr,
+                            &Dataset::empty(),
+                            &[],
+                            params,
+                            &BTreeMap::new(),
+                            None,
+                        )
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn materialize_insert_summary_source(
     runtime: &EngineRuntime,
     statement: &InsertStatement,
@@ -7998,6 +8083,7 @@ fn indexed_row_ids_for_filter(
     if runtime.visible_table_is_temporary(table_ref) {
         return Ok(None);
     }
+    let value = super::coerce_lookup_literal(table, column_name, value_expr, value)?;
     if !super::timestamp_lookup_matches_schema(table, column_name, &value) {
         return Ok(None);
     }
@@ -8829,6 +8915,18 @@ fn compile_prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleVal
         }
         _ => None,
     }
+}
+
+pub(crate) fn compile_prepared_lookup_value_source(
+    table: &TableSchema,
+    column: &str,
+    expr: &Expr,
+) -> Result<Option<PreparedSimpleValueSource>> {
+    if let Expr::Literal(value @ Value::Text(_)) = expr {
+        return super::coerce_lookup_literal(table, column, expr, value.clone())
+            .map(|value| Some(PreparedSimpleValueSource::Literal(value)));
+    }
+    Ok(compile_prepared_simple_value_source(expr))
 }
 
 fn prepared_timestamp_lookup_matches_schema(
@@ -10713,6 +10811,7 @@ fn expr_references_columns(
     column_names: &[&str],
 ) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => false,
         Expr::Column {
             table: expr_table,

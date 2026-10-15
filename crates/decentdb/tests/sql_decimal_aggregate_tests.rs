@@ -85,8 +85,20 @@ fn decimal_sum_and_avg_work_without_explicit_casts() {
     let r = exec(&db, "SELECT SUM(val), AVG(val) FROM t");
     let row = r.rows()[0].values();
 
-    assert_eq!(row[0], Value::Float64(31.0));
-    assert_eq!(row[1], Value::Float64(15.5));
+    assert_eq!(
+        row[0],
+        Value::Decimal {
+            scaled: 31,
+            scale: 0
+        }
+    );
+    assert_eq!(
+        row[1],
+        Value::Decimal {
+            scaled: 155,
+            scale: 1
+        }
+    );
 }
 
 #[test]
@@ -104,9 +116,33 @@ fn grouped_decimal_sum_and_avg_work_without_explicit_casts() {
 
     assert_eq!(r.rows().len(), 2);
     assert_eq!(r.rows()[0].values()[0], Value::Text("a".into()));
-    assert_eq!(r.rows()[0].values()[2], Value::Float64(31.0));
-    assert_eq!(r.rows()[0].values()[3], Value::Float64(15.5));
+    assert_eq!(
+        r.rows()[0].values()[2],
+        Value::Decimal {
+            scaled: 31,
+            scale: 0
+        }
+    );
+    assert_eq!(
+        r.rows()[0].values()[3],
+        Value::Decimal {
+            scaled: 155,
+            scale: 1
+        }
+    );
     assert_eq!(r.rows()[1].values()[0], Value::Text("b".into()));
-    assert_eq!(r.rows()[1].values()[2], Value::Float64(5.5));
-    assert_eq!(r.rows()[1].values()[3], Value::Float64(5.5));
+    assert_eq!(
+        r.rows()[1].values()[2],
+        Value::Decimal {
+            scaled: 55,
+            scale: 1
+        }
+    );
+    assert_eq!(
+        r.rows()[1].values()[3],
+        Value::Decimal {
+            scaled: 55,
+            scale: 1
+        }
+    );
 }

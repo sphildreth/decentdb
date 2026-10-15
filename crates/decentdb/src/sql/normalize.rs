@@ -300,16 +300,40 @@ fn normalize_insert(statement: &protobuf::InsertStmt) -> Result<InsertStatement>
         .as_deref()
         .ok_or_else(|| unsupported("INSERT is missing its source rows"))?;
     let source = normalize_insert_source(source_node)?;
-    let on_conflict = statement
+    let mut on_conflict = statement
         .on_conflict_clause
         .as_deref()
         .map(normalize_on_conflict)
         .transpose()?;
-    let returning = statement
+    let mut returning = statement
         .returning_list
         .iter()
         .map(normalize_select_item)
         .collect::<Result<Vec<_>>>()?;
+    if let Some(alias) = statement
+        .relation
+        .as_ref()
+        .and_then(|relation| relation.alias.as_ref())
+    {
+        let binding = super::dml_aliases::TargetAlias {
+            alias: &alias.aliasname,
+            table: &table_name,
+        };
+        binding.projection(&mut returning);
+        if let Some(ConflictAction::DoUpdate {
+            assignments,
+            filter,
+            ..
+        }) = &mut on_conflict
+        {
+            for assignment in assignments {
+                binding.expr(&mut assignment.expr);
+            }
+            if let Some(filter) = filter {
+                binding.expr(filter);
+            }
+        }
+    }
     Ok(InsertStatement {
         table_name,
         columns,
@@ -417,7 +441,7 @@ fn normalize_update(statement: &protobuf::UpdateStmt) -> Result<UpdateStatement>
             "UPDATE ... FROM is not supported in DecentDB 1.0",
         ));
     }
-    Ok(UpdateStatement {
+    let mut normalized = UpdateStatement {
         table_name: normalize_range_var(
             statement
                 .relation
@@ -439,7 +463,25 @@ fn normalize_update(statement: &protobuf::UpdateStmt) -> Result<UpdateStatement>
             .iter()
             .map(normalize_select_item)
             .collect::<Result<Vec<_>>>()?,
-    })
+    };
+    if let Some(alias) = statement
+        .relation
+        .as_ref()
+        .and_then(|relation| relation.alias.as_ref())
+    {
+        let binding = super::dml_aliases::TargetAlias {
+            alias: &alias.aliasname,
+            table: &normalized.table_name,
+        };
+        for assignment in &mut normalized.assignments {
+            binding.expr(&mut assignment.expr);
+        }
+        if let Some(filter) = &mut normalized.filter {
+            binding.expr(filter);
+        }
+        binding.projection(&mut normalized.returning);
+    }
+    Ok(normalized)
 }
 
 fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement> {
@@ -448,7 +490,7 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
             "DELETE ... USING is not supported in DecentDB 1.0",
         ));
     }
-    Ok(DeleteStatement {
+    let mut normalized = DeleteStatement {
         table_name: normalize_range_var(
             statement
                 .relation
@@ -465,7 +507,22 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
             .iter()
             .map(normalize_select_item)
             .collect::<Result<Vec<_>>>()?,
-    })
+    };
+    if let Some(alias) = statement
+        .relation
+        .as_ref()
+        .and_then(|relation| relation.alias.as_ref())
+    {
+        let binding = super::dml_aliases::TargetAlias {
+            alias: &alias.aliasname,
+            table: &normalized.table_name,
+        };
+        if let Some(filter) = &mut normalized.filter {
+            binding.expr(filter);
+        }
+        binding.projection(&mut normalized.returning);
+    }
+    Ok(normalized)
 }
 
 fn normalize_create_table(
@@ -508,6 +565,34 @@ fn normalize_create_table(
                     "CREATE TABLE element {} is not supported",
                     describe_node(other)
                 )))
+            }
+        }
+    }
+    let primary_keys = columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .map(|column| column.name.as_str())
+        .chain(
+            constraints
+                .iter()
+                .filter_map(|constraint| match constraint {
+                    TableConstraint::PrimaryKey { columns, .. } => {
+                        Some(columns.iter().map(String::as_str))
+                    }
+                    _ => None,
+                })
+                .flatten(),
+        )
+        .collect::<Vec<_>>();
+    for element in &statement.table_elts {
+        if let NodeEnum::ColumnDef(column) = node_kind(element)? {
+            if is_serial_type(column.type_name.as_ref())?
+                && (primary_keys.len() != 1
+                    || !crate::catalog::identifiers_equal(primary_keys[0], &column.colname))
+            {
+                return Err(unsupported(
+                    "SERIAL requires a single integer PRIMARY KEY in DecentDB",
+                ));
             }
         }
     }
@@ -658,12 +743,26 @@ fn normalize_column_definition(
         }
     }
 
-    let (column_type, spatial_type, enum_type) = normalize_column_type_name(
-        column
-            .type_name
-            .as_ref()
-            .ok_or_else(|| unsupported("column definition is missing a type"))?,
-    )?;
+    let type_name = column
+        .type_name
+        .as_ref()
+        .ok_or_else(|| unsupported("column definition is missing a type"))?;
+    let serial = is_serial_type(Some(type_name))?;
+    let (column_type, spatial_type, enum_type) = if serial {
+        not_null = true;
+        (ColumnType::Int64, None, None)
+    } else {
+        normalize_column_type_name(type_name)?
+    };
+    if is_json_type(type_name)? {
+        checks.push(Expr::Function {
+            name: "json_valid".to_string(),
+            args: vec![Expr::Column {
+                table: None,
+                column: column.colname.clone(),
+            }],
+        });
+    }
     Ok(ColumnDefinition {
         name: column.colname.clone(),
         column_type,
@@ -1414,6 +1513,7 @@ fn normalize_expr_container(node: &protobuf::Node) -> Result<Expr> {
 
 fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
     match node_kind(node)? {
+        NodeEnum::SetToDefault(_) => Ok(Expr::Default),
         NodeEnum::AConst(value) => normalize_const(value),
         NodeEnum::ColumnRef(column) => normalize_column_ref(column),
         NodeEnum::ParamRef(parameter) => {
@@ -1600,18 +1700,7 @@ fn normalize_binary_string_literal(raw: &str) -> Result<Value> {
     let Some(hex) = raw.strip_prefix('x').or_else(|| raw.strip_prefix('X')) else {
         return Ok(Value::Text(raw.to_string()));
     };
-    if !hex.len().is_multiple_of(2) {
-        return Err(unsupported("invalid hex BLOB literal length"));
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().as_chunks::<2>().0 {
-        let pair =
-            std::str::from_utf8(chunk).map_err(|_| unsupported("invalid hex BLOB literal"))?;
-        bytes.push(
-            u8::from_str_radix(pair, 16).map_err(|_| unsupported("invalid hex BLOB literal"))?,
-        );
-    }
-    Ok(Value::Blob(bytes))
+    Ok(Value::Blob(crate::record::value::parse_hex_blob(hex)?))
 }
 
 fn normalize_type_cast(cast: &protobuf::TypeCast) -> Result<Expr> {
@@ -1625,6 +1714,12 @@ fn normalize_type_cast(cast: &protobuf::TypeCast) -> Result<Expr> {
         .as_ref()
         .ok_or_else(|| unsupported("CAST is missing its target type"))?;
     let raw = normalize_qualified_name(&type_name.names)?.to_ascii_lowercase();
+    if is_json_type(type_name)? {
+        return Ok(Expr::Function {
+            name: "json".to_string(),
+            args: vec![expr],
+        });
+    }
     if raw == "interval" || raw == "pg_catalog.interval" {
         return Ok(Expr::Function {
             name: "interval".to_string(),
@@ -2340,6 +2435,27 @@ fn normalize_type_name(type_name: &protobuf::TypeName) -> Result<ColumnType> {
     normalize_column_type_name(type_name).map(|(column_type, _, _)| column_type)
 }
 
+fn is_serial_type(type_name: Option<&protobuf::TypeName>) -> Result<bool> {
+    let Some(type_name) = type_name else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        normalize_qualified_name(&type_name.names)?
+            .to_ascii_lowercase()
+            .as_str(),
+        "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
+    ))
+}
+
+fn is_json_type(type_name: &protobuf::TypeName) -> Result<bool> {
+    Ok(matches!(
+        normalize_qualified_name(&type_name.names)?
+            .to_ascii_lowercase()
+            .as_str(),
+        "json" | "jsonb" | "pg_catalog.json" | "pg_catalog.jsonb"
+    ))
+}
+
 fn normalize_column_type_name(
     type_name: &protobuf::TypeName,
 ) -> Result<(ColumnType, Option<SpatialTypeInfo>, Option<EnumTypeInfo>)> {
@@ -2351,6 +2467,9 @@ fn normalize_column_type_name(
         | "pg_catalog.float8" => Ok((ColumnType::Float64, None, None)),
         "text" | "varchar" | "character varying" | "char" | "character" | "pg_catalog.text"
         | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok((ColumnType::Text, None, None)),
+        "json" | "jsonb" | "pg_catalog.json" | "pg_catalog.jsonb" => {
+            Ok((ColumnType::Text, None, None))
+        }
         "bool" | "boolean" | "pg_catalog.bool" => Ok((ColumnType::Bool, None, None)),
         "bytea" | "blob" | "pg_catalog.bytea" => Ok((ColumnType::Blob, None, None)),
         "decimal" | "numeric" | "pg_catalog.numeric" => Ok((ColumnType::Decimal, None, None)),
@@ -2832,7 +2951,7 @@ mod tests {
 
     #[test]
     fn type_unknown_errors() {
-        let err = norm_err("CREATE TABLE t (id INT PRIMARY KEY, a JSONB)");
+        let err = norm_err("CREATE TABLE t (id INT PRIMARY KEY, a XML)");
         assert!(err.contains("not supported"), "got: {err}");
     }
 

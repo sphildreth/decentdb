@@ -221,6 +221,8 @@ type DecentDBError struct {
 	Permanent      bool
 }
 
+// Decimal is an exact fixed-point value with a signed 64-bit coefficient and
+// a base-ten scale from 0 through 255. It implements sql.Scanner and driver.Valuer.
 type Decimal struct {
 	Unscaled int64
 	Scale    int
@@ -705,8 +707,18 @@ func (d *DB) QueryOnBranchInt64(branch string, query string, args ...driver.Valu
 }
 
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
-	switch nv.Value.(type) {
+	switch value := nv.Value.(type) {
 	case Decimal:
+		return value.validate()
+	case *Decimal:
+		if value == nil {
+			nv.Value = nil
+			return nil
+		}
+		if err := value.validate(); err != nil {
+			return err
+		}
+		nv.Value = *value
 		return nil
 	}
 	return driver.ErrSkip
@@ -812,15 +824,13 @@ func convertQueueArgs(args []driver.NamedValue) (*queuedArgSet, error) {
 				out.Buffers = append(out.Buffers, ptr)
 			}
 		case Decimal:
+			if err := value.validate(); err != nil {
+				out.Free()
+				return nil, err
+			}
 			out.Values[i].tag = C.DDB_VALUE_DECIMAL
 			out.Values[i].decimal_scaled = C.int64_t(value.Unscaled)
-			scale := value.Scale
-			if scale < 0 {
-				scale = 0
-			} else if scale > 255 {
-				scale = 255
-			}
-			out.Values[i].decimal_scale = C.uint8_t(scale)
+			out.Values[i].decimal_scale = C.uint8_t(value.Scale)
 		case GeometryWKB:
 			out.Values[i].tag = C.DDB_VALUE_GEOMETRY
 			if len(value) > 0 {
@@ -841,6 +851,7 @@ func convertQueueArgs(args []driver.NamedValue) (*queuedArgSet, error) {
 			out.Values[i].tag = C.DDB_VALUE_TIMESTAMP_MICROS
 			out.Values[i].timestamp_micros = C.int64_t(value.UnixNano() / 1e3)
 		default:
+			out.Free()
 			return nil, fmt.Errorf("unsupported parameter type %T", arg.Value)
 		}
 	}
@@ -2010,14 +2021,10 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 			micros := v.UnixNano() / 1e3
 			status = C.ddb_stmt_bind_timestamp_micros(s.stmt, idx, C.int64_t(micros))
 		case Decimal:
-			scale := v.Scale
-			if scale < 0 {
-				scale = 0
+			if err := v.validate(); err != nil {
+				return err
 			}
-			if scale > 255 {
-				scale = 255
-			}
-			status = C.ddb_stmt_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.uint8_t(scale))
+			status = C.ddb_stmt_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.uint8_t(v.Scale))
 		default:
 			return fmt.Errorf("unsupported type: %T", v)
 		}

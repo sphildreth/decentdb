@@ -835,7 +835,7 @@ section, but it is a sanity-check aid rather than a benchmark suite. The
 `bindings/dotnet/benchmarks` projects are better starting points for measuring
 provider overhead, native fast paths, point reads, scans, and SQLite comparison
 cases. The canonical CRM comparison benchmark lives at
-[`bindings/dotnet/benchmarks/DecentDB.CrmComparison/`](../../bindings/dotnet/benchmarks/DecentDB.CrmComparison/).
+[`bindings/dotnet/benchmarks/DecentDB.CrmComparison/`](https://github.com/sphildreth/decentdb/tree/main/bindings/dotnet/benchmarks/DecentDB.CrmComparison).
 
 ## Build the native library
 

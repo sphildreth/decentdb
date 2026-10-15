@@ -234,6 +234,7 @@ fn kind_label(kind: FileKind) -> &'static str {
         FileKind::Database => "database",
         FileKind::Wal => "wal",
         FileKind::SyncJournal => "sync-journal",
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => "coordination",
     }
 }

@@ -35,6 +35,7 @@ pub(crate) enum FileKind {
     Database,
     Wal,
     SyncJournal,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     Coordination,
 }
 
@@ -187,6 +188,7 @@ impl VfsHandle {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn with_canonical_path_hint(mut self, source: PathBuf, canonical: PathBuf) -> Self {
         self.canonical_path_hint = Some(Arc::new((source, canonical)));
         self
@@ -222,6 +224,7 @@ impl VfsHandle {
         self.inner.supports_file_locks()
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn concurrent_bootstrap_sync_reservation(
         &self,
     ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {

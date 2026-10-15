@@ -153,6 +153,7 @@ pub(crate) fn expr_references_outer(
     local_tables: &BTreeSet<String>,
 ) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => false,
         Expr::Column { table, .. } => table.as_ref().is_some_and(|table_name| {
             outer_tables
@@ -362,6 +363,7 @@ pub(crate) fn select_item_contains_window_or_subquery(item: &SelectItem) -> bool
 
 pub(crate) fn expr_contains_recursive_unsupported_feature(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => true,
         Expr::Aggregate { .. }
         | Expr::RowNumber { .. }
         | Expr::WindowFunction { .. }

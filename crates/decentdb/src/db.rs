@@ -167,9 +167,11 @@ pub struct Db {
 
 enum OpenWithVfsOutcome {
     Opened(Db),
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     RetryAfterBootstrapSync(Box<FreshWalOpenRetry>),
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 struct FreshWalOpenRetry {
     path: PathBuf,
     config: DbConfig,
@@ -4145,6 +4147,7 @@ impl Db {
             false,
         )? {
             OpenWithVfsOutcome::Opened(db) => Ok(db),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             OpenWithVfsOutcome::RetryAfterBootstrapSync(_) => Err(DbError::internal(
                 "normal database open unexpectedly requested a fresh-WAL retry",
             )),
@@ -4199,6 +4202,7 @@ impl Db {
             effective_config.process_coordination_timeout_ms,
         )?;
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let fresh_wal_retry_header = require_fresh_wal.then(|| header.clone());
         let pager = if storage_was_freshly_initialized {
             PagerHandle::open_fresh_bootstrap_with_page_pool(
@@ -4215,6 +4219,13 @@ impl Db {
                 effective_config.page_pool_max,
             )?
         };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if require_fresh_wal {
+            return Err(DbError::internal(
+                "fresh-WAL bootstrap retries require the native runtime",
+            ));
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let wal = if require_fresh_wal {
             let Some(wal) = WalHandle::acquire_fresh(
                 &vfs,
@@ -4244,6 +4255,8 @@ impl Db {
         } else {
             WalHandle::acquire(&vfs, &path, &effective_config, &pager, process_coordinator)?
         };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager, process_coordinator)?;
         // Capture this immediately after WAL recovery. A later on-open
         // checkpoint may empty a recovered non-empty WAL, but that storage
         // must still take the normal runtime load path.
@@ -10278,20 +10291,6 @@ fn resolve_prepared_simple_value_for_fast_path(
     params: &[Value],
 ) -> Result<Value> {
     resolve_prepared_simple_value(source, params)
-}
-
-fn prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
-    match expr {
-        Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
-        Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
-        Expr::Cast { expr, target_type } => {
-            prepared_simple_value_source(expr).map(|source| PreparedSimpleValueSource::Cast {
-                source: Box::new(source),
-                target_type: *target_type,
-            })
-        }
-        _ => None,
-    }
 }
 
 fn prepared_usize_literal(expr: &crate::sql::ast::Expr) -> Option<usize> {

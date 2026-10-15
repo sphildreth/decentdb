@@ -663,6 +663,22 @@ pub(crate) fn parse_decimal_text(value: &str) -> Result<(i64, u8)> {
     Ok(normalize_decimal(scaled, scale))
 }
 
+pub(crate) fn parse_hex_blob(hex: &str) -> Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(DbError::sql("invalid hex BLOB literal length"));
+    }
+    hex.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair =
+                std::str::from_utf8(pair).map_err(|_| DbError::sql("invalid hex BLOB literal"))?;
+            u8::from_str_radix(pair, 16).map_err(|_| DbError::sql("invalid hex BLOB literal"))
+        })
+        .collect()
+}
+
 pub(crate) fn compare_decimal(
     left_scaled: i64,
     left_scale: u8,
@@ -702,45 +718,30 @@ fn compare_decimal_magnitude(
     right_abs: u64,
     right_scale: u8,
 ) -> Ordering {
+    if left_abs == 0 || right_abs == 0 {
+        return left_abs.cmp(&right_abs);
+    }
     let left_digits = left_abs.to_string();
     let right_digits = right_abs.to_string();
-
-    let (left_int, left_frac) = split_decimal_parts(&left_digits, left_scale);
-    let (right_int, right_frac) = split_decimal_parts(&right_digits, right_scale);
-
-    let integer_order = left_int
-        .len()
-        .cmp(&right_int.len())
-        .then_with(|| left_int.cmp(right_int));
-    if integer_order != Ordering::Equal {
-        return integer_order;
+    // Compare decimal positions first, then significant digits padded at the
+    // right. This includes leading fractional zeros (0.01 differs from 0.1)
+    // without floating-point conversion or an overflowing power of ten.
+    let position = (left_digits.len() + usize::from(right_scale))
+        .cmp(&(right_digits.len() + usize::from(left_scale)));
+    if position != Ordering::Equal {
+        return position;
     }
-
-    let max_fraction_len = left_frac.len().max(right_frac.len());
-    for idx in 0..max_fraction_len {
-        let left_digit = left_frac.as_bytes().get(idx).copied().unwrap_or(b'0');
-        let right_digit = right_frac.as_bytes().get(idx).copied().unwrap_or(b'0');
-        match left_digit.cmp(&right_digit) {
-            Ordering::Equal => continue,
-            non_equal => return non_equal,
-        }
-    }
-
-    Ordering::Equal
-}
-
-fn split_decimal_parts(digits: &str, scale: u8) -> (&str, &str) {
-    let scale = usize::from(scale);
-    if scale == 0 {
-        return (digits, "");
-    }
-
-    if digits.len() > scale {
-        let split = digits.len() - scale;
-        (&digits[..split], &digits[split..])
-    } else {
-        ("0", digits)
-    }
+    let width = left_digits.len().max(right_digits.len());
+    left_digits
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(width)
+        .cmp(
+            right_digits
+                .bytes()
+                .chain(std::iter::repeat(b'0'))
+                .take(width),
+        )
 }
 
 fn ip_addr_from_std(ip: IpAddr) -> (u8, [u8; 16]) {

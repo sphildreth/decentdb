@@ -71,6 +71,7 @@ pub(crate) fn acquire(
 /// is no check/open gap in which an orphan WAL can appear. A pre-existing
 /// path or live same-process registry entry returns `Ok(None)` without reading
 /// or recovering the WAL against the caller's pager.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn acquire_fresh(
     vfs: &VfsHandle,
     db_path: &Path,

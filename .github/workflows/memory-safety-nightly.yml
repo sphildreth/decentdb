@@ -512,6 +512,9 @@ jobs:
           cd bindings/go/decentdb-go
           LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug" go test ./...
           LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug" go test ./... -run TestRepeatedOpenQueryCloseKeepsRSSBounded -count=1
+          cd ../examples/bun
+          LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug" go test -count=1 ./...
+          go vet ./...
 
       - name: Run Java lifecycle and leak coverage
         if: matrix.binding == 'java'

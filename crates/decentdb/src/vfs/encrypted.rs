@@ -360,6 +360,7 @@ fn file_kind_id(kind: FileKind) -> u8 {
         FileKind::Database => 1,
         FileKind::Wal => 2,
         FileKind::SyncJournal => 3,
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         FileKind::Coordination => 4,
     }
 }

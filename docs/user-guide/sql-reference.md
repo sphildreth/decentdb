@@ -32,9 +32,15 @@ Constraints:
 - `NOT NULL` — rejects NULL values.
 - `UNIQUE` — enforces uniqueness via a secondary index.
 - `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
-- `DEFAULT value` — default value used when column is omitted from INSERT.
+- `DEFAULT value` — default value used when a column is omitted from INSERT or
+  when `DEFAULT` is supplied in INSERT VALUES or an UPDATE assignment.
 - `REFERENCES table(column)` — foreign key constraint.
 - `GENERATED ALWAYS AS (expr) STORED|VIRTUAL` — computed column in persisted (`STORED`) or read-time (`VIRTUAL`) mode (see [Generated Columns](#generated-columns)).
+
+`SERIAL`, `BIGSERIAL`, and `SMALLSERIAL` declarations use native auto-assignment
+when the declared column is the single integer primary key. Other serial
+declarations are rejected. JSON/JSONB declarations store validated JSON text;
+BYTEA accepts PostgreSQL hex input such as `'\x0001ff'`.
 
 ### CREATE TEMP TABLE / CREATE TEMP VIEW
 
@@ -672,6 +678,14 @@ SELECT SUM(DISTINCT amount) FROM orders;
 SELECT AVG(DISTINCT score) FROM results;
 SELECT ARRAY_AGG(DISTINCT category ORDER BY category) FROM products;
 ```
+
+`SUM` and `AVG` preserve DECIMAL/NUMERIC inputs as exact decimal values, including
+DISTINCT and window forms. Results use checked intermediates and the existing
+signed 64-bit coefficient/scale limits. Decimal averages calculate to the larger
+input scale or six fractional digits, whichever is greater, and round ties away
+from zero. Trailing zeros normalize. Explicit FLOAT64 operands
+promote numeric aggregates to FLOAT64; integer AVG and TOTAL return FLOAT64.
+SUM/AVG return NULL for empty or all-NULL inputs; TOTAL returns `0.0`.
 
 ### Window Functions
 

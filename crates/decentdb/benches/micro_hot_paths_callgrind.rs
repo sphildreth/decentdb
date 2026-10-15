@@ -1,4 +1,6 @@
-use iai_callgrind::{black_box, library_benchmark, library_benchmark_group, main};
+use std::hint::black_box;
+
+use gungraun::{library_benchmark, library_benchmark_group, main};
 
 use decentdb::benchmark::{
     append_wal_page_frame, crc32c_parts, decode_row, default_page_size, encode_row,

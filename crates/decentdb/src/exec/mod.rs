@@ -8316,90 +8316,25 @@ pub(crate) struct SimpleRangeBoundValue {
     pub(crate) value: Value,
 }
 
-#[derive(Clone, Debug)]
-struct SimpleGroupedNumericState {
-    numeric_count: i64,
-    total_int: i64,
-    total_float: f64,
-    saw_float: bool,
-    saw_value: bool,
-}
+#[derive(Clone, Debug, Default)]
+struct SimpleGroupedNumericState(NumericAggregateState);
 
 impl SimpleGroupedNumericState {
     fn add(&mut self, value: &Value) -> Result<()> {
-        match value {
-            Value::Null => Ok(()),
-            Value::Int64(value) => {
-                self.numeric_count += 1;
-                self.total_int += value;
-                self.total_float += *value as f64;
-                self.saw_value = true;
-                Ok(())
-            }
-            Value::Float64(value) => {
-                self.numeric_count += 1;
-                self.total_float += *value;
-                self.saw_float = true;
-                self.saw_value = true;
-                Ok(())
-            }
-            Value::Decimal { scaled, scale } => {
-                self.numeric_count += 1;
-                self.total_float += decimal_to_f64(*scaled, *scale);
-                self.saw_float = true;
-                self.saw_value = true;
-                Ok(())
-            }
-            other => Err(DbError::sql(format!(
-                "numeric aggregate does not support {other:?}"
-            ))),
-        }
+        self.0.add(value)
     }
 
-    fn value(&self, kind: SimpleGroupedNumericAggregateKind) -> Value {
-        match kind {
-            SimpleGroupedNumericAggregateKind::Sum => {
-                if !self.saw_value {
-                    Value::Null
-                } else if self.saw_float {
-                    Value::Float64(self.total_float)
-                } else {
-                    Value::Int64(self.total_int)
-                }
-            }
-            SimpleGroupedNumericAggregateKind::Avg => {
-                if self.numeric_count == 0 {
-                    Value::Null
-                } else {
-                    Value::Float64(self.total_float / self.numeric_count as f64)
-                }
-            }
-            SimpleGroupedNumericAggregateKind::SumDistinct => {
-                if !self.saw_value {
-                    Value::Null
-                } else if self.saw_float {
-                    Value::Float64(self.total_float)
-                } else {
-                    Value::Int64(self.total_int)
-                }
-            }
-            SimpleGroupedNumericAggregateKind::AvgDistinct => {
-                if self.numeric_count == 0 {
-                    Value::Null
-                } else {
-                    Value::Float64(self.total_float / self.numeric_count as f64)
-                }
-            }
+    fn value(&self, kind: SimpleGroupedNumericAggregateKind) -> Result<Value> {
+        let kind = match kind {
+            SimpleGroupedNumericAggregateKind::Sum
+            | SimpleGroupedNumericAggregateKind::SumDistinct => NumericAgg::Sum,
+            SimpleGroupedNumericAggregateKind::Avg
+            | SimpleGroupedNumericAggregateKind::AvgDistinct => NumericAgg::Avg,
             SimpleGroupedNumericAggregateKind::Total
-            | SimpleGroupedNumericAggregateKind::TotalDistinct => {
-                if self.numeric_count == 0 {
-                    Value::Float64(0.0)
-                } else {
-                    Value::Float64(self.total_float)
-                }
-            }
-            _ => Value::Null,
-        }
+            | SimpleGroupedNumericAggregateKind::TotalDistinct => NumericAgg::Total,
+            _ => return Err(DbError::internal("invalid numeric aggregate kind")),
+        };
+        self.0.value(kind)
     }
 }
 
@@ -8535,16 +8470,7 @@ impl SimpleGroupedNumericAggregate {
             count: 0,
             value_counts: vec![0; aggregate_count],
             distinct_values: vec![BTreeSet::new(); aggregate_count],
-            numeric_states: vec![
-                SimpleGroupedNumericState {
-                    numeric_count: 0,
-                    total_int: 0,
-                    total_float: 0.0,
-                    saw_float: false,
-                    saw_value: false,
-                };
-                aggregate_count
-            ],
+            numeric_states: vec![SimpleGroupedNumericState::default(); aggregate_count],
             variance_states: vec![SimpleGroupedVarianceState::default(); aggregate_count],
             bool_states: vec![SimpleGroupedBoolState::default(); aggregate_count],
             extreme_values: vec![Value::Null; aggregate_count],
@@ -8617,8 +8543,8 @@ impl SimpleGroupedNumericAggregate {
         &self,
         kind: SimpleGroupedNumericAggregateKind,
         aggregate_index: usize,
-    ) -> Value {
-        match kind {
+    ) -> Result<Value> {
+        Ok(match kind {
             SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(self.count),
             SimpleGroupedNumericAggregateKind::CountNonNull
             | SimpleGroupedNumericAggregateKind::CountDistinct => {
@@ -8630,7 +8556,7 @@ impl SimpleGroupedNumericAggregate {
             | SimpleGroupedNumericAggregateKind::AvgDistinct
             | SimpleGroupedNumericAggregateKind::Total
             | SimpleGroupedNumericAggregateKind::TotalDistinct => {
-                self.numeric_states[aggregate_index].value(kind)
+                self.numeric_states[aggregate_index].value(kind)?
             }
             SimpleGroupedNumericAggregateKind::StddevSamp
             | SimpleGroupedNumericAggregateKind::StddevSampDistinct
@@ -8651,21 +8577,24 @@ impl SimpleGroupedNumericAggregate {
             SimpleGroupedNumericAggregateKind::Min | SimpleGroupedNumericAggregateKind::Max => {
                 self.extreme_values[aggregate_index].clone()
             }
-        }
+        })
     }
 
-    fn into_row(self, aggregate_bindings: &[SimpleGroupedNumericAggregateBinding]) -> QueryRow {
+    fn into_row(
+        self,
+        aggregate_bindings: &[SimpleGroupedNumericAggregateBinding],
+    ) -> Result<QueryRow> {
         let mut group_values = self.group_values.clone();
         for (aggregate_index, aggregate) in aggregate_bindings.iter().enumerate() {
-            group_values.push(self.aggregate_value(aggregate.kind, aggregate_index));
+            group_values.push(self.aggregate_value(aggregate.kind, aggregate_index)?);
         }
-        QueryRow::new(group_values)
+        Ok(QueryRow::new(group_values))
     }
 
     fn aggregate_values(
         &self,
         aggregate_bindings: &[SimpleGroupedNumericAggregateBinding],
-    ) -> Vec<Value> {
+    ) -> Result<Vec<Value>> {
         aggregate_bindings
             .iter()
             .enumerate()
@@ -8727,7 +8656,7 @@ fn render_simple_grouped_numeric_aggregate_groups(
         let mut rows = Vec::with_capacity(groups.len());
         for group in groups {
             let mut raw_values = group.group_values.clone();
-            raw_values.extend(group.aggregate_values(&plan.aggregate_bindings));
+            raw_values.extend(group.aggregate_values(&plan.aggregate_bindings)?);
             if let Some(having) = plan.having.as_ref() {
                 if !matches!(
                     runtime.eval_expr(
@@ -8773,7 +8702,8 @@ fn render_simple_grouped_numeric_aggregate_groups(
     runtime.apply_simple_grouped_postprocessing(
         groups
             .into_iter()
-            .map(|group| group.into_row(&plan.aggregate_bindings)),
+            .map(|group| group.into_row(&plan.aggregate_bindings))
+            .collect::<Result<Vec<_>>>()?,
         plan.column_names.clone(),
         &plan.having_bindings,
         plan.having.as_ref(),
@@ -8876,6 +8806,7 @@ fn update_simple_min_max_value(best: &mut Value, candidate: Value, is_max: bool)
 
 fn expr_references_only_binding(expr: &Expr, binding: TableBindingRef<'_>) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => true,
         Expr::Column { table, .. } => table
             .as_deref()
@@ -8947,6 +8878,7 @@ fn expr_references_only_binding(expr: &Expr, binding: TableBindingRef<'_>) -> bo
 
 fn expr_references_binding_names(expr: &Expr, table_name: &str, binding_name: &str) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => true,
         Expr::Column { table, .. } => table.as_deref().is_none_or(|qualifier| {
             identifiers_equal(qualifier, table_name) || identifiers_equal(qualifier, binding_name)
@@ -9020,6 +8952,7 @@ fn expr_references_binding_names(expr: &Expr, table_name: &str, binding_name: &s
 
 fn expr_resolves_against_dataset(expr: &Expr, dataset: &Dataset) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Literal(_) | Expr::Parameter(_) => true,
         Expr::Column { table, column } => {
             simple_select_item_column_index(dataset, table.as_deref(), column).is_some()
@@ -13237,6 +13170,7 @@ fn qualified_column_ref_expr(expr: &Expr) -> Option<QualifiedColumnRef<'_>> {
 
 fn expr_has_column_ref(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Column { .. } => true,
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
@@ -13292,6 +13226,7 @@ fn expr_has_column_ref(expr: &Expr) -> bool {
 
 fn expr_contains_aggregate(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Aggregate { .. } => true,
         Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => expr_contains_aggregate(expr),
         Expr::Binary { left, right, .. } => {
@@ -13342,6 +13277,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
 
 fn expr_contains_runtime_extension_aggregate(runtime: &EngineRuntime, expr: &Expr) -> Result<bool> {
     Ok(match expr {
+        Expr::Default => false,
         Expr::Aggregate { .. } => true,
         Expr::Function { name, args } => {
             crate::extensions::runtime_has_aggregate_function(runtime, name)?
@@ -13437,6 +13373,7 @@ fn expr_contains_runtime_extension_aggregate(runtime: &EngineRuntime, expr: &Exp
 
 fn expr_contains_window(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::RowNumber { .. } | Expr::WindowFunction { .. } => true,
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }

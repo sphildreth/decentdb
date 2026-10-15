@@ -774,6 +774,9 @@ fn parse_expr(sql: &str) -> Result<Expr> {
         }
         return Ok(Expr::Parameter(index));
     }
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(Expr::Default);
+    }
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Ok(Expr::Literal(Value::Null));
     }

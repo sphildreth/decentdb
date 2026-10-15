@@ -171,7 +171,7 @@ pub struct CompareArgs {
     #[arg(long)]
     pub baseline: Option<PathBuf>,
 
-    /// Named baseline under build/bench/baselines/<name>.json.
+    /// Named baseline under `build/bench/baselines/<name>.json`.
     #[arg(long)]
     pub baseline_name: Option<String>,
 

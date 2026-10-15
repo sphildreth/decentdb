@@ -87,6 +87,7 @@ impl StatsState {
             FileKind::Database => &self.db,
             FileKind::Wal => &self.wal,
             FileKind::SyncJournal => &self.sync_journal,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             FileKind::Coordination => &self.wal,
         }
     }

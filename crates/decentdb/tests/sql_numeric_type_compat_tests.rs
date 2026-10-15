@@ -280,17 +280,14 @@ fn pg_typeof_preserves_nullable_column_and_parameter_types() {
         "SELECT PG_TYPEOF(MIN(t.amount)), PG_TYPEOF(SUM(t.amount)) FROM typed AS t HAVING PG_TYPEOF(MIN(t.amount)) = 'numeric'",
         "SELECT PG_TYPEOF(MIN(amount)), PG_TYPEOF(SUM(amount)) FROM typed WHERE 1 = 0",
     ] {
-        assert_eq!(values(&db, sql), vec![Value::Text("numeric".into()), Value::Text("double precision".into())]);
+        assert_eq!(values(&db, sql), vec![Value::Text("numeric".into()), Value::Text("numeric".into())]);
     }
     assert_eq!(
         values(
             &db,
             "SELECT PG_TYPEOF(MIN(amount)), PG_TYPEOF(SUM(amount)) FROM typed"
         ),
-        vec![
-            Value::Text("numeric".into()),
-            Value::Text("double precision".into())
-        ]
+        vec![Value::Text("numeric".into()), Value::Text("numeric".into())]
     );
     assert_eq!(
         values(

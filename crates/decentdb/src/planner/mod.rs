@@ -1581,6 +1581,7 @@ fn simple_spatial_column_value_pair<'a>(left: &'a Expr, right: &'a Expr) -> Opti
 
 fn expr_has_column_ref(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Column { .. } => true,
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
@@ -1684,6 +1685,7 @@ fn select_item_has_aggregate(item: &crate::sql::ast::SelectItem) -> bool {
 
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Aggregate { .. } => true,
         Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => expr_has_aggregate(expr),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
@@ -2121,6 +2123,7 @@ fn estimate_filter_rows(row_count: u64, filter: &Expr, catalog: &CatalogState) -
 fn estimate_selectivity(expr: &Expr, catalog: &CatalogState) -> f64 {
     let _ = catalog;
     match expr {
+        Expr::Default => 1.0,
         Expr::Binary { left, op, right } => match op {
             BinaryOp::And => {
                 estimate_selectivity(left, catalog) * estimate_selectivity(right, catalog)

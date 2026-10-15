@@ -10,6 +10,7 @@ pub(super) fn infer_expr_name(expr: &Expr, ordinal: usize) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum NumericAgg {
     Sum,
     Avg,
@@ -44,6 +45,81 @@ impl AggregateEvalContext<'_> {
     }
 }
 
+/// Shared accumulator for the generic and grouped aggregate execution paths.
+#[derive(Clone, Debug, Default)]
+pub(super) struct NumericAggregateState {
+    exact: decimal::DecimalSum,
+    exact_overflow: bool,
+    total_float: f64,
+    count: i64,
+    saw_float: bool,
+    saw_decimal: bool,
+}
+
+impl NumericAggregateState {
+    pub(super) fn add(&mut self, value: &Value) -> Result<()> {
+        let exact_value = match value {
+            Value::Null => return Ok(()),
+            Value::Int64(value) => {
+                self.total_float += *value as f64;
+                Some((*value, 0))
+            }
+            Value::Decimal { scaled, scale } => {
+                self.total_float += decimal_to_f64(*scaled, *scale);
+                self.saw_decimal = true;
+                Some((*scaled, *scale))
+            }
+            Value::Float64(value) => {
+                self.total_float += *value;
+                self.saw_float = true;
+                None
+            }
+            other => {
+                return Err(DbError::sql(format!(
+                    "numeric aggregate does not support {other:?}"
+                )))
+            }
+        };
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| DbError::sql("numeric aggregate count overflow"))?;
+        if let Some((scaled, scale)) = exact_value {
+            if !self.exact_overflow && self.exact.add(scaled, scale).is_err() {
+                // A later FLOAT64 operand promotes the result to FLOAT64.
+                // Preserve that contract without rejecting its exact prefix.
+                self.exact_overflow = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn value(&self, kind: NumericAgg) -> Result<Value> {
+        if matches!(kind, NumericAgg::Total) {
+            return Ok(Value::Float64(self.total_float));
+        }
+        if self.count == 0 {
+            return Ok(Value::Null);
+        }
+        if self.saw_float || (matches!(kind, NumericAgg::Avg) && !self.saw_decimal) {
+            return Ok(Value::Float64(if matches!(kind, NumericAgg::Avg) {
+                self.total_float / self.count as f64
+            } else {
+                self.total_float
+            }));
+        }
+        if self.exact_overflow {
+            return Err(DbError::sql("DECIMAL arithmetic overflow"));
+        }
+        match kind {
+            NumericAgg::Sum if self.saw_decimal => self.exact.sum(),
+            NumericAgg::Sum => self.exact.integer_sum(),
+            NumericAgg::Avg => self.exact.average(self.count),
+            NumericAgg::Total => Ok(Value::Float64(self.total_float)),
+        }
+    }
+}
+
 pub(super) fn aggregate_numeric(
     ctx: &AggregateEvalContext<'_>,
     row_indexes: &[usize],
@@ -51,98 +127,34 @@ pub(super) fn aggregate_numeric(
     kind: NumericAgg,
     distinct: bool,
 ) -> Result<Value> {
-    let mut total_int = 0_i64;
-    let mut total_float = 0_f64;
-    let mut saw_float = false;
-    let mut count = 0_i64;
-
-    if distinct {
-        let mut vals = Vec::new();
-        for row_index in row_indexes {
-            let row = ctx
-                .dataset
-                .rows
-                .get(*row_index)
-                .map(Vec::as_slice)
-                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-            let val = ctx.eval_row(row, expr)?;
-            if !matches!(val, Value::Null) {
-                vals.push(val);
+    let mut state = NumericAggregateState::default();
+    let mut values = Vec::new();
+    for row_index in row_indexes {
+        let row = ctx
+            .dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let value = ctx.eval_row(row, expr)?;
+        if distinct {
+            if !matches!(value, Value::Null) {
+                values.push(value);
             }
+        } else {
+            state.add(&value)?;
         }
-        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-        vals.dedup_by(|a, b| {
+    }
+    if distinct {
+        values.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+        values.dedup_by(|a, b| {
             compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
         });
-        for val in vals {
-            match val {
-                Value::Int64(value) => {
-                    total_int += value;
-                    total_float += value as f64;
-                    count += 1;
-                }
-                Value::Float64(value) => {
-                    total_float += value;
-                    saw_float = true;
-                    count += 1;
-                }
-                Value::Decimal { scaled, scale } => {
-                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
-                    saw_float = true;
-                    count += 1;
-                }
-                other => {
-                    return Err(DbError::sql(format!(
-                        "numeric aggregate does not support {other:?}"
-                    )))
-                }
-            }
-        }
-    } else {
-        for row_index in row_indexes {
-            let row = ctx
-                .dataset
-                .rows
-                .get(*row_index)
-                .map(Vec::as_slice)
-                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-            match ctx.eval_row(row, expr)? {
-                Value::Null => {}
-                Value::Int64(value) => {
-                    total_int += value;
-                    total_float += value as f64;
-                    count += 1;
-                }
-                Value::Float64(value) => {
-                    total_float += value;
-                    saw_float = true;
-                    count += 1;
-                }
-                Value::Decimal { scaled, scale } => {
-                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
-                    saw_float = true;
-                    count += 1;
-                }
-                other => {
-                    return Err(DbError::sql(format!(
-                        "numeric aggregate does not support {other:?}"
-                    )))
-                }
-            }
+        for value in values {
+            state.add(&value)?;
         }
     }
-    if count == 0 {
-        return Ok(match kind {
-            NumericAgg::Total => Value::Float64(0.0),
-            NumericAgg::Sum | NumericAgg::Avg => Value::Null,
-        });
-    }
-    Ok(match kind {
-        NumericAgg::Sum if saw_float => Value::Float64(total_float),
-        NumericAgg::Sum => Value::Int64(total_int),
-        NumericAgg::Avg => Value::Float64(total_float / count as f64),
-        NumericAgg::Total => Value::Float64(total_float),
-    })
+    state.value(kind)
 }
 
 pub(super) fn aggregate_variance(
@@ -1329,6 +1341,7 @@ pub(super) fn eval_function(
         "json_object" | "pg_catalog.json_object" => eval_json_object(values),
         "json_type" | "pg_catalog.json_type" => eval_json_type(values),
         "json_valid" | "pg_catalog.json_valid" => eval_json_valid(values),
+        "json" | "jsonb" | "pg_catalog.json" | "pg_catalog.jsonb" => eval_json_cast(values),
         "st_point" | "st_makepoint" => eval_spatial_point_constructor(&values, false, false),
         "st_pointz" => eval_spatial_point_constructor(&values, false, true),
         "st_pointm" => eval_spatial_point_m_constructor(&values, false),
@@ -3885,6 +3898,26 @@ pub(super) fn eval_json_valid(values: Vec<Value>) -> Result<Value> {
     }
 }
 
+pub(super) fn eval_json_cast(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("JSON expects 1 argument"));
+    }
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Text(text) => {
+            parse_json(text)?;
+            Ok(Value::Text(text.clone()))
+        }
+        Value::Int64(_) | Value::Decimal { .. } | Value::Bool(_) => Ok(Value::Text(
+            json_value_from_value(&values[0])?.render_json(),
+        )),
+        Value::Float64(value) if value.is_finite() => Ok(Value::Text(
+            json_value_from_value(&values[0])?.render_json(),
+        )),
+        other => Err(DbError::sql(format!("cannot cast {other:?} to JSON"))),
+    }
+}
+
 pub(super) fn json_type_name(value: &JsonValue) -> &'static str {
     match value {
         JsonValue::Null => "null",
@@ -4509,6 +4542,9 @@ pub(super) fn cast_value(value: Value, target_type: crate::catalog::ColumnType) 
         crate::catalog::ColumnType::Blob => match value {
             Value::Blob(value) => Ok(Value::Blob(value)),
             Value::Uuid(value) => Ok(Value::Blob(value.to_vec())),
+            Value::Text(value) if value.starts_with("\\x") => Ok(Value::Blob(
+                crate::record::value::parse_hex_blob(&value[2..])?,
+            )),
             other => Err(DbError::sql(format!("cannot cast {other:?} to BLOB"))),
         },
         crate::catalog::ColumnType::Geometry => match value {
@@ -4841,6 +4877,70 @@ pub(super) fn eval_binary_with_collation(
         }
         _ => eval_binary(op, left, right),
     }
+}
+
+// SQL string literals start with an unknown type. Resolve an unknown literal
+// from its numeric/UUID/temporal counterpart, while leaving typed TEXT columns
+// and explicit TEXT casts alone. This is also how ORM decimal Valuers retain
+// exact arithmetic when their quoted SQL value is used in an expression.
+pub(super) fn coerce_binary_literals(
+    op: &BinaryOp,
+    left_expr: &Expr,
+    right_expr: &Expr,
+    mut left: Value,
+    mut right: Value,
+) -> Result<(Value, Value)> {
+    if !matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom
+    ) {
+        return Ok((left, right));
+    }
+    let inferred = |value: &Value| match value {
+        Value::Decimal { .. }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+            ) =>
+        {
+            Some(ColumnType::Decimal)
+        }
+        Value::Uuid(_) => Some(ColumnType::Uuid),
+        // Temporal addition uses interval strings, not timestamp strings.
+        Value::TimestampMicros(_) if !matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
+            Some(ColumnType::Timestamp)
+        }
+        Value::TimestampTzMicros(_) if !matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
+            Some(ColumnType::TimestampTz)
+        }
+        Value::DateDays(_) if !matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
+            Some(ColumnType::Date)
+        }
+        _ => None,
+    };
+    if matches!(left_expr, Expr::Literal(Value::Text(_))) {
+        if let Some(target) = inferred(&right) {
+            left = cast_value(left, target)?;
+        }
+    }
+    if matches!(right_expr, Expr::Literal(Value::Text(_))) {
+        if let Some(target) = inferred(&left) {
+            right = cast_value(right, target)?;
+        }
+    }
+    Ok((left, right))
 }
 
 pub(super) fn eval_regex(
@@ -5232,6 +5332,7 @@ pub(super) fn select_item_contains_fulltext_function(item: &SelectItem) -> bool 
 
 pub(super) fn expr_contains_fulltext_function(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Function { name, args } => {
             name.eq_ignore_ascii_case("fulltext_match")
                 || name.eq_ignore_ascii_case("bm25")
@@ -5324,6 +5425,7 @@ pub(super) fn expr_contains_fulltext_function(expr: &Expr) -> bool {
 
 pub(super) fn expr_contains_collation(expr: &Expr) -> bool {
     match expr {
+        Expr::Default => false,
         Expr::Collate { .. } => true,
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             expr_contains_collation(expr)
@@ -5655,6 +5757,16 @@ pub(super) fn compare_numeric_text_values(
     }
 
     match (left, right) {
+        (Value::Decimal { scaled, scale }, Value::Text(text)) => Some(
+            parse_decimal_text(text)
+                .map(|(right, right_scale)| compare_decimal(*scaled, *scale, right, right_scale))
+                .unwrap_or(Ordering::Less),
+        ),
+        (Value::Text(text), Value::Decimal { scaled, scale }) => Some(
+            parse_decimal_text(text)
+                .map(|(left, left_scale)| compare_decimal(left, left_scale, *scaled, *scale))
+                .unwrap_or(Ordering::Greater),
+        ),
         (Value::Int64(left), Value::Text(right)) => parsed_numeric_text(right)
             .map(|right| (*left as f64).total_cmp(&right))
             .or(Some(Ordering::Less)),
@@ -5806,6 +5918,10 @@ pub(super) fn equality_key_value(value: &Value) -> Value {
         // SQL compares both timestamp variants by UTC microseconds. Transient
         // equality keys must agree; persisted values retain their original tag.
         Value::TimestampTzMicros(micros) => Value::TimestampMicros(*micros),
+        Value::Decimal { scaled, scale } => {
+            let (scaled, scale) = crate::record::value::normalize_decimal(*scaled, *scale);
+            Value::Decimal { scaled, scale }
+        }
         other => other.clone(),
     }
 }

@@ -1679,6 +1679,9 @@ fn validate_generated_expr(
     generated_column_name: &str,
 ) -> Result<()> {
     match expr {
+        Expr::Default => Err(DbError::sql(
+            "DEFAULT is not valid in a generated expression",
+        )),
         Expr::Literal(_) => Ok(()),
         Expr::Column {
             table: qualifier,

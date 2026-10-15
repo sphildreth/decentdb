@@ -306,6 +306,7 @@ impl WalHandle {
     /// already exists. Fresh-database bootstrap uses that result to finish its
     /// main-file durability barrier before retrying the normal recovery-aware
     /// acquisition path.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn acquire_fresh(
         vfs: &VfsHandle,
         db_path: &Path,

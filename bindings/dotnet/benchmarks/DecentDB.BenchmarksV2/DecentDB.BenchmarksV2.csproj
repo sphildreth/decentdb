@@ -11,6 +11,6 @@
     <ProjectReference Include="../../src/DecentDB.AdoNet/DecentDB.AdoNet.csproj" />
     <ProjectReference Include="../../src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj" />
     <ProjectReference Include="../../src/DecentDB.Native/DecentDB.Native.csproj" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
   </ItemGroup>
 </Project>

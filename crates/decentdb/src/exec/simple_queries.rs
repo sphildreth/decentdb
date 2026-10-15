@@ -235,6 +235,7 @@ pub(crate) fn rewrite_simple_grouped_output_expr(
     }
 
     match expr {
+        Expr::Default => None,
         Expr::Literal(_) | Expr::Parameter(_) => Some(expr.clone()),
         Expr::Unary { op, expr } => Some(Expr::Unary {
             op: *op,
@@ -904,6 +905,31 @@ pub(crate) fn timestamp_key_types_match(left: ColumnType, right: ColumnType) -> 
     )
 }
 
+pub(crate) fn coerce_lookup_literal(
+    table: &TableSchema,
+    column: &str,
+    expr: &Expr,
+    value: Value,
+) -> Result<Value> {
+    if !matches!(expr, Expr::Literal(Value::Text(_))) {
+        return Ok(value);
+    }
+    let index = schema_column_index(table, column)
+        .ok_or_else(|| DbError::sql(format!("unknown column {column}")))?;
+    let column = &table.columns[index];
+    match column.column_type {
+        ColumnType::Decimal => {
+            // ADR 0099 orders invalid numeric text after numeric values.
+            let original = value.clone();
+            constraints::coerce_column_value(column, value).or(Ok(original))
+        }
+        ColumnType::Uuid | ColumnType::Date | ColumnType::Timestamp | ColumnType::TimestampTz => {
+            constraints::coerce_column_value(column, value)
+        }
+        _ => Ok(value),
+    }
+}
+
 pub(crate) fn timestamp_lookup_matches_schema(
     table: &TableSchema,
     column: &str,
@@ -1492,6 +1518,7 @@ pub(crate) fn collect_simple_grouped_numeric_projection_aggregates(
     saw_supported_aggregate: &mut bool,
 ) -> Option<()> {
     match expr {
+        Expr::Default => None,
         Expr::Literal(_) | Expr::Parameter(_) => Some(()),
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
@@ -1721,6 +1748,7 @@ pub(crate) fn collect_simple_grouped_numeric_having_aggregates(
     saw_supported_aggregate: &mut bool,
 ) -> Option<()> {
     match expr {
+        Expr::Default => None,
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => Some(()),
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
@@ -4249,16 +4277,8 @@ impl EngineRuntime {
             None,
         )?;
         let mut row_count = 0_i64;
-        let mut numeric_states = vec![
-            SimpleGroupedNumericState {
-                numeric_count: 0,
-                total_int: 0,
-                total_float: 0.0,
-                saw_float: false,
-                saw_value: false,
-            };
-            plan.aggregate_bindings.len()
-        ];
+        let mut numeric_states =
+            vec![SimpleGroupedNumericState::default(); plan.aggregate_bindings.len()];
 
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
@@ -4284,13 +4304,13 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .map(|(aggregate_index, aggregate)| match aggregate.kind {
-                SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(row_count),
+                SimpleGroupedNumericAggregateKind::CountRows => Ok(Value::Int64(row_count)),
                 SimpleGroupedNumericAggregateKind::Sum => {
                     numeric_states[aggregate_index].value(aggregate.kind)
                 }
-                _ => Value::Null,
+                _ => Ok(Value::Null),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(QueryResult::with_rows(
             plan.column_names.clone(),
             vec![QueryRow::new(values)],
@@ -4346,16 +4366,8 @@ impl EngineRuntime {
             None,
         )?;
         let mut row_count = 0_i64;
-        let mut numeric_states = vec![
-            SimpleGroupedNumericState {
-                numeric_count: 0,
-                total_int: 0,
-                total_float: 0.0,
-                saw_float: false,
-                saw_value: false,
-            };
-            plan.aggregate_bindings.len()
-        ];
+        let mut numeric_states =
+            vec![SimpleGroupedNumericState::default(); plan.aggregate_bindings.len()];
 
         let mut projection_indexes = Vec::with_capacity(plan.aggregate_bindings.len() + 1);
         projection_indexes.push(filter_column_index);
@@ -4395,13 +4407,13 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .map(|(aggregate_index, aggregate)| match aggregate.kind {
-                SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(row_count),
+                SimpleGroupedNumericAggregateKind::CountRows => Ok(Value::Int64(row_count)),
                 SimpleGroupedNumericAggregateKind::Sum => {
                     numeric_states[aggregate_index].value(aggregate.kind)
                 }
-                _ => Value::Null,
+                _ => Ok(Value::Null),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(QueryResult::with_rows(
             plan.column_names.clone(),
             vec![QueryRow::new(values)],
@@ -5204,6 +5216,8 @@ impl EngineRuntime {
                 &BTreeMap::new(),
                 None,
             )?;
+            let filter_value =
+                coerce_lookup_literal(source_schema, filter_column, value_expr, filter_value)?;
             if !timestamp_lookup_matches_schema(source_schema, filter_column, &filter_value) {
                 return Ok(None);
             }
@@ -7827,6 +7841,7 @@ impl EngineRuntime {
         if matches!(value, Value::Null) {
             return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
         }
+        let value = coerce_lookup_literal(table_schema, filter_column, value_expr, value)?;
         if !timestamp_lookup_matches_schema(table_schema, filter_column, &value) {
             return Ok(None);
         }
@@ -11774,6 +11789,7 @@ impl EngineRuntime {
                 &BTreeMap::new(),
                 None,
             )?;
+            let value = coerce_lookup_literal(table_schema, column, value_expr, value)?;
             if !timestamp_lookup_matches_schema(table_schema, column, &value) {
                 return Ok(None);
             }

@@ -35,6 +35,89 @@ fn bench_scalar_arithmetic(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_numeric_reports(c: &mut Criterion) {
+    let mut group = c.benchmark_group("numeric_reports");
+    for (name, sql_type, values) in [
+        ("integer", "INT64", [Value::Int64(1), Value::Int64(10)]),
+        (
+            "float",
+            "FLOAT64",
+            [Value::Float64(0.01), Value::Float64(0.1)],
+        ),
+        (
+            "decimal",
+            "NUMERIC",
+            [
+                Value::Decimal {
+                    scaled: 1,
+                    scale: 2,
+                },
+                Value::Decimal {
+                    scaled: 1,
+                    scale: 1,
+                },
+            ],
+        ),
+    ] {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open report fixture");
+        db.execute(&format!(
+            "CREATE TABLE amounts(id INT PRIMARY KEY, amount {sql_type})"
+        ))
+        .expect("create report fixture");
+        db.execute("BEGIN").expect("begin report seed");
+        for id in 1..=1000 {
+            db.execute_with_params(
+                "INSERT INTO amounts VALUES($1, $2)",
+                &[Value::Int64(id), values[(id % 2) as usize].clone()],
+            )
+            .expect("seed report fixture");
+        }
+        db.execute("COMMIT").expect("commit report seed");
+        let report = db
+            .prepare("SELECT SUM(amount), AVG(amount) FROM amounts")
+            .expect("prepare report");
+        let result = report.execute(&[]).expect("validate report");
+        assert_eq!(result.rows().len(), 1);
+        if name == "decimal" {
+            assert_eq!(
+                result.rows()[0].values(),
+                &[
+                    Value::Decimal {
+                        scaled: 55,
+                        scale: 0
+                    },
+                    Value::Decimal {
+                        scaled: 55,
+                        scale: 3
+                    },
+                ]
+            );
+        }
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(report.execute(&[]).expect("execute report")));
+        });
+        if name == "decimal" {
+            db.execute("CREATE INDEX amounts_amount ON amounts(amount)")
+                .expect("index report fixture");
+            let lookup = db
+                .prepare("SELECT id FROM amounts WHERE amount = '0.01'")
+                .expect("prepare quoted decimal lookup");
+            assert_eq!(
+                lookup
+                    .execute(&[])
+                    .expect("validate indexed lookup")
+                    .rows()
+                    .len(),
+                500
+            );
+            group.bench_function("decimal_indexed_literal", |b| {
+                b.iter(|| black_box(lookup.execute(&[]).expect("execute decimal lookup")));
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_wal_frame_encode_decode(c: &mut Criterion) {
     let page_size = default_page_size();
     let payload = vec![0xA5_u8; page_size as usize];
@@ -224,6 +307,7 @@ fn bench_trigram_kernels(c: &mut Criterion) {
 criterion_group!(
     micro_hot_paths,
     bench_scalar_arithmetic,
+    bench_numeric_reports,
     bench_wal_frame_encode_decode,
     bench_wal_append_path,
     bench_wal_delta_materialize,

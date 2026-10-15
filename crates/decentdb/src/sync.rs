@@ -1258,6 +1258,7 @@ fn validate_sync_scope_filter_expr_inner(
     referenced_columns: &mut BTreeSet<String>,
 ) -> Result<()> {
     match expr {
+        Expr::Default => Err(DbError::sql("DEFAULT is not valid in a sync filter")),
         Expr::Binary { left, op, right } => match op {
             BinaryOp::And => {
                 validate_sync_scope_filter_expr_inner(left, referenced_columns)?;
@@ -1443,6 +1444,7 @@ fn sync_scope_filter_column(expr: &Expr) -> Result<()> {
 
 fn sync_scope_filter_disallowed_operand(expr: &Expr) -> Option<DbError> {
     match expr {
+        Expr::Default => Some(DbError::sql("DEFAULT is not valid in a sync filter")),
         Expr::Column {
             table: Some(table),
             column,

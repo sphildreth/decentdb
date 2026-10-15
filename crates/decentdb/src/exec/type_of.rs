@@ -135,6 +135,7 @@ pub(super) fn declared_type(
             | "concat_ws" | "substr" | "substring" | "version" => Some(ColumnType::Text),
             "to_timestamp" | "now" | "current_timestamp" => Some(ColumnType::TimestampTz),
             "interval" => Some(ColumnType::Interval),
+            "json" | "jsonb" => Some(ColumnType::Text),
             "length" | "char_length" | "octet_length" => Some(ColumnType::Int64),
             "coalesce" | "nullif" | "greatest" | "least" | "abs" => args
                 .iter()
@@ -143,20 +144,21 @@ pub(super) fn declared_type(
         },
         Expr::Aggregate { name, args, .. } => match name.as_str() {
             "count" => Some(ColumnType::Int64),
-            "avg" | "total" => Some(ColumnType::Float64),
-            "min" | "max" => args
+            "total" => Some(ColumnType::Float64),
+            "avg" => Some(
+                if args
+                    .first()
+                    .and_then(|arg| declared_type(arg, dataset, params))
+                    == Some(ColumnType::Decimal)
+                {
+                    ColumnType::Decimal
+                } else {
+                    ColumnType::Float64
+                },
+            ),
+            "min" | "max" | "sum" => args
                 .first()
                 .and_then(|arg| declared_type(arg, dataset, params)),
-            "sum" => args
-                .first()
-                .and_then(|arg| declared_type(arg, dataset, params))
-                .map(|column_type| {
-                    if column_type == ColumnType::Decimal {
-                        ColumnType::Float64
-                    } else {
-                        column_type
-                    }
-                }),
             _ => None,
         },
         Expr::Case {

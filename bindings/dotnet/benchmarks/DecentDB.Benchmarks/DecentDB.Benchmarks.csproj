@@ -12,6 +12,6 @@
     <ProjectReference Include="../../src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj" />
     <PackageReference Include="Dapper" Version="2.1.66" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.3" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
   </ItemGroup>
 </Project>

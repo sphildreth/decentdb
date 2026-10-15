@@ -23,3 +23,5 @@ mimalloc = ["dep:mimalloc"]
 [[bin]]
 name = "decentdb"
 path = "src/main.rs"
+# The executable has CLI documentation; Rust API docs belong to the engine lib.
+doc = false

@@ -1259,6 +1259,7 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
+                let value = coerce_lookup_literal(table, column_name, value_expr, value)?;
                 if !timestamp_lookup_matches_schema(table, column_name, &value) {
                     return Ok(None);
                 }
@@ -1960,6 +1961,7 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
+        let value = coerce_lookup_literal(table, column_name, value_expr, value)?;
         if !timestamp_lookup_matches_schema(table, column_name, &value) {
             return Ok(None);
         }

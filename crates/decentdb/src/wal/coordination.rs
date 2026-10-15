@@ -3,12 +3,15 @@
 //! Implements the first native-file slice of
 //! `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use sha2::{Digest, Sha256};
 
 use crate::config::ProcessCoordinationMode;
@@ -16,9 +19,11 @@ use crate::error::{DbError, Result};
 use crate::storage::checksum;
 use crate::storage::DatabaseHeader;
 use crate::vfs::{
-    lock_range_with_timeout, read_exact_at, write_all_at, FileKind, OpenMode, VfsFile, VfsFileLock,
-    VfsHandle,
+    lock_range_with_timeout, read_exact_at, write_all_at, VfsFile, VfsFileLock, VfsHandle,
 };
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::vfs::{FileKind, OpenMode};
 
 pub(crate) const COORDINATION_SIDECAR_VERSION: u16 = 1;
 pub(crate) const READER_SLOT_COUNT: u16 = 64;
@@ -30,6 +35,7 @@ const READER_SLOT_LEN: u64 = 128;
 const READER_SLOT_CHECKSUM_OFFSET: usize = READER_SLOT_LEN as usize - 4;
 const READER_SLOTS_BYTES: usize = READER_SLOT_COUNT as usize * READER_SLOT_LEN as usize;
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const INIT_LOCK_OFFSET: u64 = 0;
 const WRITER_LOCK_OFFSET: u64 = 1;
 const META_LOCK_OFFSET: u64 = 2;
@@ -194,6 +200,7 @@ struct LocalAdmissionGate {
     // descriptor for the locked inode. All same-process coordinators therefore
     // share this one descriptor, so dropping one handle cannot silently release
     // another handle's process locks.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     file: Arc<dyn VfsFile>,
 }
 
@@ -337,52 +344,56 @@ impl ProcessCoordinator {
                     "process_coordination=required is not supported by the wasm OPFS runtime",
                 ));
             }
-            return Ok(None);
+            let _ = (db_path, header, timeout_ms);
+            Ok(None)
         }
-        if !vfs.supports_file_locks() {
-            return Err(DbError::transaction(format!(
-                "process coordination requires native local file locks for {}",
-                db_path.display()
-            )));
-        }
-        if header.database_id == [0_u8; 16] {
-            return Err(DbError::corruption(
-                "database header has an empty coordination identity",
-            ));
-        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            if !vfs.supports_file_locks() {
+                return Err(DbError::transaction(format!(
+                    "process coordination requires native local file locks for {}",
+                    db_path.display()
+                )));
+            }
+            if header.database_id == [0_u8; 16] {
+                return Err(DbError::corruption(
+                    "database header has an empty coordination identity",
+                ));
+            }
 
-        // The database already exists by the time process coordination opens.
-        // Deriving the gate key from its canonical path lets all local openers
-        // find the shared coordination descriptor before opening another one.
-        let canonical_db_path = vfs.canonicalize_path(db_path)?;
-        let coord_path = coord_path_for_db(&canonical_db_path);
-        let admission_gate = local_admission_gate(vfs, &coord_path)?;
-        let file = Arc::clone(&admission_gate.file);
-        let coordinator = Self {
-            inner: Arc::new(ProcessCoordinatorInner {
-                file,
-                coord_path,
-                mode,
-                timeout: Some(Duration::from_millis(timeout_ms)),
-                process_id: current_process_id(),
-                process_token: random_process_token(),
-                database_id: header.database_id,
-                db_format_version: header.format_version,
-                page_size: header.page_size,
-                fingerprint: coordination_fingerprint(
-                    &header.database_id,
-                    header.format_version,
-                    header.page_size,
-                ),
-                admission_gate,
-                metrics: ProcessCoordinationMetrics::default(),
-                #[cfg(test)]
-                stale_probe_callback: Mutex::new(None),
-                lock_wait_callback: Mutex::new(None),
-            }),
-        };
-        coordinator.initialize_or_rebuild()?;
-        Ok(Some(coordinator))
+            // The database already exists by the time process coordination opens.
+            // Deriving the gate key from its canonical path lets all local openers
+            // find the shared coordination descriptor before opening another one.
+            let canonical_db_path = vfs.canonicalize_path(db_path)?;
+            let coord_path = coord_path_for_db(&canonical_db_path);
+            let admission_gate = local_admission_gate(vfs, &coord_path)?;
+            let file = Arc::clone(&admission_gate.file);
+            let coordinator = Self {
+                inner: Arc::new(ProcessCoordinatorInner {
+                    file,
+                    coord_path,
+                    mode,
+                    timeout: Some(Duration::from_millis(timeout_ms)),
+                    process_id: current_process_id(),
+                    process_token: random_process_token(),
+                    database_id: header.database_id,
+                    db_format_version: header.format_version,
+                    page_size: header.page_size,
+                    fingerprint: coordination_fingerprint(
+                        &header.database_id,
+                        header.format_version,
+                        header.page_size,
+                    ),
+                    admission_gate,
+                    metrics: ProcessCoordinationMetrics::default(),
+                    #[cfg(test)]
+                    stale_probe_callback: Mutex::new(None),
+                    lock_wait_callback: Mutex::new(None),
+                }),
+            };
+            coordinator.initialize_or_rebuild()?;
+            Ok(Some(coordinator))
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Result<CoordinationHeaderSnapshot> {
@@ -1013,6 +1024,7 @@ impl ProcessCoordinator {
         Ok(guard)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn initialize_or_rebuild(&self) -> Result<()> {
         let _init = lock_range_with_timeout(
             self.inner.file.as_ref(),
@@ -1128,6 +1140,7 @@ impl ProcessCoordinator {
         self.write_reader_slot(slot, empty_reader_slot_record())
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn clear_all_reader_slots_bulk(&self) -> Result<()> {
         const SLOT_BYTES: usize = READER_SLOT_COUNT as usize * READER_SLOT_LEN as usize;
         let encoded = encode_reader_slot(empty_reader_slot_record());
@@ -1394,12 +1407,14 @@ impl Drop for ProcessReaderGuard {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn coord_path_for_db(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(".coord");
     PathBuf::from(path)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn local_admission_gate(vfs: &VfsHandle, coord_path: &Path) -> Result<Arc<LocalAdmissionGate>> {
     static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<LocalAdmissionGate>>>> = OnceLock::new();
     let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1521,6 +1536,7 @@ fn active_reader_slots() -> &'static Mutex<HashSet<ReaderSlotKey>> {
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn coordination_fingerprint(
     database_id: &[u8; 16],
     db_format_version: u32,
@@ -1662,6 +1678,7 @@ fn reader_lock_offset(slot: u16) -> u64 {
     READER_LOCK_BASE + u64::from(slot)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn current_process_id() -> u64 {
     u64::from(std::process::id())
 }
@@ -1673,6 +1690,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn random_process_token() -> u64 {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {

@@ -2303,13 +2303,14 @@ impl EngineRuntime {
             }
             Expr::Binary { left, op, right } => {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
-                eval_binary_with_collation(
-                    Some(self),
+                let (left_value, right_value) = coerce_binary_literals(
                     op,
+                    left,
+                    right,
                     self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
                     self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
-                    collation,
-                )
+                )?;
+                eval_binary_with_collation(Some(self), op, left_value, right_value, collation)
             }
             Expr::Between {
                 expr,
@@ -2573,6 +2574,9 @@ impl EngineRuntime {
         excluded: Option<&Dataset>,
     ) -> Result<Value> {
         match expr {
+            Expr::Default => Err(DbError::sql(
+                "DEFAULT requires an INSERT or UPDATE column context",
+            )),
             Expr::Literal(value) => Ok(value.clone()),
             Expr::Column { table, column } => {
                 self.resolve_column(dataset, row, table.as_deref(), column, excluded)
@@ -2604,9 +2608,11 @@ impl EngineRuntime {
             }
             Expr::Binary { left, op, right } => {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
-                let left = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
-                let right = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
-                eval_binary_with_collation(Some(self), op, left, right, collation)
+                let left_value = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
+                let right_value = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
+                let (left_value, right_value) =
+                    coerce_binary_literals(op, left, right, left_value, right_value)?;
+                eval_binary_with_collation(Some(self), op, left_value, right_value, collation)
             }
             Expr::Between {
                 expr,

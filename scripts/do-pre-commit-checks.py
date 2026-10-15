@@ -78,6 +78,7 @@ class Check:
     benchmark_comparison: bool = False
     cargo_bound: bool = False
     requires: str | tuple[str, ...] | None = None
+    unset_env: tuple[str, ...] = ()
 
 
 @dataclass
@@ -267,6 +268,10 @@ def _java_home_with_jni_headers(env: dict[str, str]) -> Path | None:
             REPO_ROOT / ".tmp" / "jdk25-full" / "usr" / "lib" / "jvm" / "java-25-openjdk",
         ]
     )
+
+    # Runtime-only packages may be the default even when a complete JDK is
+    # installed beside them. Prefer the caller's JDK, then discover local ones.
+    candidates.extend(sorted(Path("/usr/lib/jvm").glob("*")))
 
     for candidate in candidates:
         if (candidate / "bin" / "java").exists() and _has_jni_headers(candidate):
@@ -495,6 +500,15 @@ def build_checks() -> list[Check]:
             requires="go",
         ),
         Check(
+            key="go-bun-example",
+            title="Go Bun ORM integration example",
+            cwd=REPO_ROOT / "bindings" / "go" / "examples" / "bun",
+            command="go test -count=1 ./... && go vet ./...",
+            env={},
+            stage=4,
+            requires="go",
+        ),
+        Check(
             key="java-tests",
             title="Java binding tests",
             cwd=REPO_ROOT / "bindings" / "java",
@@ -718,8 +732,18 @@ def build_checks() -> list[Check]:
             stage=6,
             cargo_bound=True,
             requires=("node", "wasm-bindgen"),
+            # Playwright forces color in workers; inherited NO_COLOR conflicts.
+            unset_env=("NO_COLOR",),
         ),
     ]
+
+
+def check_environment(check: Check) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(check.env)
+    for key in check.unset_env:
+        env.pop(key, None)
+    return env
 
 
 def run_check(
@@ -732,8 +756,7 @@ def run_check(
     state.status = "running"
     start = time.perf_counter()
 
-    env = os.environ.copy()
-    env.update(state.check.env)
+    env = check_environment(state.check)
 
     lock = _cargo_lock if state.check.cargo_bound else contextlib.nullcontext()
     with lock:
@@ -741,7 +764,7 @@ def run_check(
             log_file.write(f"$ (cd {state.check.cwd} && {state.check.command})\n\n")
             log_file.flush()
             process = subprocess.Popen(
-                ["bash", "-lc", state.check.command],
+                ["bash", "-c", state.check.command],
                 cwd=state.check.cwd,
                 env=env,
                 stdout=log_file,
@@ -852,8 +875,7 @@ def _required_tools(check: Check) -> tuple[str, ...]:
 
 def _check_skip_reason(check: Check) -> str | None:
     """Return a human-readable skip reason, or None if the check can run."""
-    env = os.environ.copy()
-    env.update(check.env)
+    env = check_environment(check)
     for tool in _required_tools(check):
         if not shutil.which(tool, path=env.get("PATH")):
             return f"{tool} not found"

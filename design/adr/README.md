@@ -2,6 +2,9 @@
 
 This directory contains the historical and active ADRs for DecentDB.
 
+- **0217-warning-free-quality-validation.md**: Defines native/WASM compile boundaries, the maintained Gungraun benchmark dependency, and deterministic pre-commit shell/JDK setup.
+
+- **0216-bun-orm-native-sql-integration.md**: Defines native Bun SQL compatibility, scoped DML aliases, contextual defaults, serial/JSON/BYTEA declarations, exact numeric literals/aggregates, and standard Go decimal interfaces.
 - **0215-decimal-arithmetic-and-sql-type-inspection.md**: Defines checked decimal arithmetic, timestamp return/display semantics, PG_TYPEOF type names, and instrumentation-aware performance validation.
 
 > **Note on historical context:** Some earlier ADRs (0001 through 0117) reference

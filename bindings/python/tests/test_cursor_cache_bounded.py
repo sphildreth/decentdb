@@ -9,7 +9,7 @@ import pytest
 import sys
 import os
 
-from decentdb import connect
+from decentdb import PerformanceWarning, connect
 
 ALL_CURSOR_CACHES = [
     '_rewrite_sql_cache',
@@ -71,6 +71,11 @@ def test_caches_cleared_on_close(db_path):
         f"Cursor caches should be empty after close(). "
         f"Before: {sizes_before}, After: {sizes_after}"
     )
+
+    # These unique SQL strings intentionally produce cache misses. Verify the
+    # diagnostic explicitly and close the connection deterministically.
+    with pytest.warns(PerformanceWarning, match="Statement cache hit rate"):
+        db.close()
 
 
 def test_caches_cleared_after_connection_context(db_path):
@@ -155,6 +160,11 @@ def test_rewrite_sql_cache_bounded(db_path):
     assert len(cur._rewrite_sql_cache) == 0, (
         f"_rewrite_sql_cache should be empty after close(), but has {len(cur._rewrite_sql_cache)} entries"
     )
+
+    # These unique SQL strings intentionally produce cache misses. Verify the
+    # diagnostic explicitly and close the connection deterministically.
+    with pytest.warns(PerformanceWarning, match="Statement cache hit rate"):
+        db.close()
 
 
 def test_metadata_cache_bounded(db_path):
@@ -359,6 +369,11 @@ def test_caches_cleared_after_many_unique_queries(db_path):
         f"Cursor caches should be empty after close(), even after many unique queries. "
         f"Before: {sizes_before}, After: {sizes_after}"
     )
+
+    # These unique SQL strings intentionally produce cache misses. Verify the
+    # diagnostic explicitly and close the connection deterministically.
+    with pytest.warns(PerformanceWarning, match="Statement cache hit rate"):
+        db.close()
 
 
 if __name__ == "__main__":

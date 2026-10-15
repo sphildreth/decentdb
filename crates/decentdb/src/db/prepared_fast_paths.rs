@@ -1397,7 +1397,12 @@ impl Db {
                 return None;
             }
         }
-        let value_source = prepared_simple_value_source(value_expr)?;
+        let value_source = crate::exec::dml::compile_prepared_lookup_value_source(
+            table,
+            filter_column,
+            value_expr,
+        )
+        .ok()??;
 
         let mut projection_indexes = Vec::with_capacity(select.projection.len());
         let mut column_names = Vec::with_capacity(select.projection.len());
