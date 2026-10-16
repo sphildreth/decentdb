@@ -45,10 +45,10 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // Insert empty collection
-        await persons.InsertManyAsync(new List<Person>());
+        await persons.InsertManyAsync(new List<Person>(), cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify no records were added
-        var count = await persons.CountAsync();
+        var count = await persons.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(0, count);
     }
 
@@ -69,13 +69,13 @@ public class DbSetEdgeCaseTests : IDisposable
         
         // Insert single item
         var person = new Person { Id = 1, Name = "Single", Age = 25 };
-        await persons.InsertManyAsync(new List<Person> { person });
+        await persons.InsertManyAsync(new List<Person> { person }, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify record was added
-        var count = await persons.CountAsync();
+        var count = await persons.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, count);
         
-        var retrieved = await persons.GetAsync(1);
+        var retrieved = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal("Single", retrieved.Name);
     }
@@ -106,17 +106,17 @@ public class DbSetEdgeCaseTests : IDisposable
             new Person { Id = 3, Name = "Tx3", Age = 35 }
         };
         
-        await persons.InsertManyAsync(people);
+        await persons.InsertManyAsync(people, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify records exist within transaction
-        var count = await persons.CountAsync();
+        var count = await persons.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(3, count);
         
         // Rollback transaction
         tx.Rollback();
         
         // Verify records were rolled back
-        var countAfterRollback = await persons.CountAsync();
+        var countAfterRollback = await persons.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(0, countAfterRollback);
     }
 
@@ -141,7 +141,7 @@ public class DbSetEdgeCaseTests : IDisposable
             new PersonWithNotNull { Id = 2, Name = null! } // This should cause an exception
         };
         
-        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.InsertManyAsync(people));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.InsertManyAsync(people, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -164,12 +164,12 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // Delete all persons with age < 30
-        var deletedCount = await persons.DeleteManyAsync(p => p.Age < 30);
+        var deletedCount = await persons.DeleteManyAsync(p => p.Age < 30, cancellationToken: TestContext.Current.CancellationToken);
         
         Assert.Equal(2, deletedCount); // Two people (ages 10 and 20) are under 30
         
         // Verify remaining records
-        var remaining = await persons.ToListAsync();
+        var remaining = await persons.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, remaining.Count);
         Assert.All(remaining, p => Assert.True(p.Age >= 30)); // Only ages 65 and 70 should remain
     }
@@ -194,12 +194,12 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // Try to delete persons with age > 100 (should match none)
-        var deletedCount = await persons.DeleteManyAsync(p => p.Age > 100);
+        var deletedCount = await persons.DeleteManyAsync(p => p.Age > 100, cancellationToken: TestContext.Current.CancellationToken);
         
         Assert.Equal(0, deletedCount);
         
         // Verify record still exists
-        var count = await persons.CountAsync();
+        var count = await persons.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, count);
     }
 
@@ -209,7 +209,7 @@ public class DbSetEdgeCaseTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
         
-        await Assert.ThrowsAsync<ArgumentNullException>(async () => await persons.DeleteManyAsync(null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(async () => await persons.DeleteManyAsync(null!, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -229,14 +229,14 @@ public class DbSetEdgeCaseTests : IDisposable
         var persons = ctx.Set<Person>();
         
         // Insert initial data
-        await persons.InsertAsync(new Person { Id = 1, Name = "Before Tx", Age = 25 });
+        await persons.InsertAsync(new Person { Id = 1, Name = "Before Tx", Age = 25 }, cancellationToken: TestContext.Current.CancellationToken);
         
         try
         {
             using var tx = ctx.BeginTransaction();
             
             // Insert within transaction
-            await persons.InsertAsync(new Person { Id = 2, Name = "During Tx", Age = 30 });
+            await persons.InsertAsync(new Person { Id = 2, Name = "During Tx", Age = 30 }, cancellationToken: TestContext.Current.CancellationToken);
             
             // Cause an exception to trigger rollback
             throw new Exception("Simulated error");
@@ -247,7 +247,7 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // Verify only the first record remains (second was rolled back)
-        var allRecords = await persons.ToListAsync();
+        var allRecords = await persons.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(allRecords);
         Assert.Equal(1L, allRecords[0].Id);
     }
@@ -290,7 +290,7 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // This should throw because there are multiple results when calling SingleAsync
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.SingleAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.SingleAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -309,7 +309,7 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // This should throw because there are no results
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.SingleAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.SingleAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -328,7 +328,7 @@ public class DbSetEdgeCaseTests : IDisposable
         }
         
         // This should throw because there are no results
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.FirstAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await persons.FirstAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -348,7 +348,7 @@ public class DbSetEdgeCaseTests : IDisposable
         
         var person = new PersonWithNotNull { Id = 1, Name = null! }; // Name is marked as not null
         
-        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.InsertAsync(person));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.InsertAsync(person, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -370,11 +370,11 @@ public class DbSetEdgeCaseTests : IDisposable
             cmd.ExecuteNonQuery();
         }
         
-        var person = await persons.GetAsync(1);
+        var person = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(person);
         person.Name = null!; // Try to set required field to null
         
-        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.UpdateAsync(person));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await persons.UpdateAsync(person, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Table("persons")]

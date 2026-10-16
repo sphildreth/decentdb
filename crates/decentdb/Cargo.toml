@@ -15,43 +15,43 @@ lua-extensions = ["dep:mlua"]
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-chrono = "0.4"
-regex = "1.11"
-md5 = "0.7"
-sha2 = "0.10"
-smallvec = { version = "1.15", features = ["union"] }
-toml = "0.8"
-base64 = "0.22"
-chacha20 = "0.9"
-ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
-zeroize = "1.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+chrono = "0.4.45"
+regex = "1.13.1"
+md5 = "0.8.1"
+sha2 = "0.11.1"
+smallvec = { version = "1.16.3", features = ["union"] }
+toml = "1.1.8"
+base64 = "0.23.1"
+chacha20 = "0.10.2"
+ed25519-dalek = { version = "3.0.0", default-features = false }
+zeroize = "1.9.1"
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-getrandom = "0.3"
-libc = "0.2"
+getrandom = "0.4.3"
+libc = "0.2.190"
 libpg_query_sys = { path = "../libpg_query_sys" }
-mlua = { version = "0.11", optional = true, features = ["lua54", "vendored", "send"] }
+mlua = { version = "0.12.2", optional = true, features = ["lua54", "vendored", "send"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-js-sys = "0.3"
-wasm-bindgen = "0.2"
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8.2"
 gungraun = "0.20.0"
-proptest = "1.5"
-insta = { version = "1.39", features = ["json"] }
-rusqlite = "0.31"
-duckdb = { version = "1.0", features = ["bundled"] }
-hdrhistogram = "7.5"
-serde = { version = "1.0", features = ["derive"] }
-tempfile = "3.10"
-rand = "0.8"
+proptest = "1.12.0"
+insta = { version = "1.49.0", features = ["json"] }
+rusqlite = "0.40.2"
+duckdb = { version = "1.10506.0", features = ["bundled"] }
+hdrhistogram = "7.6.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3.27.0"
+rand = "0.10.3"
 
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]

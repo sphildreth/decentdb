@@ -4,7 +4,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Structured diagnostic payload attached to native DecentDB failures. */
-public final class DecentDBDiagnostic {
+public final class DecentDBDiagnostic implements java.io.Serializable {
+    @java.io.Serial
+    private static final long serialVersionUID = 1L;
+
     private final String rawJson;
     private final Integer nativeCode;
     private final String codeName;

@@ -35,14 +35,14 @@ jobs:
       BENCHMARK_CUSTOMERS: "100"
       BENCHMARK_ORDERS: "500"
       BENCHMARK_EVENTS: "500"
-      H2_VERSION: "2.2.224"
-      DERBY_VERSION: "10.16.1.1"
+      H2_VERSION: "2.5.252"
+      DERBY_VERSION: "10.17.1.0"
       HSQLDB_VERSION: "2.7.4"
       DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/release/libdecentdb.so
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -51,28 +51,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
           cache: "pip"
           cache-dependency-path: |
             benchmarks/python_embedded_compare/requirements.txt
             bindings/python/pyproject.toml
 
       - name: Set up Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6.1.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "25"
 
       - name: Install Python benchmark dependencies
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          sudo apt-get update && sudo apt-get install -y ant
           pip install -r benchmarks/python_embedded_compare/requirements.txt
           pip install -e bindings/python
 
@@ -442,7 +443,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: benchmark-assets-${{ github.run_id }}
           path: |
@@ -464,7 +465,7 @@ jobs:
       - name: Create GitHub App token
         id: app-token
         if: steps.benchmark-narrative.outputs.publish == 'true'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ secrets.BENCHMARK_APP_ID }}
           private-key: ${{ secrets.BENCHMARK_APP_PRIVATE_KEY }}

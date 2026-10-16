@@ -20,12 +20,12 @@ public sealed class OperationalBehaviorTests : IDisposable
     public async Task BeginTransactionAsync_PreservesIsolationLevel_And_ExplicitlyRejectsSavepoints()
     {
         await using var context = CreateContext();
-        await context.Database.EnsureCreatedAsync();
+        await context.Database.EnsureCreatedAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        await using var transaction = await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+        await using var transaction = await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(IsolationLevel.ReadCommitted, transaction.GetDbTransaction().IsolationLevel);
         Assert.False(transaction.SupportsSavepoints);
-        await Assert.ThrowsAsync<NotSupportedException>(() => transaction.CreateSavepointAsync("before_more_work"));
+        await Assert.ThrowsAsync<NotSupportedException>(() => transaction.CreateSavepointAsync("before_more_work", cancellationToken: TestContext.Current.CancellationToken));
     }
 
     private OperationalDbContext CreateContext()

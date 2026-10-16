@@ -71,7 +71,8 @@ python scripts/do-pre-commit-checks.py --list
 ```
 
 Stages: static analysis → clean rebuild → release build → fast regressions → full tests/bindings → benchmarks.
-Binding checks for Go/Java/Node/Dart are skipped gracefully when the toolchain is missing.
+Selected checks fail when required toolchains are missing. Intentional exclusions
+require `--skip CHECK` and are reported as incomplete validation.
 
 ### Benchmark chart regeneration
 

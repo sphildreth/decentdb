@@ -44,17 +44,50 @@ python scripts/do-pre-commit-checks.py --mode fast
 python scripts/do-pre-commit-checks.py --mode paranoid
 ```
 
-Both modes run `cargo deny check` against `deny.toml` for the main workspace
-and the standalone Rust baseline benchmark, checking security advisories,
-licenses, dependency bans, and dependency sources. A missing
+Both modes run `cargo deny check` against `deny.toml` for the main workspace,
+the standalone Rust baseline benchmark, and the independent fuzz workspace,
+checking security advisories, licenses, dependency bans, and dependency sources. A missing
 `cargo-deny` installation fails the check. Run this check on its own with
 `python scripts/do-pre-commit-checks.py --only rust-supply-chain`.
 
-Use `paranoid` before release candidates. It runs the normal Rust and binding
-matrix, then adds release metadata/version checks, structured diagnostic
-guardrails, remaining workspace crate tests, package-local Knex and web
-typecheck/build coverage, storage crash/soak harnesses, release metrics,
-rustdoc/API docs, MkDocs, and browser WASM OPFS smoke coverage.
+Fast mode also checks staged/working-tree whitespace, vendored C ABI headers,
+release metadata, structured diagnostics, and the repository's Python automation
+tests before its native build and regression suites. Independent checks within
+a fast stage may run in parallel.
+
+Use `paranoid` before release candidates. It runs sequentially and adds all Rust
+workspace tests, independent fuzz/benchmark formatting and Clippy checks, standalone
+benchmark tests, Python benchmark framework tests, every desktop binding suite,
+standalone .NET smoke/helper projects, JDBC/DBeaver packaging, Java FFM smoke,
+Dart package/example analysis, and Flutter package tests/example analysis. It also
+runs storage crash/soak harnesses, benchmark smoke checks, rustdoc/API docs, strict
+MkDocs validation, and browser WASM OPFS smoke coverage.
+
+Selected checks are required: missing toolchains fail preflight. Install the
+toolchains described in [Building](building.md), including a full JDK with JNI
+headers, Flutter, and a DBeaver SDK whose `plugins` directory is selected with
+`DBEAVER_PLUGIN_DIR`. Cargo operations use `--locked`, Node packages use `npm ci`,
+Node engine requirements are enforced, and Dart/Flutter restores enforce their
+lockfiles. Changes to tracked dependency files during validation fail the run.
+Compiler/analyzer warnings are rejected for
+Rust, .NET, Java/JNI, C, and Dart/Flutter; Python tests reject unexpected warnings,
+and documentation builds reject warnings too.
+The FFM smoke test explicitly acknowledges the restricted native APIs in its
+three native-call methods; execution still requires `--enable-native-access`.
+
+Use `--only CHECK` for focused checks. An intentional exclusion requires
+`--skip CHECK`; excluded checks appear in an **INCOMPLETE** result, even if the
+executed checks succeed. Excluding every selected check fails. Each check has a
+30-minute timeout; override it with `--timeout-seconds SECONDS`. Timeout or Ctrl+C
+terminates the check's child processes. Logs and a machine-readable `summary.json`
+are written under `.tmp/pre-commit-checks/`.
+
+SQLite benchmark comparisons are informational because local timings depend on
+the host and background load. Their per-run comparison JSON is saved beside the
+logs, and saved baselines remain unchanged unless explicitly accepted with
+`--update-benchmark-baselines`. Benchmark command failures still fail validation.
+Windows/macOS/mobile artifact builds and longer sanitizer, Miri, and fuzz runs
+remain separate GitHub Actions checks; a local pass does not establish those results.
 
 ## Focused Rust test commands
 
@@ -140,7 +173,7 @@ Several language integrations also keep package-local tests under `bindings/`.
 
 ```bash
 cd bindings/dotnet
-dotnet test DecentDB.NET.sln -v minimal
+dotnet test --solution DecentDB.NET.sln -v minimal
 ```
 
 ### Python package

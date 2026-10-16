@@ -1,7 +1,7 @@
 name: decentdb_dart_smoke
 environment:
-  sdk: ^3.0.0
+  sdk: ^3.13.5
 dependencies:
   decentdb:
     path: ../../../bindings/dart/dart
-  ffi: ^2.1.0
+  ffi: ^2.2.0

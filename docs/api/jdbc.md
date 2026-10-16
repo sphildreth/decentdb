@@ -61,7 +61,7 @@ The Java build itself targets Java 17 bytecode. In this repository, the Gradle
 test path is currently validated with JDK 21:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 cd bindings/java
 ./gradlew :driver:test
@@ -74,7 +74,7 @@ prepared statements, `DECIMAL`, `BOOL`, `TIMESTAMP`, rollback, metadata, and
 basic error handling:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 cd bindings/java
 ./gradlew :driver:runCrudExample
@@ -91,7 +91,7 @@ To target a specific database path:
 From `bindings/java/`:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 ./gradlew :driver:benchmarkFetch -PbenchmarkArgs="--count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix java_bench_fetch"
 ```
@@ -114,15 +114,15 @@ can also pass it explicitly with `--sqlite-jdbc`.
 ## Run the low-level FFM smoke
 
 `tests/bindings/java/Smoke.java` validates the raw C ABI independently of the
-JDBC driver. With JDK 21, this path uses the preview Foreign Function & Memory
+JDBC driver. Run it with JDK 25 LTS using the stable Foreign Function & Memory
 API:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 cargo build -p decentdb
-javac --enable-preview --release 21 tests/bindings/java/Smoke.java
-java --enable-preview --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
+javac --release 25 tests/bindings/java/Smoke.java
+java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
 ```
 
 The smoke test auto-detects `target/debug/` or `target/release/` for the core

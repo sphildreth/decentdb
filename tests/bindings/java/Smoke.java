@@ -18,6 +18,8 @@ public final class Smoke {
     private static final int DDB_ERR_TIMEOUT = 10;
     private static final long DDB_WRITE_QUEUE_TIMEOUT_DEFAULT = -1L;
 
+    // These FFM calls intentionally cross the C ABI; run with --enable-native-access=ALL-UNNAMED.
+    @SuppressWarnings("restricted")
     public static void main(String[] args) throws Throwable {
         Path root = Path.of("").toAbsolutePath();
         Path library = locateLibrary(root);
@@ -67,13 +69,13 @@ public final class Smoke {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS));
 
             MemorySegment dbSlot = arena.allocate(ADDRESS);
-            check((int) open.invokeExact(arena.allocateUtf8String(":memory:"), dbSlot), "open_or_create", lastError);
+            check((int) open.invokeExact(arena.allocateFrom(":memory:"), dbSlot), "open_or_create", lastError);
             MemorySegment db = dbSlot.get(ADDRESS, 0);
 
             MemorySegment resultSlot = arena.allocate(ADDRESS);
             check((int) execute.invokeExact(
                 db,
-                arena.allocateUtf8String("CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT)"),
+                arena.allocateFrom("CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT)"),
                 MemorySegment.NULL,
                 0L,
                 resultSlot
@@ -82,7 +84,7 @@ public final class Smoke {
 
             check((int) execute.invokeExact(
                 db,
-                arena.allocateUtf8String("INSERT INTO smoke (id, name) VALUES (1, 'java-smoke')"),
+                arena.allocateFrom("INSERT INTO smoke (id, name) VALUES (1, 'java-smoke')"),
                 MemorySegment.NULL,
                 0L,
                 resultSlot
@@ -91,7 +93,7 @@ public final class Smoke {
 
             check((int) executeQueued.invokeExact(
                 db,
-                arena.allocateUtf8String("INSERT INTO smoke (id, name) VALUES (2, 'java-queued')"),
+                arena.allocateFrom("INSERT INTO smoke (id, name) VALUES (2, 'java-queued')"),
                 MemorySegment.NULL,
                 0L,
                 DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
@@ -107,13 +109,13 @@ public final class Smoke {
             MemorySegment watchSlot = arena.allocate(ADDRESS);
             check((int) watchQuery.invokeExact(
                 db,
-                arena.allocateUtf8String("{\"sql\":\"SELECT id, name FROM smoke ORDER BY id\"}"),
+                arena.allocateFrom("{\"sql\":\"SELECT id, name FROM smoke ORDER BY id\"}"),
                 watchSlot
             ), "watch query", lastError);
             MemorySegment watch = watchSlot.get(ADDRESS, 0);
             MemorySegment eventSlot = arena.allocate(ADDRESS);
             check((int) watchNext.invokeExact(watch, 1000, eventSlot), "watch initial", lastError);
-            String initial = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getUtf8String(0);
+            String initial = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0);
             if (!initial.contains("\"type\":\"initial\"")) {
                 throw new IllegalStateException("unexpected initial watch event: " + initial);
             }
@@ -121,14 +123,14 @@ public final class Smoke {
 
             check((int) execute.invokeExact(
                 db,
-                arena.allocateUtf8String("INSERT INTO smoke (id, name) VALUES (3, 'java-watch')"),
+                arena.allocateFrom("INSERT INTO smoke (id, name) VALUES (3, 'java-watch')"),
                 MemorySegment.NULL,
                 0L,
                 resultSlot
             ), "watch insert", lastError);
             check((int) resultFree.invokeExact(resultSlot), "free watch insert", lastError);
             check((int) watchNext.invokeExact(watch, 1000, eventSlot), "watch invalidate", lastError);
-            String invalidate = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getUtf8String(0);
+            String invalidate = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0);
             if (!invalidate.contains("\"type\":\"invalidate\"") || !invalidate.contains("\"smoke\"")) {
                 throw new IllegalStateException("unexpected invalidate watch event: " + invalidate);
             }
@@ -141,7 +143,7 @@ public final class Smoke {
 
             check((int) execute.invokeExact(
                 db,
-                arena.allocateUtf8String("SELECT id, name FROM smoke"),
+                arena.allocateFrom("SELECT id, name FROM smoke"),
                 MemorySegment.NULL,
                 0L,
                 resultSlot
@@ -156,7 +158,7 @@ public final class Smoke {
 
             int status = (int) execute.invokeExact(
                 db,
-                arena.allocateUtf8String("SELECT * FROM nope"),
+                arena.allocateFrom("SELECT * FROM nope"),
                 MemorySegment.NULL,
                 0L,
                 resultSlot
@@ -185,11 +187,15 @@ public final class Smoke {
         }
     }
 
+    // The native contract returns a NUL-terminated UTF-8 string.
+    @SuppressWarnings("restricted")
     private static String errorString(MethodHandle lastError) throws Throwable {
         MemorySegment segment = (MemorySegment) lastError.invokeExact();
-        return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getUtf8String(0);
+        return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getString(0);
     }
 
+    // The allocated diagnostic string uses the same native NUL-terminated contract.
+    @SuppressWarnings("restricted")
     private static String errorJson(MethodHandle lastErrorJson, MethodHandle stringFree, Arena arena) throws Throwable {
         MemorySegment slot = arena.allocate(ADDRESS);
         int status = (int) lastErrorJson.invokeExact(slot);
@@ -201,7 +207,7 @@ public final class Smoke {
             return "";
         }
         try {
-            return segment.reinterpret(Long.MAX_VALUE).getUtf8String(0);
+            return segment.reinterpret(Long.MAX_VALUE).getString(0);
         } finally {
             int freeStatus = (int) stringFree.invokeExact(slot);
             if (freeStatus != DDB_OK) {

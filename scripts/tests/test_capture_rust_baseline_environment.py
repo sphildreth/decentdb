@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,14 +29,15 @@ capture = load_module(
 )
 
 
-def git(repo: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+def git_evidence(repo: Path, args: list[str]) -> bytes:
+    """Exercise evidence capture without writing a Git repository or commits."""
+    return {
+        ("git", "rev-parse", "HEAD"): b"a" * 40 + b"\n",
+        ("git", "ls-files", "-z", "--cached"): b"src/tracked.rs\0README.md\0",
+        ("git", "ls-files", "-z", "--others", "--exclude-standard"):
+            b"src/untracked.py\0.env\0target/generated.rs\0"
+            b"benchmarks/rust-baseline/results/record.json\0",
+    }[tuple(args)]
 
 
 class CaptureRustBaselineEnvironmentTests(unittest.TestCase):
@@ -46,15 +46,10 @@ class CaptureRustBaselineEnvironmentTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
-            git(repo, "init", "-q")
-            git(repo, "config", "user.email", "benchmark@example.invalid")
-            git(repo, "config", "user.name", "Benchmark Test")
 
             (repo / "src").mkdir()
             (repo / "src" / "tracked.rs").write_text("fn tracked() {}\n")
             (repo / "README.md").write_text("tracked docs\n")
-            git(repo, "add", "src/tracked.rs", "README.md")
-            git(repo, "commit", "-qm", "fixture")
 
             (repo / "src" / "untracked.py").write_text("VALUE = 1\n")
             (repo / ".env").write_text("TOKEN=do-not-record\n")
@@ -69,7 +64,7 @@ class CaptureRustBaselineEnvironmentTests(unittest.TestCase):
             binary.write_bytes(b"frozen binary")
             current_root = repo / ".tmp" / "evidence" / "trials"
 
-            with unittest.mock.patch.object(
+            with unittest.mock.patch.object(capture, "run_command", side_effect=git_evidence), unittest.mock.patch.object(
                 capture, "platform_evidence", return_value="test platform\n"
             ):
                 manifest_path = capture.capture_environment(
@@ -103,12 +98,7 @@ class CaptureRustBaselineEnvironmentTests(unittest.TestCase):
     def test_capture_refuses_existing_trials(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
-            git(repo, "init", "-q")
-            git(repo, "config", "user.email", "benchmark@example.invalid")
-            git(repo, "config", "user.name", "Benchmark Test")
             (repo / "README.md").write_text("fixture\n")
-            git(repo, "add", "README.md")
-            git(repo, "commit", "-qm", "fixture")
             binary = repo / "rust-baseline"
             binary.write_bytes(b"binary")
             current_root = repo / "evidence"

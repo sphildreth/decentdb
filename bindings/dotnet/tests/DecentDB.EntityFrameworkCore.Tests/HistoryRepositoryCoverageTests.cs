@@ -19,7 +19,7 @@ public sealed class HistoryRepositoryCoverageTests : IDisposable
         var repository = context.GetService<IHistoryRepository>();
 
         Assert.False(repository.Exists());
-        Assert.False(await repository.ExistsAsync());
+        Assert.False(await repository.ExistsAsync(cancellationToken: TestContext.Current.CancellationToken));
 
         try
         {
@@ -31,11 +31,11 @@ public sealed class HistoryRepositoryCoverageTests : IDisposable
         }
 
         _ = repository.Exists();
-        _ = await repository.ExistsAsync();
+        _ = await repository.ExistsAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         try
         {
-            _ = await repository.CreateIfNotExistsAsync();
+            _ = await repository.CreateIfNotExistsAsync(cancellationToken: TestContext.Current.CancellationToken);
         }
         catch (Exception ex) when (ex is DecentDBException or DbException)
         {
@@ -60,7 +60,7 @@ public sealed class HistoryRepositoryCoverageTests : IDisposable
         using var syncLock = repository.AcquireDatabaseLock();
         Assert.NotNull(syncLock);
 
-        using var asyncLock = await repository.AcquireDatabaseLockAsync();
+        using var asyncLock = await repository.AcquireDatabaseLockAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(asyncLock);
     }
 

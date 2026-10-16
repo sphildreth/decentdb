@@ -68,7 +68,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.OrderByDescending(e => e.Salary).ToListAsync();
+        var result = await set.OrderByDescending(e => e.Salary).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(5, result.Count);
         Assert.Equal(3L, result[0].Id); // Carol: 140k
@@ -90,7 +90,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
             .Where(e => e.Department != null)
             .OrderBy(e => e.Department)
             .ThenBy(e => e.Salary)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(4, result.Count);
         // Engineering: Alice (120k) before Carol (140k)
@@ -113,7 +113,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
             .Where(e => e.Department != null)
             .OrderBy(e => e.Department)
             .ThenByDescending(e => e.Salary)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(4, result.Count);
         // Engineering: Carol (140k) before Alice (120k)
@@ -136,7 +136,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Name == "Alice" || e.Name == "Eve")
             .OrderBy(e => e.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Alice", result[0].Name);
@@ -152,7 +152,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Where(e => e.Department == null).ToListAsync();
+        var result = await set.Where(e => e.Department == null).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Dave", result[0].Name);
@@ -165,7 +165,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Where(e => e.Department != null).ToListAsync();
+        var result = await set.Where(e => e.Department != null).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(4, result.Count);
         Assert.DoesNotContain(result, e => e.Name == "Dave");
@@ -183,7 +183,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Department != "Engineering")
             .OrderBy(e => e.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // Marketing employees (Bob, Eve) — Dave has null department so excluded by SQL != semantics
         Assert.All(result, e => Assert.NotEqual("Engineering", e.Department));
@@ -198,7 +198,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Where(e => e.Salary < 90000).ToListAsync();
+        var result = await set.Where(e => e.Salary < 90000).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Bob", result[0].Name);
@@ -214,7 +214,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Salary <= 90000)
             .OrderBy(e => e.Salary)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Bob", result[0].Name);   // 80k
@@ -233,7 +233,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Name.EndsWith("e"))
             .OrderBy(e => e.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, result.Count);
         Assert.Equal("Alice", result[0].Name);
@@ -251,7 +251,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Name.Contains("o"))
             .OrderBy(e => e.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Bob", result[0].Name);
@@ -267,7 +267,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var eng = await set.FirstAsync(e => e.Department == "Engineering");
+        var eng = await set.FirstAsync(e => e.Department == "Engineering", cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(eng);
         Assert.Equal("Engineering", eng.Department);
     }
@@ -280,7 +280,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         await SeedEmployees(set);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => set.FirstAsync(e => e.Name == "NonExistent"));
+            () => set.FirstAsync(e => e.Name == "NonExistent", cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ───────── CountAsync with predicate ─────────
@@ -292,10 +292,10 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var engCount = await set.CountAsync(e => e.Department == "Engineering");
+        var engCount = await set.CountAsync(e => e.Department == "Engineering", cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, engCount);
 
-        var activeCount = await set.CountAsync(e => e.Active == true);
+        var activeCount = await set.CountAsync(e => e.Active == true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(4, activeCount);
     }
 
@@ -311,7 +311,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var result = await set
             .Where(e => e.Department == "Engineering")
             .Where(e => e.Active == true)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Alice", result[0].Name);
@@ -326,7 +326,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var inactive = await set.Where(e => e.Active == false).ToListAsync();
+        var inactive = await set.Where(e => e.Active == false).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(inactive);
         Assert.Equal("Carol", inactive[0].Name);
@@ -342,7 +342,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         await SeedEmployees(set);
 
         var minSalary = 100000;
-        var result = await set.Where(e => e.Salary >= minSalary).OrderBy(e => e.Id).ToListAsync();
+        var result = await set.Where(e => e.Salary >= minSalary).OrderBy(e => e.Id).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Alice", result[0].Name);
@@ -359,19 +359,19 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         await SeedEmployees(set);
 
         // Page 1: first 2
-        var page1 = await set.OrderBy(e => e.Id).Take(2).ToListAsync();
+        var page1 = await set.OrderBy(e => e.Id).Take(2).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, page1.Count);
         Assert.Equal(1L, page1[0].Id);
         Assert.Equal(2L, page1[1].Id);
 
         // Page 2: skip 2, take 2
-        var page2 = await set.OrderBy(e => e.Id).Skip(2).Take(2).ToListAsync();
+        var page2 = await set.OrderBy(e => e.Id).Skip(2).Take(2).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, page2.Count);
         Assert.Equal(3L, page2[0].Id);
         Assert.Equal(4L, page2[1].Id);
 
         // Page 3: skip 4, take 2 — only 1 remaining
-        var page3 = await set.OrderBy(e => e.Id).Skip(4).Take(2).ToListAsync();
+        var page3 = await set.OrderBy(e => e.Id).Skip(4).Take(2).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(page3);
         Assert.Equal(5L, page3[0].Id);
     }
@@ -385,7 +385,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.OrderBy(e => e.Id).Skip(100).ToListAsync();
+        var result = await set.OrderBy(e => e.Id).Skip(100).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Empty(result);
     }
 
@@ -398,7 +398,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Take(0).ToListAsync();
+        var result = await set.Take(0).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Empty(result);
     }
 
@@ -411,7 +411,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        Assert.False(await set.AnyAsync(e => e.Name == "NonExistent"));
+        Assert.False(await set.AnyAsync(e => e.Name == "NonExistent", cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ───────── UpdateAsync on non-existent entity (no-op) ─────────
@@ -424,10 +424,10 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
 
         // Update an entity that doesn't exist — should be a no-op (0 rows affected)
         var ghost = new Employee { Id = 999, Name = "Ghost", Salary = 0, Active = false };
-        await set.UpdateAsync(ghost);
+        await set.UpdateAsync(ghost, cancellationToken: TestContext.Current.CancellationToken);
 
         // Verify it wasn't inserted
-        var found = await set.GetAsync(999);
+        var found = await set.GetAsync(999, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(found);
     }
 
@@ -440,10 +440,10 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        await set.DeleteByIdAsync(999);
+        await set.DeleteByIdAsync(999, cancellationToken: TestContext.Current.CancellationToken);
 
         // Verify nothing was deleted
-        Assert.Equal(5, await set.CountAsync());
+        Assert.Equal(5, await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ───────── StreamAsync with Where filter ─────────
@@ -456,7 +456,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         await SeedEmployees(set);
 
         var names = new List<string>();
-        await foreach (var e in set.Where(e => e.Active == true).OrderBy(e => e.Name).StreamAsync())
+        await foreach (var e in set.Where(e => e.Active == true).OrderBy(e => e.Name).StreamAsync(cancellationToken: TestContext.Current.CancellationToken))
         {
             names.Add(e.Name);
         }
@@ -483,9 +483,9 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<OrderItem>();
 
-        await set.InsertAsync(new OrderItem { Id = 1, ProductName = "Widget", Quantity = 5 });
+        await set.InsertAsync(new OrderItem { Id = 1, ProductName = "Widget", Quantity = 5 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var item = await set.GetAsync(1);
+        var item = await set.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(item);
         Assert.Equal("Widget", item!.ProductName);
         Assert.Equal(5, item.Quantity);
@@ -511,7 +511,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         ctx.SqlExecuted += (_, args) => executedSql = args.Sql;
 
         var set = ctx.Set<Employee>();
-        await set.InsertAsync(new Employee { Id = 1, Name = "Test", Salary = 50000, Active = true });
+        await set.InsertAsync(new Employee { Id = 1, Name = "Test", Salary = 50000, Active = true }, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Contains("INSERT INTO", executingSql);
         Assert.Contains("employees", executingSql);
@@ -525,20 +525,20 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
     {
         using var derivedCtx = new EmployeeContext(_dbPath);
 
-        await derivedCtx.Employees.InsertAsync(new Employee { Id = 1, Name = "FromDerived", Salary = 70000, Active = true });
+        await derivedCtx.Employees.InsertAsync(new Employee { Id = 1, Name = "FromDerived", Salary = 70000, Active = true }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var emp = await derivedCtx.Employees.GetAsync(1);
+        var emp = await derivedCtx.Employees.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(emp);
         Assert.Equal("FromDerived", emp!.Name);
 
         emp.Salary = 75000;
-        await derivedCtx.Employees.UpdateAsync(emp);
+        await derivedCtx.Employees.UpdateAsync(emp, cancellationToken: TestContext.Current.CancellationToken);
 
-        var updated = await derivedCtx.Employees.GetAsync(1);
+        var updated = await derivedCtx.Employees.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(75000, updated!.Salary);
 
-        await derivedCtx.Employees.DeleteByIdAsync(1);
-        Assert.Null(await derivedCtx.Employees.GetAsync(1));
+        await derivedCtx.Employees.DeleteByIdAsync(1, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Null(await derivedCtx.Employees.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     private sealed class EmployeeContext : DecentDBContext
@@ -563,7 +563,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
                 (e.Department == "Engineering" && e.Salary > 130000) ||
                 (e.Department == "Marketing" && e.Salary < 90000))
             .OrderBy(e => e.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Bob", result[0].Name);    // Marketing, 80k
@@ -579,7 +579,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Where(e => e.Salary > 130000).ToListAsync();
+        var result = await set.Where(e => e.Salary > 130000).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Carol", result[0].Name);
@@ -598,11 +598,11 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         {
             new Employee { Id = 1, Name = "Tx1", Salary = 50000, Active = true },
             new Employee { Id = 2, Name = "Tx2", Salary = 60000, Active = true },
-        });
+        }, cancellationToken: TestContext.Current.CancellationToken);
 
         tx.Commit();
 
-        Assert.Equal(2, await set.CountAsync());
+        Assert.Equal(2, await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ───────── DeleteMany returns 0 on empty table ─────────
@@ -613,7 +613,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<Employee>();
 
-        var deleted = await set.DeleteManyAsync(e => e.Active == true);
+        var deleted = await set.DeleteManyAsync(e => e.Active == true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(0, deleted);
     }
 
@@ -625,7 +625,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<Employee>();
 
-        var result = await set.FirstOrDefaultAsync();
+        var result = await set.FirstOrDefaultAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(result);
     }
 
@@ -637,7 +637,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<Employee>();
 
-        Assert.Equal(0, await set.CountAsync());
+        Assert.Equal(0, await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ───────── Multiple Set<T> calls return same-shaped sets ─────────
@@ -650,9 +650,9 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set1 = ctx.Set<Employee>();
         var set2 = ctx.Set<Employee>();
 
-        await set1.InsertAsync(new Employee { Id = 1, Name = "ViaSet1", Salary = 50000, Active = true });
+        await set1.InsertAsync(new Employee { Id = 1, Name = "ViaSet1", Salary = 50000, Active = true }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fromSet2 = await set2.GetAsync(1);
+        var fromSet2 = await set2.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fromSet2);
         Assert.Equal("ViaSet1", fromSet2!.Name);
     }
@@ -666,7 +666,7 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
         var set = ctx.Set<Employee>();
         await SeedEmployees(set);
 
-        var result = await set.Where(e => e.Name.StartsWith("Al")).ToListAsync();
+        var result = await set.Where(e => e.Name.StartsWith("Al")).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Alice", result[0].Name);
@@ -725,14 +725,14 @@ public sealed class MicroOrmComprehensiveTests : IDisposable
 
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<TaskItem>();
-        await set.InsertAsync(new TaskItem { Id = 1, Title = "Fix bug", Priority = Priority.Critical });
-        await set.InsertAsync(new TaskItem { Id = 2, Title = "Write docs", Priority = Priority.Low });
+        await set.InsertAsync(new TaskItem { Id = 1, Title = "Fix bug", Priority = Priority.Critical }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertAsync(new TaskItem { Id = 2, Title = "Write docs", Priority = Priority.Low }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var task = await set.GetAsync(1);
+        var task = await set.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(task);
         Assert.Equal(Priority.Critical, task!.Priority);
 
-        var lowPriority = await set.GetAsync(2);
+        var lowPriority = await set.GetAsync(2, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(lowPriority);
         Assert.Equal(Priority.Low, lowPriority!.Priority);
     }

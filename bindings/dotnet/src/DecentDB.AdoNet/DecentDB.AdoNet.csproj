@@ -16,9 +16,7 @@
     <RepositoryType>git</RepositoryType>
     <RootNamespace>DecentDB.AdoNet</RootNamespace>
     <AssemblyName>DecentDB.AdoNet</AssemblyName>
-    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
-    <NoWarn>$(NoWarn);NU5128</NoWarn>
 
     <IsPackable>true</IsPackable>
   </PropertyGroup>
@@ -28,7 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" />
+    <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

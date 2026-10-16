@@ -12,7 +12,7 @@ standard JDBC temporal getters, and semantic `ENUM`, `IPADDR`, `CIDR`,
 From this directory:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 ./gradlew :driver:runCrudExample
 ```
@@ -25,7 +25,7 @@ database instead of using a temp file.
 From this directory:
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
 export PATH="$JAVA_HOME/bin:$PATH"
 ./gradlew :driver:benchmarkFetch -PbenchmarkArgs="--count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix java_bench_fetch"
 ```

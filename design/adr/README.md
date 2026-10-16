@@ -2,6 +2,7 @@
 
 This directory contains the historical and active ADRs for DecentDB.
 
+- **0218-stable-dependency-and-lts-toolchain-refresh.md**: Defines the repository-wide stable package and LTS toolchain refresh, compatibility boundaries, warning policy, and complete local/platform validation.
 - **0217-warning-free-quality-validation.md**: Defines native/WASM compile boundaries, the maintained Gungraun benchmark dependency, and deterministic pre-commit shell/JDK setup.
 
 - **0216-bun-orm-native-sql-integration.md**: Defines native Bun SQL compatibility, scoped DML aliases, contextual defaults, serial/JSON/BYTEA declarations, exact numeric literals/aggregates, and standard Go decimal interfaces.

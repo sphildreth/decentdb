@@ -10,10 +10,10 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-decentdb = { version = "2.1.0", path = "../decentdb" }
-flate2 = "1.1.9"
-getrandom = "0.3"
-serde_json = "1.0"
+decentdb = { version = "3.0.0", path = "../decentdb" }
+flate2 = "1.1.10"
+getrandom = "0.4.3"
+serde_json = "1.0.154"
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.27.0"

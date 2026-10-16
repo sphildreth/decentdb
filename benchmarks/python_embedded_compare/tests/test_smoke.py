@@ -17,7 +17,7 @@ from drivers.firebird_driver import FirebirdDriver
 _VENDOR_DIR = Path(__file__).resolve().parents[1] / "vendor"
 _HAS_FIREBIRD_JARS = all(
     (_VENDOR_DIR / j).exists()
-    for j in ("jaybird-native-6.0.4.jar", "jna-jpms-5.18.1.jar")
+    for j in ("jaybird-native-6.0.7.jar", "jna-jpms-5.19.1.jar")
 )
 _skip_no_firebird = pytest.mark.skipif(
     not _HAS_FIREBIRD_JARS,
@@ -347,8 +347,8 @@ class TestJdbcDriverConfig:
             }
         )
 
-        assert any(path.endswith("jaybird-native-6.0.4.jar") for path in driver.jar_paths)
-        assert any(path.endswith("jna-jpms-5.18.1.jar") for path in driver.jar_paths)
+        assert any(path.endswith("jaybird-native-6.0.7.jar") for path in driver.jar_paths)
+        assert any(path.endswith("jna-jpms-5.19.1.jar") for path in driver.jar_paths)
         assert driver.connection_properties["nativeLibraryPath"] == "/tmp/firebird"
         assert driver.jvm_properties["jna.library.path"] == "/tmp/firebird"
         assert driver.connection_properties["user"] == "SYSDBA"

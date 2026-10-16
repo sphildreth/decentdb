@@ -849,7 +849,7 @@ cargo build -p decentdb
 
 ```bash
 cd bindings/dotnet
-dotnet test DecentDB.NET.sln -v minimal
+dotnet test --solution DecentDB.NET.sln -v minimal
 ```
 
 ## Run the V2 benchmarks

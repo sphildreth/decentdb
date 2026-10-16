@@ -8,7 +8,6 @@ using Dapper;
 using DecentDB.AdoNet;
 using DecentDB.MicroOrm;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace DecentDB.Tests;
 

@@ -1,6 +1,6 @@
 {
   "name": "knex-decentdb",
-  "version": "2.18.0",
+  "version": "3.0.0",
   "private": true,
   "description": "Knex client/dialect for DecentDB",
   "main": "index.js",
@@ -9,9 +9,16 @@
     "benchmark:fetch": "npm --prefix ../decentdb run build --silent && node --expose-gc benchmarks/bench_fetch.js"
   },
   "peerDependencies": {
-    "knex": ">=2"
+    "knex": ">=3.3.0"
   },
   "dependencies": {
     "decentdb-native": "file:../decentdb"
-  }
+  },
+  "engines": {
+    "node": ">=24.22.0"
+  },
+  "devDependencies": {
+    "knex": "^3.3.0"
+  },
+  "packageManager": "npm@12.2.0"
 }

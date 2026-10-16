@@ -2,6 +2,7 @@
 name = "decentdb-rust-baseline"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.99.1"
 license = "Apache-2.0"
 publish = false
 
@@ -33,13 +34,13 @@ comparisons = ["sqlite", "duckdb", "extended-suites"]
 
 [dependencies]
 decentdb = { path = "../../crates/decentdb", default-features = false }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"], optional = true }
-anyhow = "1"
-sha2 = "0.10"
-rusqlite = { version = "0.31", optional = true }
-duckdb = { version = "1.0", features = ["bundled"], optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+clap = { version = "4.6.7", default-features = false, features = ["derive", "error-context", "help", "std", "usage"], optional = true }
+anyhow = "1.0.104"
+sha2 = "0.11.1"
+rusqlite = { version = "0.40.2", optional = true }
+duckdb = { version = "1.10506.0", features = ["bundled"], optional = true }
 
 [profile.release]
 opt-level = 3
@@ -56,3 +57,6 @@ strip = "symbols"
 inherits = "release"
 debug = true
 strip = "none"
+
+# Keep this benchmark workspace independent when checked out inside another workspace.
+[workspace]

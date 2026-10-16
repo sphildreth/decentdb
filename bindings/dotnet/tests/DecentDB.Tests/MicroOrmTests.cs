@@ -97,38 +97,38 @@ public sealed class MicroOrmTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
-        await persons.InsertAsync(new Person { Id = 1, Name = "Alice", Age = 30 });
-        await persons.InsertAsync(new Person { Id = 2, Name = "Bob", Age = 17 });
-        await persons.InsertAsync(new Person { Id = 3, Name = "Ann", Age = 22 });
+        await persons.InsertAsync(new Person { Id = 1, Name = "Alice", Age = 30 }, cancellationToken: TestContext.Current.CancellationToken);
+        await persons.InsertAsync(new Person { Id = 2, Name = "Bob", Age = 17 }, cancellationToken: TestContext.Current.CancellationToken);
+        await persons.InsertAsync(new Person { Id = 3, Name = "Ann", Age = 22 }, cancellationToken: TestContext.Current.CancellationToken);
 
         var adultsStartingWithA = await persons
             .Where(p => p.Age >= 18 && p.Name.StartsWith("A"))
             .OrderBy(p => p.Id)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, adultsStartingWithA.Count);
         Assert.Equal(1L, adultsStartingWithA[0].Id);
         Assert.Equal(3L, adultsStartingWithA[1].Id);
 
-        var countAdults = await persons.Where(p => p.Age >= 18).CountAsync();
+        var countAdults = await persons.Where(p => p.Age >= 18).CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, countAdults);
 
-        var secondById = await persons.OrderBy(p => p.Id).Skip(1).Take(1).FirstAsync();
+        var secondById = await persons.OrderBy(p => p.Id).Skip(1).Take(1).FirstAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2L, secondById.Id);
 
-        var alice = await persons.GetAsync(1);
+        var alice = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(alice);
         Assert.Equal("Alice", alice!.Name);
 
         alice.Age = 31;
-        await persons.UpdateAsync(alice);
+        await persons.UpdateAsync(alice, cancellationToken: TestContext.Current.CancellationToken);
 
-        var alice2 = await persons.GetAsync(1);
+        var alice2 = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(alice2);
         Assert.Equal(31, alice2!.Age);
 
-        await persons.DeleteByIdAsync(2);
-        var bob = await persons.GetAsync(2);
+        await persons.DeleteByIdAsync(2, cancellationToken: TestContext.Current.CancellationToken);
+        var bob = await persons.GetAsync(2, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(bob);
     }
 
@@ -138,24 +138,24 @@ public sealed class MicroOrmTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
-        Assert.False(await persons.AnyAsync());
+        Assert.False(await persons.AnyAsync(cancellationToken: TestContext.Current.CancellationToken));
 
         await persons.InsertManyAsync(new[]
         {
             new Person { Id = 10, Name = "A", Age = 1 },
             new Person { Id = 11, Name = "B", Age = 2 },
             new Person { Id = 12, Name = "C", Age = 3 },
-        });
+        }, cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.True(await persons.AnyAsync());
+        Assert.True(await persons.AnyAsync(cancellationToken: TestContext.Current.CancellationToken));
 
-        var b = await persons.Where(p => p.Name == "B").SingleAsync();
+        var b = await persons.Where(p => p.Name == "B").SingleAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(11, b.Id);
 
-        var deleted = await persons.DeleteManyAsync(p => p.Age >= 2);
+        var deleted = await persons.DeleteManyAsync(p => p.Age >= 2, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, deleted);
 
-        var remaining = await persons.OrderBy(p => p.Id).ToListAsync();
+        var remaining = await persons.OrderBy(p => p.Id).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(remaining);
         Assert.Equal(10, remaining[0].Id);
     }
@@ -171,7 +171,7 @@ public sealed class MicroOrmTests : IDisposable
             new Person { Id = 1, Name = "A", Age = 10 },
             new Person { Id = 2, Name = "B", Age = 20 },
             new Person { Id = 3, Name = "C", Age = 30 },
-        });
+        }, cancellationToken: TestContext.Current.CancellationToken);
 
         IQueryable<Person> q = persons;
 
@@ -204,10 +204,10 @@ public sealed class MicroOrmTests : IDisposable
             new Person { Id = 1, Name = "A", Age = 10 },
             new Person { Id = 2, Name = "B", Age = 20 },
             new Person { Id = 3, Name = "C", Age = 30 },
-        });
+        }, cancellationToken: TestContext.Current.CancellationToken);
 
         var ids = new List<long>();
-        await foreach (var p in persons.OrderBy(p => p.Id).StreamAsync())
+        await foreach (var p in persons.OrderBy(p => p.Id).StreamAsync(cancellationToken: TestContext.Current.CancellationToken))
         {
             ids.Add(p.Id);
         }
@@ -237,9 +237,9 @@ public sealed class MicroOrmTests : IDisposable
             Ignored = "ignored"
         };
 
-        await set.InsertAsync(ok);
+        await set.InsertAsync(ok, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(1);
+        var fetched = await set.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Ann", fetched!.Name);
         Assert.Equal("ok", fetched.NotNullable);
@@ -252,7 +252,7 @@ public sealed class MicroOrmTests : IDisposable
             NotNullable = null!
         };
 
-        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(badNull));
+        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(badNull, cancellationToken: TestContext.Current.CancellationToken));
 
         var tooLong = new CustomPerson
         {
@@ -261,7 +261,7 @@ public sealed class MicroOrmTests : IDisposable
             NotNullable = "ok"
         };
 
-        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(tooLong));
+        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(tooLong, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -305,9 +305,9 @@ public sealed class MicroOrmTests : IDisposable
             BlobVal = blob
         };
 
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(100);
+        var fetched = await set.GetAsync(100, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Hello World", fetched!.TextVal);
         Assert.Equal(42, fetched.IntVal);
@@ -320,9 +320,9 @@ public sealed class MicroOrmTests : IDisposable
         // Test updating boolean and decimal
         fetched.BoolVal = false;
         fetched.DecVal = 999.99000m;
-        await set.UpdateAsync(fetched);
+        await set.UpdateAsync(fetched, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched2 = await set.GetAsync(100);
+        var fetched2 = await set.GetAsync(100, cancellationToken: TestContext.Current.CancellationToken);
         Assert.False(fetched2!.BoolVal);
         Assert.Equal(999.99000m, fetched2.DecVal);
     }
@@ -362,7 +362,7 @@ public sealed class MicroOrmTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var viewSet = ctx.Set<ItemView>();
 
-        var items = await viewSet.OrderBy(x => x.Id).ToListAsync();
+        var items = await viewSet.OrderBy(x => x.Id).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, items.Count);
         Assert.Equal(2, items[0].Id);

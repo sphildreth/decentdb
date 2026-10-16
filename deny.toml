@@ -15,6 +15,8 @@ allow = [
     "MIT",
     "BSD-3-Clause",
     "ISC",
+    # LLVM libFuzzer, included by the independent fuzz workspace.
+    "NCSA",
     "Zlib",
     "Unicode-3.0",
     "BSL-1.0",

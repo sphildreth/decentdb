@@ -47,13 +47,13 @@ public class InsertManyReturningTests : IDisposable
             new AutoPkEntity { Name = "C" },
         };
 
-        await set.InsertManyReturningAsync(entities);
+        await set.InsertManyReturningAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(1, entities[0].Id);
         Assert.Equal(2, entities[1].Id);
         Assert.Equal(3, entities[2].Id);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(3, result.Count);
     }
 
@@ -67,13 +67,13 @@ public class InsertManyReturningTests : IDisposable
             .Select(i => new AutoPkEntity { Name = $"r{i}" })
             .ToList();
 
-        await set.InsertManyReturningAsync(entities);
+        await set.InsertManyReturningAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.True(entities.All(e => e.Id > 0));
         var ids = entities.Select(e => e.Id).ToList();
         Assert.Equal(ids.Count, ids.Distinct().Count());
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(257, result.Count);
     }
 
@@ -99,9 +99,9 @@ public class InsertManyReturningTests : IDisposable
         };
 
         await Assert.ThrowsAnyAsync<Exception>(async () =>
-            await set.InsertManyReturningAsync(entities));
+            await set.InsertManyReturningAsync(entities, cancellationToken: TestContext.Current.CancellationToken));
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(result);
         Assert.Equal("dup", result[0].Name);
     }
@@ -118,7 +118,7 @@ public class InsertManyReturningTests : IDisposable
         };
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            set.InsertManyReturningAsync(entities));
+            set.InsertManyReturningAsync(entities, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     private class AutoPkEntity

@@ -162,6 +162,7 @@ GitHub Releases publish native archives for:
 - `decentdb-<tag>-Linux-x64.tar.gz`
 - `decentdb-<tag>-Linux-arm64.tar.gz` — for 64-bit Raspberry Pi OS on Raspberry Pi 3/4/5 and other aarch64 Linux systems
 - `decentdb-<tag>-macOS-x64.tar.gz`
+- `decentdb-<tag>-macOS-arm64.tar.gz`
 - `decentdb-<tag>-Windows-x64.zip`
 
 Each archive contains the DecentDB CLI plus the native C API library. Extract the archive and add

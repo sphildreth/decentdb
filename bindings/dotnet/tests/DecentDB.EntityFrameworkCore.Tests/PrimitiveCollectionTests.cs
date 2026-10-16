@@ -28,7 +28,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
         var result = await context.Albums
             .Where(a => a.Genres != null && a.Genres.Length > 0)
             .Select(a => a.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Contains("Rock Album", result);
@@ -45,7 +45,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
             .Where(a => a.Genres != null && a.Genres.Length > 0)
             .OrderBy(a => a.Name)
             .Select(a => a.Genres)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, genres.Count);
         Assert.NotNull(genres[0]);
@@ -58,10 +58,10 @@ public sealed class PrimitiveCollectionTests : IDisposable
         SeedData();
         await using var context = CreateContext();
 
-        var allAlbums = await context.Albums.CountAsync();
+        var allAlbums = await context.Albums.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         var withGenres = await context.Albums
             .Where(a => a.Genres != null && a.Genres.Length > 0)
-            .CountAsync();
+            .CountAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, allAlbums);
         Assert.Equal(2, withGenres);
@@ -75,7 +75,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
 
         var withGenres = await context.Albums
             .Where(a => a.Genres != null && a.Genres.Length > 0)
-            .CountAsync();
+            .CountAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(1, withGenres);
     }
@@ -90,7 +90,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
             .Where(a => a.Genres != null && a.Genres.Length > 0)
             .OrderBy(a => a.Name)
             .Select(a => a.Genres![0])
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, firstGenres.Count);
         Assert.Equal("Jazz", firstGenres[0]);
@@ -106,7 +106,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
         var firstGenres = await context.Albums
             .OrderBy(a => a.Name)
             .Select(a => a.Genres != null && a.Genres.Length > 0 ? a.Genres[0] : "Unknown")
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, firstGenres.Count);
         Assert.Equal("Jazz", firstGenres[0]);
@@ -123,7 +123,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
         var result = await context.Albums
             .Where(a => a.Genres != null && a.Genres.Contains("Rock"))
             .Select(a => a.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Single(result);
         Assert.Equal("Rock Album", result[0]);
@@ -139,7 +139,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
             .Where(a => a.Genres != null && a.Genres.Contains("Blues"))
             .OrderBy(a => a.Name)
             .Select(a => a.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result.Count);
         Assert.Equal("Blues Album", result[0]);
@@ -156,7 +156,7 @@ public sealed class PrimitiveCollectionTests : IDisposable
             .AsNoTracking()
             .Where(a => a.Genres != null && a.Genres.Length > 0)
             .Select(a => a.Genres)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         var uniqueGenres = albumGenres
             .Where(g => g != null)

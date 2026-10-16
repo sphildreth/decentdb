@@ -3,40 +3,41 @@ plugins {
 }
 
 group = 'org.jkiss.dbeaver.ext'
-version = '2.18.0'
+version = '3.0.0'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.compilerArgs.addAll(['-Xlint:all', '-Werror'])
+}
+
 repositories {
     mavenCentral()
 }
 
+// Resolve the host SDK during configuration, before task execution.
+def candidateDirs = []
+def configuredDir = providers.gradleProperty('dbeaverPluginDir').orNull ?:
+    providers.environmentVariable('DBEAVER_PLUGIN_DIR').orNull
+if (configuredDir != null) candidateDirs << file(configuredDir)
+candidateDirs << new File('/usr/lib/dbeaver/plugins')
+candidateDirs << new File('/usr/share/dbeaver/plugins')
+def dbeaverPluginDir = candidateDirs.find { it.exists() && it.isDirectory() }
+
 dependencies {
-    // Embed the DecentDB JDBC driver + its runtime deps into this bundle.
     implementation project(':driver')
-
-    // DBeaver OSGi bundles – compile-only (provided at runtime by the DBeaver platform).
-    def dbeaverPluginDirProp = project.findProperty('dbeaverPluginDir')
-    def dbeaverPluginDirEnv = System.getenv('DBEAVER_PLUGIN_DIR')
-
-    def candidateDirs = []
-    if (dbeaverPluginDirProp != null) candidateDirs << new File(dbeaverPluginDirProp.toString())
-    if (dbeaverPluginDirEnv != null) candidateDirs << new File(dbeaverPluginDirEnv)
-    candidateDirs << new File('/usr/lib/dbeaver/plugins')
-    candidateDirs << new File('/usr/share/dbeaver/plugins')
-
-    ext.dbeaverPluginDir = candidateDirs.find { it.exists() && it.isDirectory() }
-    if (ext.dbeaverPluginDir != null) {
-        compileOnly fileTree(ext.dbeaverPluginDir) { include '*.jar' }
+    if (dbeaverPluginDir != null) {
+        compileOnly fileTree(dbeaverPluginDir) { include '*.jar' }
     }
 }
 
 tasks.named('compileJava') {
     doFirst {
-        if (project.ext.dbeaverPluginDir == null) {
+        if (dbeaverPluginDir == null) {
             throw new GradleException("DBeaver plugin directory not found. Set -PdbeaverPluginDir=... (or DBEAVER_PLUGIN_DIR) to a folder containing DBeaver's *.jar bundles.")
         }
     }

@@ -65,7 +65,7 @@ public sealed class CommonAdoNetRegressionTests : IDisposable
     [Fact]
     public async Task VacuumAtomicAsync_RejectsBlankPath_AndCleansTempOnCliFailure()
     {
-        await Assert.ThrowsAsync<ArgumentException>(() => DecentDBMaintenance.VacuumAtomicAsync(" "));
+        await Assert.ThrowsAsync<ArgumentException>(() => DecentDBMaintenance.VacuumAtomicAsync(" ", cancellationToken: TestContext.Current.CancellationToken));
 
         using (var connection = new DecentDBConnection($"Data Source={_dbPath}"))
         {
@@ -80,7 +80,7 @@ public sealed class CommonAdoNetRegressionTests : IDisposable
             : CreateFailingCliScript();
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => DecentDBMaintenance.VacuumAtomicAsync(_dbPath, failingCliPath));
+            () => DecentDBMaintenance.VacuumAtomicAsync(_dbPath, failingCliPath, cancellationToken: TestContext.Current.CancellationToken));
 
         Assert.Contains("Vacuum", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.False(File.Exists(_dbPath + ".vacuum_tmp"));

@@ -4,6 +4,9 @@ import java.sql.SQLException;
 
 /** SQLException carrying DecentDB's structured diagnostic payload. */
 public final class DecentDBSQLException extends SQLException {
+    @java.io.Serial
+    private static final long serialVersionUID = 1L;
+
     private final DecentDBDiagnostic diagnostic;
 
     DecentDBSQLException(

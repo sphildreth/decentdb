@@ -16,7 +16,7 @@ ordinary Bun model tags and APIs, with all PostgreSQL dialect features enabled.
 
 ## Run
 
-You need Rust, Go 1.25.5 or newer, cgo enabled, and a C compiler. Build the native
+You need Rust, Go 1.27.2 or newer, cgo enabled, and a C compiler. Build the native
 library from this checkout, then run from the example directory:
 
 ```bash

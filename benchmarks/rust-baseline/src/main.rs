@@ -205,6 +205,14 @@ impl BenchmarkEngine {
     }
 }
 
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
 fn validate_engine_profile(cli: &Cli) -> anyhow::Result<()> {
     #[cfg(feature = "sqlite")]
     if cli.sqlite_profile.is_some() && cli.engine != BenchmarkEngine::Sqlite {
@@ -1019,7 +1027,7 @@ fn semantic_checksum(rows: &SemanticRows) -> String {
     for digest in row_digests {
         hasher.update(digest);
     }
-    format!("{:x}", hasher.finalize())
+    lower_hex(&hasher.finalize())
 }
 
 fn semantic_int(row: &[SemanticValue], index: usize, label: &str) -> Result<i64, String> {
@@ -1560,7 +1568,7 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
         }
         hasher.update(&buffer[..bytes_read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 fn finalize_runner_provenance(report: &mut RunReport, seed: u64) -> anyhow::Result<()> {
@@ -3250,7 +3258,7 @@ fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<ReportInput>> {
             let path = results_dir.join(relative_path);
             let json = fs::read(&path)
                 .with_context(|| format!("failed to read manifested result {}", path.display()))?;
-            let actual_sha256 = format!("{:x}", Sha256::digest(&json));
+            let actual_sha256 = lower_hex(&Sha256::digest(&json));
             if actual_sha256 != entry.sha256.to_ascii_lowercase() {
                 bail!(
                     "SHA-256 mismatch for manifested result {}: expected {}, found {}",
@@ -7179,7 +7187,7 @@ mod tests {
         // skipped with a warning instead of taking down the whole report.
         std::fs::write(directory.path().join(junk_name), b"not json").expect("write junk run");
 
-        let accepted_sha256 = format!("{:x}", Sha256::digest(&accepted_json));
+        let accepted_sha256 = super::lower_hex(&Sha256::digest(&accepted_json));
         let manifest = serde_json::json!({
             "schema_version": 1,
             "files": [{"path": accepted_name, "sha256": accepted_sha256}],

@@ -21,11 +21,11 @@ public sealed class SyncSdkTests
             connection.Open();
             ExecuteNonQuery(connection, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)");
 
-            var status = await connection.Sync.InitializeReplicaAsync("node-a");
+            var status = await connection.Sync.InitializeReplicaAsync("node-a", cancellationToken: TestContext.Current.CancellationToken);
             Assert.True(status.Enabled);
             Assert.Equal("node-a", status.ReplicaId);
 
-            status = await connection.Sync.GetStatusAsync();
+            status = await connection.Sync.GetStatusAsync(cancellationToken: TestContext.Current.CancellationToken);
             Assert.True(status.Enabled);
             Assert.Equal("node-a", status.ReplicaId);
 
@@ -34,10 +34,10 @@ public sealed class SyncSdkTests
                 Name = "central",
                 Endpoint = "https://sync.example",
                 TokenEnv = null
-            });
+            }, cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal("central", peer.Name);
 
-            var peers = await connection.Sync.ListPeersAsync();
+            var peers = await connection.Sync.ListPeersAsync(cancellationToken: TestContext.Current.CancellationToken);
             Assert.Single(peers);
 
             var scope = await connection.Sync.CreateScopeAsync(new SyncScope
@@ -45,14 +45,14 @@ public sealed class SyncSdkTests
                 Name = "tenant_42",
                 IncludeTables = new() { "items" },
                 RowFilter = null
-            });
+            }, cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal("tenant_42", scope.Name);
 
-            var binding = await connection.Sync.BindPeerScopeAsync("central", "tenant_42");
+            var binding = await connection.Sync.BindPeerScopeAsync("central", "tenant_42", cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal("central", binding.PeerName);
             Assert.Equal("tenant_42", binding.ScopeName);
 
-            var bindings = await connection.Sync.ListPeerScopeBindingsAsync();
+            var bindings = await connection.Sync.ListPeerScopeBindingsAsync(cancellationToken: TestContext.Current.CancellationToken);
             Assert.Single(bindings);
         }
         finally
@@ -70,9 +70,9 @@ public sealed class SyncSdkTests
             using var connection = new DecentDBConnection($"Data Source={dbPath}");
             connection.Open();
             ExecuteNonQuery(connection, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)");
-            await connection.Sync.InitializeReplicaAsync("node-a");
+            await connection.Sync.InitializeReplicaAsync("node-a", cancellationToken: TestContext.Current.CancellationToken);
 
-            var doctorJson = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"doctor\"}");
+            var doctorJson = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"doctor\"}", cancellationToken: TestContext.Current.CancellationToken);
             using var document = JsonDocument.Parse(doctorJson);
             Assert.True(document.RootElement.TryGetProperty("highest_severity", out var severity));
             Assert.True(severity.ValueKind == JsonValueKind.String || severity.ValueKind == JsonValueKind.Null);
@@ -98,13 +98,13 @@ public sealed class SyncSdkTests
             ExecuteNonQuery(source, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)");
             ExecuteNonQuery(target, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)");
 
-            await source.Sync.InitializeReplicaAsync("node-a");
-            await target.Sync.InitializeReplicaAsync("node-b");
+            await source.Sync.InitializeReplicaAsync("node-a", cancellationToken: TestContext.Current.CancellationToken);
+            await target.Sync.InitializeReplicaAsync("node-b", cancellationToken: TestContext.Current.CancellationToken);
 
             ExecuteNonQuery(source, "INSERT INTO items (id, name) VALUES (1, 'alpha')");
 
-            var batch = await source.Sync.ExportBatchAsync(since: 0, limit: 100);
-            var summary = await target.Sync.ImportBatchAsync(batch);
+            var batch = await source.Sync.ExportBatchAsync(since: 0, limit: 100, cancellationToken: TestContext.Current.CancellationToken);
+            var summary = await target.Sync.ImportBatchAsync(batch, cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal(1, summary.Applied);
 
             var count = ExecuteScalarLong(target, "SELECT COUNT(*) FROM items WHERE id = 1");
@@ -126,16 +126,16 @@ public sealed class SyncSdkTests
             using var connection = new DecentDBConnection($"Data Source={dbPath}");
             connection.Open();
             ExecuteNonQuery(connection, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)");
-            await connection.Sync.InitializeReplicaAsync("node-a");
+            await connection.Sync.InitializeReplicaAsync("node-a", cancellationToken: TestContext.Current.CancellationToken);
             ExecuteNonQuery(connection, "INSERT INTO items (id, name) VALUES (1, 'alpha')");
 
-            var before = await connection.Sync.GetPendingChangesAsync();
+            var before = await connection.Sync.GetPendingChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
             Assert.NotEmpty(before);
 
-            var summary = await connection.Sync.PruneAsync(through: 1, dryRun: true, allowDataLoss: true);
+            var summary = await connection.Sync.PruneAsync(through: 1, dryRun: true, allowDataLoss: true, cancellationToken: TestContext.Current.CancellationToken);
             Assert.True(summary.DryRun);
 
-            var after = await connection.Sync.GetPendingChangesAsync();
+            var after = await connection.Sync.GetPendingChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal(before.Count, after.Count);
         }
         finally

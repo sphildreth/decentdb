@@ -2,6 +2,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import sysconfig
 import uuid
 
 import pytest
@@ -237,15 +238,18 @@ def test_error_exposes_structured_diagnostic(db_path):
 
 def test_fastdecode_imports_with_native_lib_env():
     package_dir = pathlib.Path(__file__).resolve().parents[1]
-    extension_files = list(package_dir.glob("decentdb/_fastdecode*.so"))
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    extension_files = list(package_dir.glob(f"decentdb/_fastdecode*{suffix}"))
     if not extension_files:
         pytest.skip("fastdecode extension is not built")
 
     repo_root = package_dir.parents[1]
+    native_name = {"darwin": "libdecentdb.dylib", "win32": "decentdb.dll"}.get(
+        sys.platform, "libdecentdb.so"
+    )
     native_candidates = [
-        repo_root / "target" / "release" / "libdecentdb.so",
-        repo_root / "target" / "debug" / "libdecentdb.so",
-        repo_root / "build" / "libdecentdb.so",
+        repo_root / directory / native_name
+        for directory in ("target/release", "target/debug", "build")
     ]
     native_lib = next((path for path in native_candidates if path.exists()), None)
     if native_lib is None:

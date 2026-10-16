@@ -114,10 +114,10 @@ public class MicroOrmLayerTests : IDisposable
         var set = context.Set<TestEntity>();
         
         var entity = new TestEntity { Id = 1, Name = "Test Entity" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify the entity was added by querying
-        var entities = await set.ToListAsync();
+        var entities = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(entities);
         Assert.Equal("Test Entity", entities[0].Name);
     }
@@ -135,9 +135,9 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 3, Name = "Entity 3" }
         };
         
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(3, result.Count);
         Assert.Contains(result, e => e.Name == "Entity 1");
         Assert.Contains(result, e => e.Name == "Entity 2");
@@ -150,9 +150,9 @@ public class MicroOrmLayerTests : IDisposable
         using var context = new DecentDBContext(_dbPath);
         var set = context.Set<TestEntity>();
         
-        await set.InsertManyAsync(Array.Empty<TestEntity>());
+        await set.InsertManyAsync(Array.Empty<TestEntity>(), cancellationToken: TestContext.Current.CancellationToken);
         
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Empty(result);
     }
 
@@ -162,9 +162,9 @@ public class MicroOrmLayerTests : IDisposable
         using var context = new DecentDBContext(_dbPath);
         var set = context.Set<TestEntity>();
         
-        await set.InsertManyAsync(new[] { new TestEntity { Id = 42, Name = "solo" } });
+        await set.InsertManyAsync(new[] { new TestEntity { Id = 42, Name = "solo" } }, cancellationToken: TestContext.Current.CancellationToken);
         
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(result);
         Assert.Equal("solo", result[0].Name);
     }
@@ -179,9 +179,9 @@ public class MicroOrmLayerTests : IDisposable
             .Select(i => new TestEntity { Id = i, Name = $"r{i}" })
             .ToList();
         
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(257, result.Count);
     }
 
@@ -192,10 +192,10 @@ public class MicroOrmLayerTests : IDisposable
         var set = context.Set<TestEntity>();
         
         using var tx = context.BeginTransaction();
-        await set.InsertManyAsync(new[] { new TestEntity { Id = 100, Name = "tx-test" } });
+        await set.InsertManyAsync(new[] { new TestEntity { Id = 100, Name = "tx-test" } }, cancellationToken: TestContext.Current.CancellationToken);
         tx.Rollback();
         
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Empty(result);
     }
 
@@ -207,18 +207,18 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add an entity first
         var entity = new TestEntity { Id = 1, Name = "Original Name" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Query to get the entity
-        var retrieved = await set.FirstAsync();
+        var retrieved = await set.FirstAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal("Original Name", retrieved.Name);
         
         // Update the entity
         retrieved.Name = "Updated Name";
-        await set.UpdateAsync(retrieved);
+        await set.UpdateAsync(retrieved, cancellationToken: TestContext.Current.CancellationToken);
         
         // Query again to verify update
-        var updated = await set.FirstAsync();
+        var updated = await set.FirstAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal("Updated Name", updated.Name);
     }
 
@@ -230,17 +230,17 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add an entity first
         var entity = new TestEntity { Id = 1, Name = "To Be Removed" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify it was added
-        var countBefore = await set.CountAsync();
+        var countBefore = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, countBefore);
         
         // Remove the entity
-        await set.DeleteAsync(entity);
+        await set.DeleteAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify it was removed
-        var countAfter = await set.CountAsync();
+        var countAfter = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(0, countAfter);
     }
 
@@ -252,17 +252,17 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add an entity first
         var entity = new TestEntity { Id = 1, Name = "To Be Removed" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify it was added
-        var countBefore = await set.CountAsync();
+        var countBefore = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, countBefore);
         
         // Remove the entity by ID
-        await set.DeleteByIdAsync(1);
+        await set.DeleteByIdAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify it was removed
-        var countAfter = await set.CountAsync();
+        var countAfter = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(0, countAfter);
     }
 
@@ -279,18 +279,18 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 2, Name = "Entity 2" },
             new TestEntity { Id = 3, Name = "Entity 3" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify they were added
-        var countBefore = await set.CountAsync();
+        var countBefore = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(3, countBefore);
         
         // Remove entities matching a condition
-        var deletedCount = await set.DeleteManyAsync(e => e.Id <= 2);
+        var deletedCount = await set.DeleteManyAsync(e => e.Id <= 2, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, deletedCount);
         
         // Verify they were removed
-        var countAfter = await set.CountAsync();
+        var countAfter = await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, countAfter);
     }
 
@@ -302,10 +302,10 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add an entity first
         var entity = new TestEntity { Id = 1, Name = "Find Me" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Find the entity by ID
-        var found = await set.GetAsync(1);
+        var found = await set.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(found);
         Assert.Equal("Find Me", found.Name);
     }
@@ -317,7 +317,7 @@ public class MicroOrmLayerTests : IDisposable
         var set = context.Set<TestEntity>();
         
         // Try to find an entity that doesn't exist
-        var found = await set.GetAsync(999);
+        var found = await set.GetAsync(999, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(found);
     }
 
@@ -334,10 +334,10 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 2, Name = "Banana" },
             new TestEntity { Id = 3, Name = "Cherry" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Query with where clause
-        var result = await set.Where(e => e.Name.StartsWith("A")).ToListAsync();
+        var result = await set.Where(e => e.Name.StartsWith("A")).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(result);
         Assert.Equal("Apple", result[0].Name);
     }
@@ -350,14 +350,14 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add an entity
         var entity = new TestEntity { Id = 1, Name = "First Entity" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Test First
-        var first = await set.FirstAsync();
+        var first = await set.FirstAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal("First Entity", first.Name);
         
         // Test FirstOrDefault on empty condition
-        var none = await set.FirstOrDefaultAsync(e => e.Name == "Nonexistent");
+        var none = await set.FirstOrDefaultAsync(e => e.Name == "Nonexistent", cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(none);
     }
 
@@ -374,9 +374,9 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 2, Name = "Entity 2" },
             new TestEntity { Id = 3, Name = "Entity 3" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
-        Assert.Equal(3, await set.CountAsync());
+        Assert.Equal(3, await set.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -386,16 +386,16 @@ public class MicroOrmLayerTests : IDisposable
         var set = context.Set<TestEntity>();
         
         // Initially should return false
-        Assert.False(await set.AnyAsync());
+        Assert.False(await set.AnyAsync(cancellationToken: TestContext.Current.CancellationToken));
         
         // Add an entity
         var entity = new TestEntity { Id = 1, Name = "Any Test" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Should now return true
-        Assert.True(await set.AnyAsync());
-        Assert.True(await set.AnyAsync(e => e.Name == "Any Test"));
-        Assert.False(await set.AnyAsync(e => e.Name == "Nonexistent"));
+        Assert.True(await set.AnyAsync(cancellationToken: TestContext.Current.CancellationToken));
+        Assert.True(await set.AnyAsync(e => e.Name == "Any Test", cancellationToken: TestContext.Current.CancellationToken));
+        Assert.False(await set.AnyAsync(e => e.Name == "Nonexistent", cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -411,16 +411,16 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 1, Name = "Alice" },
             new TestEntity { Id = 2, Name = "Bob" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Order by name
-        var orderedByName = await set.OrderBy(e => e.Name).ToListAsync();
+        var orderedByName = await set.OrderBy(e => e.Name).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal("Alice", orderedByName[0].Name);
         Assert.Equal("Bob", orderedByName[1].Name);
         Assert.Equal("Charlie", orderedByName[2].Name);
         
         // Order by ID
-        var orderedById = await set.OrderBy(e => e.Id).ToListAsync();
+        var orderedById = await set.OrderBy(e => e.Id).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, orderedById[0].Id);
         Assert.Equal(2, orderedById[1].Id);
         Assert.Equal(3, orderedById[2].Id);
@@ -440,14 +440,14 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 3, Name = "Entity 3" },
             new TestEntity { Id = 4, Name = "Entity 4" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Take first 2
-        var taken = await set.Take(2).ToListAsync();
+        var taken = await set.Take(2).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, taken.Count);
         
         // Skip first 2, take next 2
-        var skippedAndTaken = await set.Skip(2).Take(2).ToListAsync();
+        var skippedAndTaken = await set.Skip(2).Take(2).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, skippedAndTaken.Count);
     }
 
@@ -463,10 +463,10 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 1, Name = "List Test" },
             new TestEntity { Id = 2, Name = "Array Test" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Test ToList
-        var list = await set.ToListAsync();
+        var list = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, list.Count);
     }
 
@@ -477,15 +477,15 @@ public class MicroOrmLayerTests : IDisposable
         var set = context.Set<TestEntity>();
         
         // Test with no entities
-        var single = await set.SingleOrDefaultAsync();
+        var single = await set.SingleOrDefaultAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(single);
         
         // Add one entity
         var entity = new TestEntity { Id = 1, Name = "Single Entity" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Test with one entity
-        single = await set.SingleOrDefaultAsync();
+        single = await set.SingleOrDefaultAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(single);
         Assert.Equal("Single Entity", single.Name);
     }
@@ -498,10 +498,10 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add one entity
         var entity = new TestEntity { Id = 1, Name = "Single Entity" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Test with one entity
-        var single = await set.SingleAsync();
+        var single = await set.SingleAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(single);
         Assert.Equal("Single Entity", single.Name);
     }
@@ -518,11 +518,11 @@ public class MicroOrmLayerTests : IDisposable
             new TestEntity { Id = 1, Name = "Stream Entity 1" },
             new TestEntity { Id = 2, Name = "Stream Entity 2" }
         };
-        await set.InsertManyAsync(entities);
+        await set.InsertManyAsync(entities, cancellationToken: TestContext.Current.CancellationToken);
         
         // Test streaming
         var count = 0;
-        await foreach (var item in set.StreamAsync())
+        await foreach (var item in set.StreamAsync(cancellationToken: TestContext.Current.CancellationToken))
         {
             count++;
         }
@@ -539,13 +539,13 @@ public class MicroOrmLayerTests : IDisposable
         
         // Add entity within transaction
         var entity = new TestEntity { Id = 1, Name = "In Transaction" };
-        await set.InsertAsync(entity);
+        await set.InsertAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
         
         // Commit the transaction
         transaction.Commit();
         
         // Verify entity was saved
-        var savedEntity = await set.GetAsync(1);
+        var savedEntity = await set.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(savedEntity);
         Assert.Equal("In Transaction", savedEntity.Name);
     }
@@ -563,12 +563,12 @@ public class MicroOrmLayerTests : IDisposable
         Assert.NotNull(productSet);
         
         // Add an entity to each set
-        await testSet.InsertAsync(new TestEntity { Id = 1, Name = "Test" });
-        await productSet.InsertAsync(new ProductEntity { Id = 1, Name = "Product", Price = 10.99m });
+        await testSet.InsertAsync(new TestEntity { Id = 1, Name = "Test" }, cancellationToken: TestContext.Current.CancellationToken);
+        await productSet.InsertAsync(new ProductEntity { Id = 1, Name = "Product", Price = 10.99m }, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify both sets have entities
-        Assert.Equal(1, await testSet.CountAsync());
-        Assert.Equal(1, await productSet.CountAsync());
+        Assert.Equal(1, await testSet.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(1, await productSet.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // Test entity classes

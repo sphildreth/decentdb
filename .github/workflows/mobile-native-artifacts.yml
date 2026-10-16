@@ -1,9 +1,13 @@
 name: Mobile Native Artifacts
 
 on:
+  pull_request:
   workflow_dispatch:
   release:
     types: [published]
+
+permissions:
+  contents: read
 
 jobs:
   flutter-package:
@@ -11,12 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Flutter SDK
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
+          flutter-version: "3.47.7"
 
       - name: Analyze Dart package
         run: |
@@ -31,12 +36,22 @@ jobs:
           flutter analyze
           flutter test
 
+      - name: Analyze Flutter example
+        working-directory: bindings/dart/flutter/example
+        run: flutter pub get && flutter analyze
+
   android:
     name: Android mobile artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Java 25 LTS
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
 
       - name: Set artifact root
         run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/android" >> "$GITHUB_ENV"
@@ -45,13 +60,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Flutter SDK
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
+          flutter-version: "3.47.7"
 
       - name: Prepare Android targets
         run: |
           rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Install Android NDK r30 LTS and platform SDK
+        run: |
+          sdkmanager "ndk;30.0.16248370" "platforms;android-37"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
       - name: Build Android artifacts
         run: |
@@ -68,6 +89,13 @@ jobs:
             --platform android \
             --artifact-root "$MOBILE_ARTIFACT_ROOT" \
             --strict
+
+      - name: Build Flutter Android example
+        run: |
+          bash bindings/dart/scripts/install_mobile_artifacts.sh --android-root "$MOBILE_ARTIFACT_ROOT"
+          cd bindings/dart/flutter/example
+          flutter create --platforms=android --project-name decentdb_flutter_example --no-pub .
+          flutter build apk --debug --target-platform android-arm64,android-x64
 
       - name: Record Android guardrails
         run: |
@@ -100,7 +128,7 @@ jobs:
           zip -r "$ARTIFACT_PATH" .
 
       - name: Upload Android artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT_PATH }}
@@ -111,7 +139,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set artifact root
         run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/ios" >> "$GITHUB_ENV"
@@ -120,9 +148,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Flutter SDK
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
+          flutter-version: "3.47.7"
 
       - name: Prepare iOS targets
         run: |
@@ -143,6 +172,13 @@ jobs:
             --platform ios \
             --artifact-root "$MOBILE_ARTIFACT_ROOT" \
             --strict
+
+      - name: Build Flutter iOS example
+        run: |
+          bash bindings/dart/scripts/install_mobile_artifacts.sh --ios-root "$MOBILE_ARTIFACT_ROOT"
+          cd bindings/dart/flutter/example
+          flutter create --platforms=ios --project-name decentdb_flutter_example --no-pub .
+          flutter build ios --release --no-codesign
 
       - name: Record iOS guardrails
         run: |
@@ -175,7 +211,7 @@ jobs:
           zip -r "$ARTIFACT_PATH" .
 
       - name: Upload iOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT_PATH }}

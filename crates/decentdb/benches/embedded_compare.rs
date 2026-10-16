@@ -216,10 +216,10 @@ impl SqliteBenchmarker {
                 .unwrap();
             for i in 0..JOIN_DATASET_COUNT {
                 users
-                    .execute(rusqlite::params![i, format!("Join User {}", i)])
+                    .execute(rusqlite::params![i as i64, format!("Join User {}", i)])
                     .unwrap();
                 profiles
-                    .execute(rusqlite::params![i, format!("Bio {}", i)])
+                    .execute(rusqlite::params![i as i64, format!("Bio {}", i)])
                     .unwrap();
             }
         }
@@ -276,7 +276,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
                 .unwrap();
             let start = Instant::now();
             for i in 0..INSERT_COUNT {
-                stmt.execute(rusqlite::params![i, format!("User {}", i)])
+                stmt.execute(rusqlite::params![i as i64, format!("User {}", i)])
                     .unwrap();
             }
             start.elapsed()
@@ -292,11 +292,13 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 
         let mut stmt = conn.prepare("SELECT name FROM users WHERE id = ?").unwrap();
         let warmup_id = point_read_id(READ_COUNT / 2);
-        let _warmup: String = stmt.query_row([warmup_id], |row| row.get(0)).unwrap();
+        let _warmup: String = stmt
+            .query_row([warmup_id as i64], |row| row.get(0))
+            .unwrap();
         for i in 0..READ_COUNT {
             let id = point_read_id(i);
             let start = Instant::now();
-            let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
+            let _name: String = stmt.query_row([id as i64], |row| row.get(0)).unwrap();
             latencies.push(elapsed_nanos(start));
         }
 
@@ -315,7 +317,8 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         stmt.execute(rusqlite::params![-1, 0, 9.99]).unwrap();
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
-            stmt.execute(rusqlite::params![i, i % 100, 9.99]).unwrap();
+            stmt.execute(rusqlite::params![i as i64, (i % 100) as i64, 9.99])
+                .unwrap();
             latencies.push(elapsed_nanos(start));
         }
 
@@ -337,13 +340,13 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             .unwrap();
         let warmup_id = join_read_id(JOIN_COUNT / 2);
         let _warmup: (String, String) = stmt
-            .query_row([warmup_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row([warmup_id as i64], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap();
         for i in 0..JOIN_COUNT {
             let id = join_read_id(i);
             let start = Instant::now();
             let _row: (String, String) = stmt
-                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_row([id as i64], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap();
             latencies.push(elapsed_nanos(start));
         }
@@ -360,7 +363,9 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             .unwrap();
         let warmup = range_scan_params(RANGE_SCAN_COUNT / 2);
         let _warmup: Vec<String> = stmt
-            .query_map([warmup.0, warmup.1, warmup.2], |row| row.get(0))
+            .query_map([warmup.0 as i64, warmup.1 as i64, warmup.2 as i64], |row| {
+                row.get(0)
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -368,7 +373,9 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             let (start_id, end_id, limit) = range_scan_params(i);
             let start = Instant::now();
             let _rows: Vec<String> = stmt
-                .query_map([start_id, end_id, limit], |row| row.get(0))
+                .query_map([start_id as i64, end_id as i64, limit as i64], |row| {
+                    row.get(0)
+                })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
@@ -387,13 +394,13 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             .unwrap();
         let warmup = aggregate_user_id(AGGREGATE_COUNT / 2);
         let _warmup: (i64, f64) = stmt
-            .query_row([warmup], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row([warmup as i64], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap();
         for i in 0..AGGREGATE_COUNT {
             let user_id = aggregate_user_id(i);
             let start = Instant::now();
             let _row: (i64, f64) = stmt
-                .query_row([user_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_row([user_id as i64], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap();
             latencies.push(elapsed_nanos(start));
         }
@@ -416,7 +423,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
                 for i in 0..CONCURRENT_READS_PER_THREAD {
                     let id = point_read_id(i * thread_count + t);
                     let start = Instant::now();
-                    let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
+                    let _name: String = stmt.query_row([id as i64], |row| row.get(0)).unwrap();
                     latencies.push(elapsed_nanos(start));
                 }
                 latencies

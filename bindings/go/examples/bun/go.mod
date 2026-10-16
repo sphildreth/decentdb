@@ -1,6 +1,6 @@
 module github.com/sphildreth/decentdb/bindings/go/examples/bun
 
-go 1.25.5
+go 1.27.2
 
 require (
 	github.com/sphildreth/decentdb/bindings/go/decentdb-go v0.0.0
@@ -14,7 +14,7 @@ require (
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )
 
 replace github.com/sphildreth/decentdb/bindings/go/decentdb-go => ../../decentdb-go

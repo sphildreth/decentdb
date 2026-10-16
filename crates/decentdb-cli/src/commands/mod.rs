@@ -5045,60 +5045,57 @@ fn sync_http_post_import(
         .map_err(|error| SyncHttpError::fatal(format!("invalid import response: {error}")))
 }
 
-#[allow(clippy::result_large_err)]
 fn sync_http_get_text(url: &str, token: Option<&str>) -> Result<String, SyncHttpError> {
     sync_http_send(|| {
-        let mut request = ureq::get(url);
+        let mut request = ureq::get(url).config().http_status_as_error(false).build();
         if let Some(token) = token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         request.call()
     })
 }
 
-#[allow(clippy::result_large_err)]
 fn sync_http_post_json<T: serde::Serialize>(
     url: &str,
     token: Option<&str>,
     payload: &T,
 ) -> Result<String, SyncHttpError> {
     sync_http_send(|| {
-        let mut request = ureq::post(url);
+        let mut request = ureq::post(url).config().http_status_as_error(false).build();
         if let Some(token) = token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         request.send_json(payload)
     })
 }
 
-#[allow(clippy::result_large_err)]
 fn sync_http_send<F>(send: F) -> Result<String, SyncHttpError>
 where
-    F: FnOnce() -> std::result::Result<ureq::Response, ureq::Error>,
+    F: FnOnce() -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 {
-    match send() {
-        Ok(response) => response.into_string().map_err(|error| {
+    let mut response =
+        send().map_err(|error| SyncHttpError::retryable(format!("transport error: {error}")))?;
+    let code = response.status().as_u16();
+    if code < 400 {
+        return response.body_mut().read_to_string().map_err(|error| {
             SyncHttpError::retryable(format!("failed reading response body: {error}"))
-        }),
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            if (500..=599).contains(&code) {
-                Err(SyncHttpError::retryable(format!(
-                    "server returned {code}: {body}"
-                )))
-            } else if code == 401 || code == 403 {
-                Err(SyncHttpError::fatal(format!(
-                    "authentication failed with HTTP {code}"
-                )))
-            } else {
-                Err(SyncHttpError::fatal(format!(
-                    "server returned HTTP {code}: {body}"
-                )))
-            }
-        }
-        Err(ureq::Error::Transport(error)) => Err(SyncHttpError::retryable(format!(
-            "transport error: {error}"
-        ))),
+        });
+    }
+    // Inspect error responses ourselves so HTTP status and response bodies keep
+    // their existing retry/authentication semantics under ureq 3.
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    if (500..=599).contains(&code) {
+        Err(SyncHttpError::retryable(format!(
+            "server returned {code}: {body}"
+        )))
+    } else if code == 401 || code == 403 {
+        Err(SyncHttpError::fatal(format!(
+            "authentication failed with HTTP {code}"
+        )))
+    } else {
+        Err(SyncHttpError::fatal(format!(
+            "server returned HTTP {code}: {body}"
+        )))
     }
 }
 

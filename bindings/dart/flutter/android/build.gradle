@@ -3,18 +3,18 @@ plugins {
 }
 
 group = 'dev.decentdb.decentdb_flutter'
-version = '2.18.0'
+version = '3.0.0'
 
 android {
     namespace 'dev.decentdb.decentdb_flutter'
-    compileSdk 35
+    compileSdk 37
 
     defaultConfig {
         minSdk 26
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 }

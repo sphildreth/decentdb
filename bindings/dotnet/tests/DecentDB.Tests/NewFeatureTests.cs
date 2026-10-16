@@ -172,11 +172,11 @@ public sealed class NewFeatureTests : IDisposable
         var item = new AutoItem { Name = "First" };
         Assert.Equal(0, item.Id);
 
-        await set.InsertAsync(item);
+        await set.InsertAsync(item, cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(item.Id > 0, "Id should be auto-assigned");
 
         var item2 = new AutoItem { Name = "Second" };
-        await set.InsertAsync(item2);
+        await set.InsertAsync(item2, cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(item2.Id > item.Id, "Second id should be greater");
     }
 
@@ -189,10 +189,10 @@ public sealed class NewFeatureTests : IDisposable
         var set = ctx.Set<AutoItem>();
 
         var item = new AutoItem { Id = 42, Name = "Explicit" };
-        await set.InsertAsync(item);
+        await set.InsertAsync(item, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(42, item.Id);
 
-        var fetched = await set.GetAsync(42L);
+        var fetched = await set.GetAsync(42L, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Explicit", fetched!.Name);
     }
@@ -206,9 +206,9 @@ public sealed class NewFeatureTests : IDisposable
         var set = ctx.Set<AutoItem>();
 
         var item = new AutoItem { Name = "ReadBack" };
-        await set.InsertAsync(item);
+        await set.InsertAsync(item, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(item.Id);
+        var fetched = await set.GetAsync(item.Id, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("ReadBack", fetched!.Name);
         Assert.Equal(item.Id, fetched.Id);
@@ -293,9 +293,9 @@ public sealed class NewFeatureTests : IDisposable
         var set = ctx.Set<UpsertItem>();
 
         var item = new UpsertItem { Id = 1, Name = "Alice", Score = 100 };
-        await set.UpsertAsync(item);
+        await set.UpsertAsync(item, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(1L);
+        var fetched = await set.GetAsync(1L, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Alice", fetched!.Name);
         Assert.Equal(100, fetched.Score);
@@ -309,12 +309,12 @@ public sealed class NewFeatureTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<UpsertItem>();
 
-        await set.InsertAsync(new UpsertItem { Id = 1, Name = "Alice", Score = 100 });
+        await set.InsertAsync(new UpsertItem { Id = 1, Name = "Alice", Score = 100 }, cancellationToken: TestContext.Current.CancellationToken);
 
         // Upsert same id with updated values
-        await set.UpsertAsync(new UpsertItem { Id = 1, Name = "Alice Updated", Score = 200 });
+        await set.UpsertAsync(new UpsertItem { Id = 1, Name = "Alice Updated", Score = 200 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var all = await set.ToListAsync();
+        var all = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(all);
         Assert.Equal("Alice Updated", all[0].Name);
         Assert.Equal(200, all[0].Score);
@@ -328,9 +328,9 @@ public sealed class NewFeatureTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<UpsertItem>();
 
-        await set.InsertOrIgnoreAsync(new UpsertItem { Id = 1, Name = "Alice", Score = 100 });
+        await set.InsertOrIgnoreAsync(new UpsertItem { Id = 1, Name = "Alice", Score = 100 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(1L);
+        var fetched = await set.GetAsync(1L, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Alice", fetched!.Name);
     }
@@ -343,10 +343,10 @@ public sealed class NewFeatureTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<UpsertItem>();
 
-        await set.InsertAsync(new UpsertItem { Id = 1, Name = "Original", Score = 100 });
-        await set.InsertOrIgnoreAsync(new UpsertItem { Id = 1, Name = "Duplicate", Score = 999 });
+        await set.InsertAsync(new UpsertItem { Id = 1, Name = "Original", Score = 100 }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertOrIgnoreAsync(new UpsertItem { Id = 1, Name = "Duplicate", Score = 999 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var fetched = await set.GetAsync(1L);
+        var fetched = await set.GetAsync(1L, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(fetched);
         Assert.Equal("Original", fetched!.Name);
         Assert.Equal(100, fetched.Score);
@@ -438,10 +438,10 @@ public sealed class NewFeatureTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<ProjItem>();
 
-        await set.InsertAsync(new ProjItem { Id = 1, Name = "Alpha", Value = 10 });
-        await set.InsertAsync(new ProjItem { Id = 2, Name = "Beta", Value = 20 });
+        await set.InsertAsync(new ProjItem { Id = 1, Name = "Alpha", Value = 10 }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertAsync(new ProjItem { Id = 2, Name = "Beta", Value = 20 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var names = await set.SelectAsync(x => x.Name);
+        var names = await set.SelectAsync(x => x.Name, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, names.Count);
         Assert.Contains("Alpha", names);
         Assert.Contains("Beta", names);
@@ -455,10 +455,10 @@ public sealed class NewFeatureTests : IDisposable
         using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<ProjItem>();
 
-        await set.InsertAsync(new ProjItem { Id = 1, Name = "Alpha", Value = 10 });
-        await set.InsertAsync(new ProjItem { Id = 2, Name = "Beta", Value = 20 });
+        await set.InsertAsync(new ProjItem { Id = 1, Name = "Alpha", Value = 10 }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertAsync(new ProjItem { Id = 2, Name = "Beta", Value = 20 }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var names = await set.Where(x => x.Value > 15).SelectAsync(x => x.Name);
+        var names = await set.Where(x => x.Value > 15).SelectAsync(x => x.Name, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(names);
         Assert.Equal("Beta", names[0]);
     }

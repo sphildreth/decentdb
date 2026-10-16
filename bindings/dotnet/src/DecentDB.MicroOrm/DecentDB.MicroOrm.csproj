@@ -17,16 +17,15 @@
     <RepositoryType>git</RepositoryType>
 
     <!-- Publish as a single package that contains the managed layers + native binaries. -->
-    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
 
-    <!-- SDK-style packing infers supported TFMs from lib/<tfm>; suppress NU5128 noise. -->
-    <NoWarn>$(NoWarn);NU5128</NoWarn>
 
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
+    <!-- Both assemblies are bundled; AdoNet keeps its Native reference private. -->
+    <ProjectReference Include="..\DecentDB.AdoNet\DecentDB.AdoNet.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

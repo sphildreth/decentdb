@@ -255,7 +255,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       db.execute('ROLLBACK');
       rethrow;
     } finally {
-      insertStmt.dispose();
+      insertStmt.close();
     }
     insertWatch.stop();
     final insertSeconds = insertWatch.elapsedMicroseconds / 1000000.0;
@@ -298,7 +298,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
         }
       }
     } finally {
-      fetchmanyStmt.dispose();
+      fetchmanyStmt.close();
     }
     fetchmanyWatch.stop();
     if (fetchmanyTotal != options.count) {
@@ -325,7 +325,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
         steppedRows++;
       }
     } finally {
-      stepStmt.dispose();
+      stepStmt.close();
     }
     stepWatch.stop();
     if (steppedRows != options.count) {
@@ -343,7 +343,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
     final warmupRows =
         pointStmt.select(<Object?>[pointIds[pointIds.length ~/ 2]]);
     if (warmupRows.isEmpty) {
-      pointStmt.dispose();
+      pointStmt.close();
       throw StateError('Warmup point read missed expected row');
     }
 
@@ -352,13 +352,13 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       final started = Stopwatch()..start();
       final rows = pointStmt.select(<Object?>[pointIds[i]]);
       if (rows.isEmpty) {
-        pointStmt.dispose();
+        pointStmt.close();
         throw StateError('Point read missed id=${pointIds[i]}');
       }
       started.stop();
       pointLatenciesMs[i] = started.elapsedMicroseconds / 1000.0;
     }
-    pointStmt.dispose();
+    pointStmt.close();
 
     pointLatenciesMs.sort();
     final pointP50Ms = _percentileSorted(pointLatenciesMs, 50);
@@ -381,7 +381,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       pointP95Ms: pointP95Ms,
     );
   } finally {
-    db.dispose();
+    db.close();
     if (!options.keepDb) {
       _cleanupDbFiles(dbPath);
     }

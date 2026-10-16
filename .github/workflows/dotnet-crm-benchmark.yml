@@ -52,10 +52,10 @@ jobs:
       OUT_ROOT: ".tmp/dotnet-crm-smoke"
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: "10.0.x"
 
@@ -92,7 +92,7 @@ jobs:
           echo "Smoke validation passed: $RESULT_DIR/results.json"
 
       - name: Upload smoke artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dotnet-crm-smoke-${{ github.run_id }}
           path: .tmp/dotnet-crm-smoke
@@ -109,10 +109,10 @@ jobs:
       OUT_ROOT: .tmp/dotnet-crm-nightly
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: "10.0.x"
 
@@ -133,7 +133,7 @@ jobs:
             --run-id "nightly-${GITHUB_RUN_ID}"
 
       - name: Upload nightly artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dotnet-crm-nightly-${{ github.run_id }}
           path: .tmp/dotnet-crm-nightly
@@ -153,10 +153,10 @@ jobs:
       BASELINE_DURABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline-ado-durable || '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: "10.0.x"
 
@@ -248,7 +248,7 @@ jobs:
           fi
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dotnet-crm-release-${{ github.run_id }}
           path: .tmp/dotnet-crm-release

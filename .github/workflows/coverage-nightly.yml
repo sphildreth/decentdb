@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,18 +29,18 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov and cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
 
       - name: Generate lcov coverage report
         run: cargo cov-ci
 
       - name: Upload lcov report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: lcov-info
           path: lcov.info

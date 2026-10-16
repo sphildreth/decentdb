@@ -3,6 +3,7 @@ name = "decentdb-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+rust-version = "1.99.1"
 license = "Apache-2.0"
 
 [package.metadata]
@@ -12,7 +13,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "0.4.13"
 decentdb = { path = "../crates/decentdb", default-features = false, features = [
     "fuzz-internals",
 ] }

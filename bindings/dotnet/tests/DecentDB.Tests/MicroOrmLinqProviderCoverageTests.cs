@@ -22,7 +22,7 @@ public sealed class MicroOrmLinqProviderCoverageTests : IDisposable
             new SyncEntity { Id = 2, Name = "b", GroupId = 1 },
             new SyncEntity { Id = 3, Name = "c", GroupId = 2 },
             new SyncEntity { Id = 4, Name = "d", GroupId = 2 }
-        ]);
+        ], cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(4, set.Count());
         Assert.Equal(2L, set.LongCount(e => e.GroupId == 1));

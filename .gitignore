@@ -79,6 +79,7 @@ tests/bindings/**/*.node
 /bindings/**/*.exe
 /bindings/**/*.lib
 /bindings/**/*.so
+/bindings/**/*.pyd
 /bindings/**/*.a
 /bindings/**/*.node
 

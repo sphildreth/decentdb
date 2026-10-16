@@ -25,15 +25,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
+
+      - name: Set up Java 25 LTS
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
 
       - name: Install dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y ant
           pip install -r benchmarks/python_embedded_compare/requirements.txt
           pip install pytest
 
@@ -47,15 +54,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
+
+      - name: Set up Java 25 LTS
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
 
       - name: Install dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y ant
           pip install -r benchmarks/python_embedded_compare/requirements.txt
           pip install pytest
 
@@ -80,15 +94,22 @@ jobs:
             variant: default
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
+
+      - name: Set up Java 25 LTS
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
 
       - name: Install dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y ant
           pip install -r benchmarks/python_embedded_compare/requirements.txt
 
       - name: Create config
@@ -124,7 +145,7 @@ jobs:
             --output out/${{ matrix.engine }}-${{ matrix.variant }}
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: benchmark-results-${{ matrix.engine }}-${{ matrix.variant }}
           path: |
@@ -138,10 +159,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           path: artifacts
           pattern: benchmark-results-*
@@ -175,7 +196,7 @@ jobs:
           "
 
       - name: Upload merged results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: merged-benchmark-results
           path: benchmarks/python_embedded_compare/out/results_merged.json

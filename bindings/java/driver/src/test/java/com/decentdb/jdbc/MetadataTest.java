@@ -92,7 +92,12 @@ class MetadataTest {
         assumeNative();
         DatabaseMetaData meta = connection.getMetaData();
         assertEquals("DecentDB JDBC Driver", meta.getDriverName());
-        assertEquals(1, meta.getDriverMajorVersion());
+        assertEquals(DecentDBDriver.DRIVER_MAJOR_VERSION, meta.getDriverMajorVersion());
+        assertEquals(DecentDBDriver.DRIVER_MINOR_VERSION, meta.getDriverMinorVersion());
+        assertEquals(DecentDBDriver.DRIVER_VERSION, meta.getDriverVersion());
+        String[] engineVersion = meta.getDatabaseProductVersion().split("\\.");
+        assertEquals(Integer.parseInt(engineVersion[0]), meta.getDatabaseMajorVersion());
+        assertEquals(Integer.parseInt(engineVersion[1]), meta.getDatabaseMinorVersion());
     }
 
     @Test

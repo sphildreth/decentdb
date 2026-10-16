@@ -70,10 +70,10 @@ public sealed class DecentDBContextTests : IDisposable
         }
         
         var persons = ctx.Set<TestPerson>();
-        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Test" });
+        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Test" }, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify we can query
-        var person = await persons.GetAsync(1);
+        var person = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(person);
         Assert.Equal("Test", person.Name);
     }
@@ -125,7 +125,7 @@ public sealed class DecentDBContextTests : IDisposable
         
         // Perform an operation that executes SQL
         var persons = ctx.Set<TestPerson>();
-        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Event Test" });
+        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Event Test" }, cancellationToken: TestContext.Current.CancellationToken);
         
         Assert.True(sqlExecutingFired);
         Assert.True(sqlExecutedFired);
@@ -155,9 +155,9 @@ public sealed class DecentDBContextTests : IDisposable
         
         // Verify no exception occurs when performing operations
         var persons = ctx.Set<TestPerson>();
-        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Handler Test" });
+        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Handler Test" }, cancellationToken: TestContext.Current.CancellationToken);
         
-        var person = await persons.GetAsync(1);
+        var person = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(person);
     }
 
@@ -180,10 +180,10 @@ public sealed class DecentDBContextTests : IDisposable
         
         // Insert within transaction
         var persons = ctx.Set<TestPerson>();
-        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Transaction Test" });
+        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Transaction Test" }, cancellationToken: TestContext.Current.CancellationToken);
         
         // Query within transaction
-        var person = await persons.GetAsync(1);
+        var person = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(person);
         Assert.Equal("Transaction Test", person.Name);
         
@@ -191,7 +191,7 @@ public sealed class DecentDBContextTests : IDisposable
         tx.Rollback();
         
         // Verify data was rolled back
-        var personAfterRollback = await persons.GetAsync(1);
+        var personAfterRollback = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Null(personAfterRollback);
     }
 
@@ -210,9 +210,9 @@ public sealed class DecentDBContextTests : IDisposable
         }
         
         var persons = ctx.Set<TestPerson>();
-        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Non-Pooled Test" });
+        await persons.InsertAsync(new TestPerson { Id = 1, Name = "Non-Pooled Test" }, cancellationToken: TestContext.Current.CancellationToken);
         
-        var person = await persons.GetAsync(1);
+        var person = await persons.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(person);
         Assert.Equal("Non-Pooled Test", person.Name);
     }

@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - [2026-10-16]
+
+This major release raises supported runtime and package minimums as part of the
+dependency refresh. Existing database and WAL formats and the C ABI remain
+compatible; the major bump reflects the binding and toolchain requirements.
+
+### Changed
+
+- Raised minimum versions to Rust 1.99.1, Python 3.12, Node 24.22.0,
+  Go 1.27.2, Dart 3.13.5, and Flutter 3.47.7. The Knex integration now requires
+  Knex 3.3.0 or newer. Upgrade these runtimes and dependencies before moving
+  from DecentDB 2.x to 3.0.
+- Refreshed dependencies across Rust, .NET, Python, Go, Node/web, Dart/Flutter,
+  Java, benchmarks, documentation, and GitHub Actions to stable releases, using
+  LTS Node/.NET/Java toolchains. Migrated HTTP and test APIs and refreshed all
+  tracked lockfiles without changing database/WAL formats or the C ABI.
+- Added desktop binding validation on Linux x64/arm64, Windows x64, and macOS
+  x64/arm64, plus Android/iOS Flutter example builds for pull requests.
+- Migrated .NET tests to xUnit v3 and Microsoft.Testing.Platform, and updated
+  build, test, benchmark, and documentation commands for the refreshed toolchains.
+- Expanded pre-commit validation to independent Rust workspaces, Python automation
+  and benchmark tests, standalone .NET projects, JDBC/DBeaver packaging, Java FFM,
+  Dart examples, and Flutter. Required checks now fail on missing toolchains;
+  explicit exclusions are reported as incomplete validation.
+
 ### Fixed
 
+- Added pre-commit timeouts and child-process cancellation, enforced warning
+  failures and locked dependency restores, and rejected dependency files changed
+  during validation. Benchmark comparisons are explicitly informational and
+  preserve saved baselines unless an update is requested.
+- Corrected release version propagation for the migration crate's engine
+  dependency, independent fuzz lockfile, and JDBC numeric version metadata.
+- Made JDBC structured diagnostics serializable with their SQL exceptions.
+- Corrected .NET package dependency metadata while preserving bundled managed
+  assemblies, removed obsolete warning suppressions, and resolved compiler,
+  analyzer, packaging, and deprecation warnings exposed by the updated tools.
+- Built the optional Python native decoder with the active interpreter before
+  smoke tests and verified downloaded wasm-bindgen tools against their published
+  checksums.
 - Initialized the C smoke test's copied numeric value before use and synchronized
   the bootstrap WAL race test on completed injection, fixing memory-safety
   nightly failures. C and Python Valgrind probes now share narrow exceptions for

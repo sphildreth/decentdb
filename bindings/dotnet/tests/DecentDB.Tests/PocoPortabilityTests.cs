@@ -55,9 +55,9 @@ public class PocoPortabilityTests : IDisposable
             Artist = new ArtistStub { Id = 42, Name = "Test Artist" }
         };
 
-        await set.InsertAsync(album);
+        await set.InsertAsync(album, cancellationToken: TestContext.Current.CancellationToken);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(result);
         Assert.Equal("Test Album", result[0].Title);
         Assert.Equal(42, result[0].ArtistId);
@@ -79,9 +79,9 @@ public class PocoPortabilityTests : IDisposable
             }
         };
 
-        await set.InsertAsync(artist);
+        await set.InsertAsync(artist, cancellationToken: TestContext.Current.CancellationToken);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(result);
         Assert.Equal("Test Artist", result[0].Name);
     }
@@ -99,9 +99,9 @@ public class PocoPortabilityTests : IDisposable
             new AlbumWithNavigation { Id = 3, Title = "Album 3", ArtistId = 30, Artist = new ArtistStub { Id = 30, Name = "Artist C" } },
         };
 
-        await set.InsertManyAsync(albums);
+        await set.InsertManyAsync(albums, cancellationToken: TestContext.Current.CancellationToken);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(3, result.Count);
         Assert.All(result, a => Assert.NotNull(a.Title));
     }
@@ -112,10 +112,10 @@ public class PocoPortabilityTests : IDisposable
         using var context = new DecentDBContext(_dbPath);
         var set = context.Set<EntityWithEnum>();
 
-        await set.InsertAsync(new EntityWithEnum { Id = 1, Genre = Genre.Rock });
-        await set.InsertAsync(new EntityWithEnum { Id = 2, Genre = Genre.Jazz });
+        await set.InsertAsync(new EntityWithEnum { Id = 1, Genre = Genre.Rock }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertAsync(new EntityWithEnum { Id = 2, Genre = Genre.Jazz }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, result.Count);
         Assert.Equal(Genre.Rock, result[0].Genre);
         Assert.Equal(Genre.Jazz, result[1].Genre);
@@ -127,10 +127,10 @@ public class PocoPortabilityTests : IDisposable
         using var context = new DecentDBContext(_dbPath);
         var set = context.Set<EntityWithNullableInt>();
 
-        await set.InsertAsync(new EntityWithNullableInt { Id = 1, Year = 2020 });
-        await set.InsertAsync(new EntityWithNullableInt { Id = 2, Year = null });
+        await set.InsertAsync(new EntityWithNullableInt { Id = 1, Year = 2020 }, cancellationToken: TestContext.Current.CancellationToken);
+        await set.InsertAsync(new EntityWithNullableInt { Id = 2, Year = null }, cancellationToken: TestContext.Current.CancellationToken);
 
-        var result = await set.ToListAsync();
+        var result = await set.ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(2, result.Count);
         Assert.Equal(2020, result[0].Year);
         Assert.Null(result[1].Year);

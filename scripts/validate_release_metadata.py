@@ -212,6 +212,14 @@ def validate(root: Path) -> int:
         )
         expect_regex(
             root,
+            "crates/decentdb-migrate/Cargo.toml",
+            r'^decentdb\s*=\s*\{\s*version\s*=\s*"([^"]+)"',
+            version,
+            "local engine dependency version",
+            issues,
+        )
+        expect_regex(
+            root,
             "bindings/python/pyproject.toml",
             r"^\[project\].*?^version\s*=\s*\"([^\"]+)\"",
             version,
@@ -234,6 +242,17 @@ def validate(root: Path) -> int:
             "DRIVER_VERSION",
             issues,
         )
+        if SEMVER_RE.match(version):
+            major, minor, _ = version.split(".", 2)
+            for component, expected in (("MAJOR", major), ("MINOR", minor)):
+                expect_regex(
+                    root,
+                    "bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDriver.java",
+                    rf"DRIVER_{component}_VERSION\s*=\s*([0-9]+)",
+                    expected,
+                    f"DRIVER_{component}_VERSION",
+                    issues,
+                )
         expect_regex(
             root,
             "bindings/java/dbeaver-extension/build.gradle",
@@ -367,13 +386,40 @@ def validate(root: Path) -> int:
             issues,
             package_paths=("", "../decentdb"),
         )
-        expect_cargo_lock_path_versions(
+        expect_json_version(
             root,
-            "benchmarks/rust-baseline/Cargo.lock",
+            "bindings/web/package.json",
             version,
             issues,
-            ("decentdb", "libpg_query_sys"),
+            package_paths=(),
         )
+        expect_json_version(
+            root,
+            "bindings/web/package-lock.json",
+            version,
+            issues,
+        )
+        for lockfile, packages in (
+            (
+                "Cargo.lock",
+                (
+                    "decentdb",
+                    "decentdb-benchmark",
+                    "decentdb-cli",
+                    "decentdb-migrate",
+                    "libpg_query_sys",
+                ),
+            ),
+            ("benchmarks/rust-baseline/Cargo.lock", ("decentdb", "libpg_query_sys")),
+            ("fuzz/Cargo.lock", ("decentdb", "libpg_query_sys")),
+        ):
+            expect_cargo_lock_path_versions(
+                root,
+                lockfile,
+                version,
+                issues,
+                packages,
+            )
         expect_regex(
             root,
             "docs/user-guide/benchmarks.md",

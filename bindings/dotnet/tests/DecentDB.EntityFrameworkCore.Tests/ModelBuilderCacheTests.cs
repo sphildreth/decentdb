@@ -103,7 +103,7 @@ public sealed class ModelBuilderCacheTests : IDisposable
             {
                 var model = DecentDBModelBuilder.BuildModel<TestContextA>();
                 Assert.NotNull(model);
-            });
+            }, cancellationToken: TestContext.Current.CancellationToken);
         }
         await Task.WhenAll(tasks);
     }

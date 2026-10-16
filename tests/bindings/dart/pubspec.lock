@@ -7,7 +7,7 @@ packages:
       path: "../../../bindings/dart/dart"
       relative: true
     source: path
-    version: "2.18.0"
+    version: "3.0.0"
   ffi:
     dependency: "direct main"
     description:
@@ -17,4 +17,4 @@ packages:
     source: hosted
     version: "2.2.0"
 sdks:
-  dart: ">=3.7.0 <4.0.0"
+  dart: ">=3.13.5 <4.0.0"

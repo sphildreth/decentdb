@@ -15,6 +15,7 @@ on:
           - linux-x64
           - linux-arm64
           - windows-x64
+          - macos-x64
           - macos-arm64
       run_validation:
         description: "Run the full validation suite before artifact builds"
@@ -72,6 +73,14 @@ jobs:
                   "dart_lib_name": "decentdb.dll",
               },
               {
+                  "label": "macOS x64",
+                  "runner": "macos-26-intel",
+                  "release_suffix": "macOS-x64",
+                  "java_suffix": "macOS-x64",
+                  "artifact_name": "macos-x64",
+                  "dart_lib_name": "libdecentdb.dylib",
+              },
+              {
                   "label": "macOS arm64",
                   "runner": "macos-latest",
                   "release_suffix": "macOS-arm64",
@@ -108,7 +117,7 @@ jobs:
       CI: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -117,33 +126,35 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6.0.0
         with:
           dotnet-version: "10.0.x"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.27.2"
 
       - name: Set up Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: "25"
+          node-version: "24.22.0"
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v5
+      - name: Set up Java 25
+        uses: actions/setup-java@v6.1.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "25"
 
       - name: Set up Dart
-        uses: dart-lang/setup-dart@v1
+        uses: dart-lang/setup-dart@v1.8.1
+        with:
+          sdk: "3.13.5"
 
       - name: Install docs tooling
         run: |
@@ -204,8 +215,8 @@ jobs:
         run: |
           bash tests/bindings/c/run.sh
           go run ./tests/bindings/go/smoke.go
-          javac --enable-preview --release 21 tests/bindings/java/Smoke.java
-          java --enable-preview --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
+          javac --release 25 tests/bindings/java/Smoke.java
+          java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
           bash tests/bindings/node/build.sh
           node tests/bindings/node/smoke.js
           cd tests/bindings/dart
@@ -215,7 +226,7 @@ jobs:
 
       - name: Web Binding Smoke (WASM + browser OPFS)
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.114 --locked
+          bash scripts/install_wasm_bindgen.sh 0.2.129
           cd bindings/web
           npm ci
           npm run build
@@ -264,16 +275,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v5
+      - name: Set up Java 25
+        uses: actions/setup-java@v6.1.0
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: "25"
 
       - name: Download DBeaver plugins (for compile)
         shell: bash
@@ -284,7 +295,7 @@ jobs:
           mkdir -p "$dbeaver_dir"
 
           curl -fsSL -o "$dbeaver_dir/dbeaver.zip" \
-            https://dbeaver.io/files/dbeaver-ce-latest-win32.win32.x86_64.zip
+            https://github.com/dbeaver/dbeaver/releases/download/26.2.2/dbeaver-ce-26.2.2-windows-x86_64.zip
 
           python - "$dbeaver_dir/dbeaver.zip" "$dbeaver_dir" <<'PY'
           import sys, zipfile
@@ -417,7 +428,7 @@ jobs:
         with:
           attempt_limit: 3
           attempt_delay: 10000
-          action: actions/upload-artifact@v4
+          action: actions/upload-artifact@v7.0.2
           with: |
             name: release-${{ matrix.artifact_name }}
             path: |
@@ -440,29 +451,33 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           path: artifacts
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
           prerelease: ${{ startsWith((github.event_name == 'release' && github.event.release.tag_name || github.ref_name), 'v0.') || contains((github.event_name == 'release' && github.event.release.tag_name || github.ref_name), '-rc.') }}
           files: |
             artifacts/**/decentdb-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-x64.tar.gz
             artifacts/**/decentdb-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-x64.tar.gz
             artifacts/**/decentdb-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-arm64.tar.gz
             artifacts/**/decentdb-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Windows-x64.zip
             artifacts/**/decentdb-dart-native-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-x64.tar.gz
             artifacts/**/decentdb-dart-native-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-x64.tar.gz
             artifacts/**/decentdb-dart-native-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-arm64.tar.gz
             artifacts/**/decentdb-dart-native-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Windows-x64.zip
             artifacts/**/decentdb-jdbc-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux.jar
             artifacts/**/decentdb-jdbc-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-arm64.jar
+            artifacts/**/decentdb-jdbc-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-x64.jar
             artifacts/**/decentdb-jdbc-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS.jar
             artifacts/**/decentdb-jdbc-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Windows.jar
             artifacts/**/decentdb-dbeaver-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux.zip
             artifacts/**/decentdb-dbeaver-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Linux-arm64.zip
+            artifacts/**/decentdb-dbeaver-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS-x64.zip
             artifacts/**/decentdb-dbeaver-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-macOS.zip
             artifacts/**/decentdb-dbeaver-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}-Windows.zip

@@ -45,7 +45,7 @@ class FirebirdDriver(JDBCDriver):
         self.jvm_properties = dict(config.get("jvm_properties", {}))
 
         vendor_dir = Path(__file__).resolve().parents[1] / "vendor"
-        for jar_name in ("jaybird-native-6.0.4.jar", "jna-jpms-5.18.1.jar"):
+        for jar_name in ("jaybird-native-6.0.7.jar", "jna-jpms-5.19.1.jar"):
             jar_file = vendor_dir / jar_name
             if not jar_file.exists():
                 raise FileNotFoundError(

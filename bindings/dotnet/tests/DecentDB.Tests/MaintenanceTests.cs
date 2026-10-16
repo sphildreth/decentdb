@@ -37,7 +37,7 @@ public class MaintenanceTests
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_vacuum_none_{Guid.NewGuid():N}.ddb");
         
-        var result = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, GetDecentDbCliPath());
+        var result = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, GetDecentDbCliPath(), cancellationToken: TestContext.Current.CancellationToken);
         
         Assert.False(result);
     }
@@ -64,7 +64,7 @@ public class MaintenanceTests
         {
             SeedDatabase(dbPath);
 
-            var result = await DecentDBMaintenance.CheckpointAsync(dbPath);
+            var result = await DecentDBMaintenance.CheckpointAsync(dbPath, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.DatabaseExisted);
             Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
@@ -82,7 +82,7 @@ public class MaintenanceTests
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_rebuild_indexes_none_{Guid.NewGuid():N}.ddb");
 
-        var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath);
+        var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.False(result.DatabaseExisted);
         Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
@@ -98,7 +98,7 @@ public class MaintenanceTests
         {
             SeedIndexedDatabase(dbPath);
 
-            var result = await DecentDBMaintenance.RebuildIndexAsync(dbPath, "ix_rebuild_name");
+            var result = await DecentDBMaintenance.RebuildIndexAsync(dbPath, "ix_rebuild_name", cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.DatabaseExisted);
             Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
@@ -120,7 +120,7 @@ public class MaintenanceTests
         {
             SeedIndexedDatabase(dbPath);
 
-            var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath);
+            var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.DatabaseExisted);
             Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
@@ -144,7 +144,7 @@ public class MaintenanceTests
         {
             SeedDatabase(dbPath);
 
-            var result = await DecentDBMaintenance.CompactAsync(dbPath, compactedPath);
+            var result = await DecentDBMaintenance.CompactAsync(dbPath, compactedPath, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.SourceExisted);
             Assert.True(result.SourceBytes > 0);
@@ -168,7 +168,7 @@ public class MaintenanceTests
             SeedDatabase(dbPath);
 
             await Assert.ThrowsAsync<ArgumentException>(() =>
-                DecentDBMaintenance.CompactAsync(dbPath, dbPath, overwrite: true));
+                DecentDBMaintenance.CompactAsync(dbPath, dbPath, overwrite: true, cancellationToken: TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -185,12 +185,12 @@ public class MaintenanceTests
         try
         {
             SeedDatabase(dbPath);
-            await File.WriteAllTextAsync(compactedPath + "-wal", "stale");
+            await File.WriteAllTextAsync(compactedPath + "-wal", "stale", cancellationToken: TestContext.Current.CancellationToken);
 
             await Assert.ThrowsAsync<IOException>(() =>
-                DecentDBMaintenance.CompactAsync(dbPath, compactedPath));
+                DecentDBMaintenance.CompactAsync(dbPath, compactedPath, cancellationToken: TestContext.Current.CancellationToken));
 
-            var result = await DecentDBMaintenance.CompactAsync(dbPath, compactedPath, overwrite: true);
+            var result = await DecentDBMaintenance.CompactAsync(dbPath, compactedPath, overwrite: true, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.SourceExisted);
             Assert.Equal(1L, CountRows(compactedPath));
@@ -211,7 +211,7 @@ public class MaintenanceTests
         {
             SeedDatabase(dbPath);
 
-            var result = await DecentDBMaintenance.VacuumAsync(dbPath, createBackup: true);
+            var result = await DecentDBMaintenance.VacuumAsync(dbPath, createBackup: true, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(result.DatabaseExisted);
             Assert.True(result.BackupCreated);
@@ -251,14 +251,14 @@ public class MaintenanceTests
             Assert.True(File.Exists(dbPath));
             
             // Perform vacuum without backup
-            var result = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, cliPath, createBackup: false);
+            var result = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, cliPath, createBackup: false, cancellationToken: TestContext.Current.CancellationToken);
             
             Assert.True(result);
             Assert.True(File.Exists(dbPath));
             Assert.False(File.Exists(dbPath + ".bak"));
             
             // Perform vacuum with backup
-            var resultWithBackup = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, cliPath, createBackup: true);
+            var resultWithBackup = await DecentDBMaintenance.VacuumAtomicAsync(dbPath, cliPath, createBackup: true, cancellationToken: TestContext.Current.CancellationToken);
             
             Assert.True(resultWithBackup);
             Assert.True(File.Exists(dbPath));

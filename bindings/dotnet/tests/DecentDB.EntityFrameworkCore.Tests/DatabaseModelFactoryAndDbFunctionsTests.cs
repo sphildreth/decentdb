@@ -18,7 +18,7 @@ public sealed class DatabaseModelFactoryAndDbFunctionsTests : IDisposable
         var factory = new DecentDBDatabaseModelFactory();
         var model = factory.Create($"Data Source={_dbPath}", new DatabaseModelFactoryOptions([], []));
 
-        var users = Assert.Single(model.Tables.Where(table => string.Equals(table.Name, "users", StringComparison.OrdinalIgnoreCase)));
+        var users = Assert.Single(model.Tables, table => string.Equals(table.Name, "users", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(["id", "name", "active"], users.Columns.Select(c => c.Name).ToArray());
         Assert.NotNull(users.PrimaryKey);
         Assert.Equal("id", Assert.Single(users.PrimaryKey!.Columns).Name);

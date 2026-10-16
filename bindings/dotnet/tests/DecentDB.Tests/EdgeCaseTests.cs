@@ -268,10 +268,10 @@ public class EdgeCaseTests : IDisposable
 
         // This should either throw or handle the validation appropriately
         // Since the actual validation logic is in the ORM, we'll just test insertion
-        await productSet.InsertAsync(invalidProduct);
+        await productSet.InsertAsync(invalidProduct, cancellationToken: TestContext.Current.CancellationToken);
         
         // Verify it was inserted
-        var retrieved = await productSet.GetAsync(1);
+        var retrieved = await productSet.GetAsync(1, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(retrieved);
         Assert.Equal("", retrieved.Name);
         Assert.Equal(-10m, retrieved.Price);
@@ -342,7 +342,7 @@ public class EdgeCaseTests : IDisposable
             var param = cmd.CreateParameter();
             param.Value = $"Value-{i}-{Guid.NewGuid()}";
             cmd.Parameters.Add(param);
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(cancellationToken: TestContext.Current.CancellationToken);
         }
 
         // Verify all records were inserted

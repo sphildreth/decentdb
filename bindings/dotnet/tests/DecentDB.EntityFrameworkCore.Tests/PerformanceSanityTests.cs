@@ -24,7 +24,7 @@ public sealed class PerformanceSanityTests : IDisposable
         var tracked = await context.Products
             .Where(x => x.IsActive)
             .Take(3)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotEmpty(context.ChangeTracker.Entries());
 
         context.ChangeTracker.Clear();
@@ -33,7 +33,7 @@ public sealed class PerformanceSanityTests : IDisposable
             .AsNoTracking()
             .Where(x => x.IsActive)
             .Take(3)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(3, tracked.Count);
         Assert.Equal(3, untracked.Count);
@@ -58,7 +58,7 @@ public sealed class PerformanceSanityTests : IDisposable
                 .Include(x => x.Posts)
                 .AsSplitQuery()
                 .OrderBy(x => x.Id)
-                .ToListAsync();
+                .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal(2, blogs.Count);
             Assert.Equal(2, blogs[0].Posts.Count);
@@ -83,7 +83,7 @@ public sealed class PerformanceSanityTests : IDisposable
             .ThenBy(x => x.Id)
             .Take(2)
             .Select(x => new { x.Id, x.Score })
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         var last = firstPage[^1];
 
@@ -93,7 +93,7 @@ public sealed class PerformanceSanityTests : IDisposable
             .Where(x => x.Score > last.Score || (x.Score == last.Score && x.Id > last.Id))
             .Take(2)
             .Select(x => x.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(["bravo", "alpha"], secondPage);
     }
@@ -107,7 +107,7 @@ public sealed class PerformanceSanityTests : IDisposable
         var list = await context.Products
             .OrderBy(x => x.Id)
             .Select(x => x.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         var streamed = new List<string>();
         await foreach (var name in context.Products
@@ -130,7 +130,7 @@ public sealed class PerformanceSanityTests : IDisposable
         {
             var updated = await context.Products
                 .Where(x => x.Category == "ops")
-                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Score, x => x.Score + 10));
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Score, x => x.Score + 10), cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal(2, updated);
         }
@@ -139,14 +139,14 @@ public sealed class PerformanceSanityTests : IDisposable
         {
             var deleted = await context.Products
                 .Where(x => x.Score < 100)
-                .ExecuteDeleteAsync();
+                .ExecuteDeleteAsync(cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal(1, deleted);
         }
 
         await using var verify = CreateContext();
-        Assert.Equal(3, await verify.Products.CountAsync());
-        Assert.Equal(130, await verify.Products.Where(x => x.Name == "alpha").Select(x => x.Score).SingleAsync());
+        Assert.Equal(3, await verify.Products.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(130, await verify.Products.Where(x => x.Name == "alpha").Select(x => x.Score).SingleAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     private PerformanceDbContext CreateContext()

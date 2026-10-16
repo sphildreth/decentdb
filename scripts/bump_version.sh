@@ -236,6 +236,10 @@ update "VERSION" "canonical release version"
 replace_first_in_file "Cargo.toml" '^version = ".*"$' "version = \"$VERSION\""
 update "Cargo.toml" "workspace version"
 
+migrate_manifest="crates/decentdb-migrate/Cargo.toml"
+replace_first_in_file "$migrate_manifest" '^decentdb = [{] version = "[^"]*"' "decentdb = { version = \"$VERSION\""
+update "$migrate_manifest" "local engine dependency version"
+
 # --- Python ---
 replace_first_in_file "bindings/python/pyproject.toml" '^version = ".*"$' "version = \"$VERSION\""
 update "bindings/python/pyproject.toml" "project version"
@@ -302,7 +306,12 @@ fi
 java_driver="bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDriver.java"
 if [[ -f "$java_driver" ]]; then
   replace_first_in_file "$java_driver" 'DRIVER_VERSION = "[^"]*"' "DRIVER_VERSION = \"$VERSION\""
-  update "$java_driver" "DRIVER_VERSION constant"
+  version_major="${VERSION%%.*}"
+  version_minor="${VERSION#*.}"
+  version_minor="${version_minor%%.*}"
+  replace_first_in_file "$java_driver" 'DRIVER_MAJOR_VERSION = [0-9]+' "DRIVER_MAJOR_VERSION = $version_major"
+  replace_first_in_file "$java_driver" 'DRIVER_MINOR_VERSION = [0-9]+' "DRIVER_MINOR_VERSION = $version_minor"
+  update "$java_driver" "driver version constants"
 fi
 
 # --- Java DBeaver extension ---
@@ -375,6 +384,9 @@ update "tests/bindings/dart/pubspec.lock" "local DecentDB path package version"
 # --- Secondary Rust lockfiles outside the workspace root ---
 update_cargo_lock_path_versions "benchmarks/rust-baseline/Cargo.lock" decentdb libpg_query_sys
 update "benchmarks/rust-baseline/Cargo.lock" "local workspace path package versions"
+
+update_cargo_lock_path_versions "fuzz/Cargo.lock" decentdb libpg_query_sys
+update "fuzz/Cargo.lock" "local workspace path package versions"
 
 # --- Release-facing docs and roadmap metadata ---
 update_release_text_metadata

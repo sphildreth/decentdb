@@ -277,7 +277,7 @@ public sealed class ComprehensiveCrudTests : IDisposable
     public async Task Async_InsertUpdateDeleteSelect_Works()
     {
         await using var context = CreateAllTypesContext();
-        await context.Database.EnsureCreatedAsync();
+        await context.Database.EnsureCreatedAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         var entity = new AllTypesEntity
         {
@@ -301,36 +301,36 @@ public sealed class ComprehensiveCrudTests : IDisposable
         };
 
         // AddAsync + SaveChangesAsync
-        await context.AllTypes.AddAsync(entity);
-        await context.SaveChangesAsync();
+        await context.AllTypes.AddAsync(entity, cancellationToken: TestContext.Current.CancellationToken);
+        await context.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
         var id = entity.Id;
         Assert.True(id > 0);
 
         // FirstOrDefaultAsync
-        var found = await context.AllTypes.FirstOrDefaultAsync(x => x.Id == id);
+        var found = await context.AllTypes.FirstOrDefaultAsync(x => x.Id == id, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(found);
 
         // Update + SaveChangesAsync
         found!.StringVal = "async-updated";
-        await context.SaveChangesAsync();
+        await context.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // ToListAsync
-        var list = await context.AllTypes.Where(x => x.StringVal == "async-updated").ToListAsync();
+        var list = await context.AllTypes.Where(x => x.StringVal == "async-updated").ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(list);
 
         // CountAsync
-        var count = await context.AllTypes.CountAsync();
+        var count = await context.AllTypes.CountAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(1, count);
 
         // AnyAsync
-        var any = await context.AllTypes.AnyAsync(x => x.BoolVal);
+        var any = await context.AllTypes.AnyAsync(x => x.BoolVal, cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(any);
 
         // Remove + SaveChangesAsync
         context.AllTypes.Remove(found);
-        await context.SaveChangesAsync();
+        await context.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Equal(0, await context.AllTypes.CountAsync());
+        Assert.Equal(0, await context.AllTypes.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ===============================================================
@@ -814,7 +814,7 @@ public sealed class ComprehensiveCrudTests : IDisposable
     public async Task Async_MelodeeWorkflow_InsertSearchUpdateDelete()
     {
         await using var context = CreateMelodeeContext();
-        await context.Database.EnsureCreatedAsync();
+        await context.Database.EnsureCreatedAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // AddAsync (Melodee AddArtistAsync)
         var artist = new MelodeeArtist
@@ -828,14 +828,14 @@ public sealed class ComprehensiveCrudTests : IDisposable
             }
         };
         context.Artists.Add(artist);
-        await context.SaveChangesAsync();
+        await context.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
         var id = artist.Id;
 
         // FirstOrDefaultAsync (Melodee search/lookup)
         await using var ctx2 = CreateMelodeeContext();
         var found = await ctx2.Artists
             .Include(x => x.Albums)
-            .FirstOrDefaultAsync(x => x.NameNormalized == "beatles");
+            .FirstOrDefaultAsync(x => x.NameNormalized == "beatles", cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(found);
         Assert.Single(found!.Albums);
 
@@ -843,22 +843,22 @@ public sealed class ComprehensiveCrudTests : IDisposable
         found.IsLocked = true;
         found.LastRefreshed = DateTimeOffset.UtcNow;
         found.MusicBrainzId = Guid.NewGuid();
-        await ctx2.SaveChangesAsync();
+        await ctx2.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         // ToListAsync with Where (Melodee search patterns)
         var results = await ctx2.Artists
             .Where(x => x.IsLocked == true)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.Single(results);
 
         // Delete albums then artist (Melodee DeleteArtistsAsync)
-        var albums = await ctx2.Albums.Where(a => a.ArtistId == id).ToListAsync();
+        var albums = await ctx2.Albums.Where(a => a.ArtistId == id).ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
         ctx2.Albums.RemoveRange(albums);
         ctx2.Artists.Remove(found);
-        await ctx2.SaveChangesAsync();
+        await ctx2.SaveChangesAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Equal(0, await ctx2.Artists.CountAsync());
-        Assert.Equal(0, await ctx2.Albums.CountAsync());
+        Assert.Equal(0, await ctx2.Artists.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(0, await ctx2.Albums.CountAsync(cancellationToken: TestContext.Current.CancellationToken));
     }
 
     // ===============================================================

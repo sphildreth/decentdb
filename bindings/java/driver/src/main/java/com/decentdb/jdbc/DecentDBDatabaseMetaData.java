@@ -52,10 +52,14 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public int getDriverMinorVersion() { return DecentDBDriver.DRIVER_MINOR_VERSION; }
 
     @Override
-    public int getDatabaseMajorVersion() { return 1; }
+    public int getDatabaseMajorVersion() {
+        return Integer.parseInt(getDatabaseProductVersion().split("\\.", 3)[0]);
+    }
 
     @Override
-    public int getDatabaseMinorVersion() { return DecentDBDriver.DRIVER_MINOR_VERSION; }
+    public int getDatabaseMinorVersion() {
+        return Integer.parseInt(getDatabaseProductVersion().split("\\.", 3)[1]);
+    }
 
     @Override
     public int getJDBCMajorVersion() { return 4; }

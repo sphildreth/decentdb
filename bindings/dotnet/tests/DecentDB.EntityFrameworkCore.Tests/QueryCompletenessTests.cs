@@ -62,7 +62,7 @@ public sealed class QueryCompletenessTests : IDisposable
                 .Where(x => x.Category == "ops")
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.Score, x => x.Score + 5)
-                    .SetProperty(x => x.IsArchived, true));
+                    .SetProperty(x => x.IsArchived, true), cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal(2, updated);
         }
@@ -72,7 +72,7 @@ public sealed class QueryCompletenessTests : IDisposable
             var opsRows = await verifyUpdate.QueryProducts
                 .Where(x => x.Category == "ops")
                 .OrderBy(x => x.Id)
-                .ToListAsync();
+                .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal([125, 110], opsRows.Select(x => x.Score).ToArray());
             Assert.All(opsRows, row => Assert.True(row.IsArchived));
@@ -82,7 +82,7 @@ public sealed class QueryCompletenessTests : IDisposable
         {
             var deleted = await deleteContext.QueryProducts
                 .Where(x => x.IsArchived)
-                .ExecuteDeleteAsync();
+                .ExecuteDeleteAsync(cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.Equal(3, deleted);
         }
@@ -91,7 +91,7 @@ public sealed class QueryCompletenessTests : IDisposable
         var remaining = await verifyDelete.QueryProducts
             .OrderBy(x => x.Id)
             .Select(x => x.Name)
-            .ToListAsync();
+            .ToListAsync(cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(["charlie"], remaining);
     }

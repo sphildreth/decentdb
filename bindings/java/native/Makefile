@@ -48,7 +48,7 @@ else
 endif
 
 CC = gcc
-CFLAGS = -O2 -Wall \
+CFLAGS = -O2 -Wall -Wextra -Werror \
     -I$(JAVA_HOME)/include \
     $(OS_INCLUDES) \
     -I.
@@ -82,7 +82,7 @@ endif
 
 all: $(OUTPUT_LIB)
 
-$(OUTPUT_LIB): decentdb_jni.c | $(BUILD_DIR)
+$(OUTPUT_LIB): decentdb_jni.c Makefile ../../../include/decentdb.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) $(PLATFORM_FLAGS) \
 	    -o $@ \
 	    decentdb_jni.c \

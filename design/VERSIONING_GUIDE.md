@@ -22,6 +22,8 @@ Pick the **highest-impact** change class in the branch:
 Examples:
 - Feature + bug fix in one branch => **Minor** (not Patch)
 - Docs + CI + packaging only => **Patch**
+- Raising supported runtime or peer-dependency minimums so existing consumers
+  are excluded => **Major**
 
 ### Public release line
 
@@ -45,6 +47,9 @@ exists in the Rust repository today.
 - `VERSION`
 - `Cargo.toml`  
   Update `[workspace.package].version`. The Rust crates inherit from the workspace version.
+- `crates/decentdb-migrate/Cargo.toml`
+  Update the local `decentdb` dependency's version requirement, including across
+  major releases.
 
 ### Python binding
 
@@ -55,6 +60,8 @@ exists in the Rust repository today.
 
 - `bindings/java/driver/build.gradle`
 - `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDriver.java`
+  Update the full version string and the numeric major/minor constants used by
+  JDBC driver and database metadata.
 - `bindings/java/dbeaver-extension/build.gradle`
 - `bindings/java/dbeaver-extension/META-INF/MANIFEST.MF`
 
@@ -109,6 +116,7 @@ package version entries (`scripts/bump_version.sh` handles both).
 ### Secondary lockfiles
 
 - `benchmarks/rust-baseline/Cargo.lock`
+- `fuzz/Cargo.lock`
   Update only the local workspace path package versions for `decentdb` and
   `libpg_query_sys`; leave third-party crate versions untouched.
 
@@ -185,6 +193,7 @@ cargo metadata --no-deps --format-version 1 >/dev/null
 rg 'OLD_VERSION|vOLD_VERSION' \
   VERSION \
   Cargo.toml \
+  crates/decentdb-migrate/Cargo.toml \
   bindings/python/pyproject.toml \
   bindings/java/driver/build.gradle \
   bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDriver.java \
@@ -208,6 +217,7 @@ rg 'OLD_VERSION|vOLD_VERSION' \
   bindings/web/package.json \
   bindings/web/package-lock.json \
   benchmarks/rust-baseline/Cargo.lock \
+  fuzz/Cargo.lock \
   docs/about/changelog.md \
   docs/user-guide/benchmarks.md \
   design/FUTURE_WINS.md \

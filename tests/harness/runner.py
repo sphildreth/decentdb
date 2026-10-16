@@ -32,6 +32,7 @@ def run_scenario(repo_root: Path, scenario_file: Path) -> int:
         command = [
             "cargo",
             "run",
+            "--locked",
             "-q",
             "-p",
             "decentdb",
