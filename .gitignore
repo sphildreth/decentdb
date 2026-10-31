@@ -116,3 +116,4 @@ benchmarks/rust-baseline/.tmp/*
 # Python packaging artifacts
 bindings/python/decentdb.egg-info/
 *.egg-info/
+.hamstik.toml
