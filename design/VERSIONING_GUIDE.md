@@ -109,9 +109,6 @@ package version entries (`scripts/bump_version.sh` handles both).
 - `docs/user-guide/benchmarks.md`
   Update the DecentDB engine version stamp when the workspace release version
   changes.
-- `design/FUTURE_WINS.md`
-  Update the current public release marker that defines the `vNext` planning
-  bucket. Historical delivered-context references stay unchanged.
 
 ### Secondary lockfiles
 
@@ -220,7 +217,6 @@ rg 'OLD_VERSION|vOLD_VERSION' \
   fuzz/Cargo.lock \
   docs/about/changelog.md \
   docs/user-guide/benchmarks.md \
-  design/FUTURE_WINS.md \
   .github/workflows/nuget.yml
 ```
 

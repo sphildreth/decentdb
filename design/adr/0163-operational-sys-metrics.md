@@ -6,7 +6,7 @@
 
 ## Context
 
-Roadmap item #2 in `design/FUTURE_WINS.md` requires built-in operational
+Roadmap item #2 in `design/HISTORY.md` requires built-in operational
 metrics for WAL state, write-queue pressure, storage state, and sync status.
 DecentDB already exposes several Rust/C ABI snapshots and legacy sync
 inspection names, but applications need a stable SQL inspection surface that

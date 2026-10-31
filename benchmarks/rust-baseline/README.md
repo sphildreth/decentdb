@@ -65,7 +65,7 @@ SQLite or DuckDB tests, dependencies, or comparison behavior to the DecentDB
 engine core.
 
 For the current cross-benchmark performance plan, see
-`../../design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`. The public README charts are
+`../../docs/user-guide/performance.md`. The public README charts are
 driven by `cargo bench -p decentdb --bench embedded_compare` and
 `data/bench_summary.json`; this rust-baseline runner is the larger diagnostic
 surface for music-library totals, point lookups, joins, views, and grouped
@@ -121,7 +121,7 @@ valid with `--engine decentdb`.
 | huge | 250,000 | 2,500,000 | 25,000,000 | Long-running stress/showcase tier; not required for every PR |
 
 Memory behavior is tracked in JSON and in
-`design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`.
+`docs/user-guide/performance.md`.
 
 The default DecentDB path links the `decentdb` crate directly (path-dep against
 `../../crates/decentdb`) and uses the engine's hot-path API:

@@ -34,7 +34,7 @@ SQLite on this workload while preserving durable ACID semantics.
   search, bulk load, and recovery latency targets.
 - `design/adr/0112-cost-based-optimizer-with-stats.md`: accepted direction for
   persisted stats, cost-based index selection, and join reordering.
-- `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`: broader plan for streaming
+- `design/HISTORY.md`: broader plan for streaming
   executor, cost-based planning, and durable commit fast paths.
 - `design/_archive/2026-06-PERF_TESTING_RESULTS.md`: prior issue-tracker benchmark
   evidence and current branch status.

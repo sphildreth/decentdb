@@ -4,9 +4,9 @@
 
 ## Context
 
-`design/FUTURE_WINS.md` tracks a Lua extension runtime and package model as the
+`design/HISTORY.md` tracks a Lua extension runtime and package model as the
 final candidate for additional 2.6.0 feature work. The companion spec,
-`design/_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`, requires a runtime dependency,
+`design/HISTORY.md`, requires a runtime dependency,
 build strategy, sandbox boundary, resource-limit model, and cross-target policy
 before implementation.
 
@@ -195,8 +195,8 @@ Implementation is not complete until tests cover:
 
 ## References
 
-- `design/FUTURE_WINS.md`
-- `design/_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0118-rust-ffi-panic-safety.md`
 - Lua 5.4 Reference Manual: https://www.lua.org/manual/5.4/
 - `mlua` crate documentation: https://docs.rs/crate/mlua/latest

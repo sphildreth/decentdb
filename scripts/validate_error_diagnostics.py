@@ -111,9 +111,6 @@ def validate(args: argparse.Namespace) -> int:
     diagnostics_page = root / "docs/user-guide/error-diagnostics.md"
     c_cpp = root / "docs/api/c-cpp.md"
     changelog = root / "docs/about/changelog.md"
-    future_wins = root / "design/FUTURE_WINS.md"
-    roadmap_phase = "Rich structured errors and developer diagnostics"
-
     if not error_codes.exists():
         issues.append("docs/api/error-codes.md is missing")
     if not diagnostics_page.exists():
@@ -159,27 +156,6 @@ def validate(args: argparse.Namespace) -> int:
             warnings.append("c-cpp docs do not reference ddb_last_error_json yet")
     else:
         issues.append("docs/api/c-cpp.md is missing")
-
-    if future_wins.exists():
-        fw_text = future_wins.read_text(encoding="utf-8")
-        fw_text_lower = fw_text.lower()
-        if roadmap_phase not in fw_text:
-            issues.append("future wins roadmap missing structured diagnostics phase")
-        status_map_index = fw_text_lower.find("## status map")
-        status_scope = fw_text[status_map_index:] if status_map_index != -1 else fw_text
-        pre_status_scope = fw_text[:status_map_index] if status_map_index != -1 else fw_text
-        if roadmap_phase.lower() in status_scope.lower():
-            warnings.append(
-                f"FUTURE_WINS still lists {roadmap_phase} after the Status Map; keep completed work only in Delivered Context"
-            )
-        if roadmap_phase.lower() not in pre_status_scope.lower():
-            warnings.append(
-                f"FUTURE_WINS missing Delivered Context entry for {roadmap_phase}"
-            )
-        if "delivered context" not in fw_text_lower:
-            warnings.append("FUTURE_WINS missing Delivered Context section")
-    else:
-        issues.append("design/FUTURE_WINS.md is missing")
 
     if not changelog.exists():
         warnings.append("docs/about/changelog.md is missing")

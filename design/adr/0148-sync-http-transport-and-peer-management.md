@@ -70,8 +70,8 @@ database HTTP server.
 
 ## References
 
-- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
 - `crates/decentdb/src/sync.rs`
 - `crates/decentdb/src/db.rs`

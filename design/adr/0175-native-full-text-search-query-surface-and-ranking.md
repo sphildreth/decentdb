@@ -122,8 +122,8 @@ quirks.
 
 ### References
 
-- `design/_archive/WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0176-full-text-search-storage-durability-and-binding-contract.md`
 - SQLite FTS5 documentation
 - DuckDB full-text search documentation

@@ -59,7 +59,7 @@ coordination is not promised.
 
 ### References
 
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
 - `docs/api/wasm.md`
 - `crates/decentdb/src/vfs/opfs.rs`
 - `crates/decentdb/src/wasm.rs`

@@ -4,9 +4,9 @@
 
 ## Context
 
-`design/FUTURE_WINS.md` priority #1 requires DecentDB sync to move from a
+`design/HISTORY.md` priority #1 requires DecentDB sync to move from a
 developer workflow into a production application platform surface. Slices 1-8
-of `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md` already provide durable
+of `design/HISTORY.md` already provide durable
 change capture, scoped sync, HTTP development transport, conflict workflows,
 retention reporting, and SDK access. The missing decision is how a production
 relay participates without turning the embedded engine into a hosted sync
@@ -196,9 +196,9 @@ Implementation is not complete until tests cover:
 
 ## References
 
-- `design/FUTURE_WINS.md` priority #1
-- `design/_archive/WIN_PRODUCTION_RELAY_SPEC.md`
-- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
+- `design/HISTORY.md` priority #1
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0148-sync-http-transport-and-peer-management.md`
 - `design/adr/0149-scoped-sync-v1.md`
 - `design/adr/0150-sync-conflict-resolution-workflows.md`

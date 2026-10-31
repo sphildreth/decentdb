@@ -200,20 +200,6 @@ updates = {
             rf"\g<1>{version}\g<2>",
         ),
     ],
-    Path("design/FUTURE_WINS.md"): [
-        (
-            r"(public release in this repository is `)[^`]+(`)",
-            rf"\g<1>{version}\g<2>",
-        ),
-        (
-            r"(planning release bucket in this repository is `)[^`]+(`)",
-            rf"\g<1>{version}\g<2>",
-        ),
-        (
-            r"(bucket after `)[^`]+(` only when scope is explicitly accepted)",
-            rf"\g<1>{version}\g<2>",
-        ),
-    ],
 }
 
 for path, replacements in updates.items():
@@ -388,10 +374,9 @@ update "benchmarks/rust-baseline/Cargo.lock" "local workspace path package versi
 update_cargo_lock_path_versions "fuzz/Cargo.lock" decentdb libpg_query_sys
 update "fuzz/Cargo.lock" "local workspace path package versions"
 
-# --- Release-facing docs and roadmap metadata ---
+# --- Release-facing docs (roadmap/backlog lives in Hamstik DDB) ---
 update_release_text_metadata
 update "docs/user-guide/benchmarks.md" "DecentDB benchmark version stamp"
-update "design/FUTURE_WINS.md" "current public release marker"
 
 # --- Regenerate Cargo.lock ---
 echo ""

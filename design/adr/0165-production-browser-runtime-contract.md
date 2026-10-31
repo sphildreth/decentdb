@@ -5,8 +5,8 @@
 ### Context
 
 ADR 0161 shipped the browser WASM/OPFS v1 runtime with one Dedicated Worker
-owner and no multi-tab coordination contract. The `WIN_PRODUCTION_BROWSER_RUNTIM`
-Future Win requires production-grade ownership, capability gating, service-worker
+owner and no multi-tab coordination contract. The retired production browser runtime design
+(indexed in `design/HISTORY.md`) requires production-grade ownership, capability gating, service-worker
 policy, diagnostics, tiered browser support, and explicit non-fallback behavior.
 
 ### Decision
@@ -83,8 +83,8 @@ DecentDB browser production runtime adopts the following contract.
 
 ### References
 
-- `design/_archive/WIN_PRODUCTION_BROWSER_RUNTIM.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0161-browser-wasm-opfs-runtime.md`
 - `docs/api/wasm.md`
 - `bindings/web/`

@@ -57,8 +57,8 @@ would make SDK integration harder to reason about, slower, and less portable.
 
 ## References
 
-- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `crates/decentdb/src/c_api.rs`
 - `crates/decentdb/src/db.rs`
 - `bindings/dotnet/src/DecentDB.Native`

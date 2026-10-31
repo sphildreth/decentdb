@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Retired the `WIN_*` and `FUTURE_WINS.md` design documents. Remaining goals,
+  design detail, and acceptance criteria now live on the Hamstik DDB work items;
+  the full retired text is attached to those items and indexed in
+  `design/HISTORY.md`.
+
 ## [3.0.0] - [2026-10-16]
 
 This major release raises supported runtime and package minimums as part of the
@@ -466,8 +473,8 @@ capabilities.
   `LIKE` projection path.
 - Archived the completed metric-improvement tracker and folded the remaining
   diagnostic rust-baseline view/fixed-overhead gaps into
-  `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`.
-- Reprioritized `design/FUTURE_WINS.md` around the next adoption-critical
+  `design/HISTORY.md`.
+- Reprioritized `design/HISTORY.md` around the next adoption-critical
   backlog: core read/query performance, cross-binding cursor parity,
   Postgres-backed local-first sync, migration workflow, Doctor/advisors, JSONB,
   hybrid search, and packaging/ORM adoption work.
@@ -907,10 +914,10 @@ capabilities.
   roadmap to delivered context; follow-on performance work is now scoped to
   measured evidence outside this completed baseline.
 - Promoted the browser Future Win from roadmap item to delivered context in
-  `design/FUTURE_WINS.md`; follow-on browser work is now scoped to measured
+  `design/HISTORY.md`; follow-on browser work is now scoped to measured
   parser breadth, security key handling, branch workflows, or performance.
 - Promoted the mobile Future Win from roadmap item to delivered context in
-  `design/FUTURE_WINS.md`; follow-on mobile work is now scoped to measured
+  `design/HISTORY.md`; follow-on mobile work is now scoped to measured
   device matrices, direct native SDKs, watch lifecycle guarantees, and key
   rotation rather than first-class Flutter package hardening.
 - Bumped the C ABI version to 7 for structured diagnostic JSON and added release

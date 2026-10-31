@@ -134,7 +134,7 @@ being silently exported.
 
 ## References
 
-- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
+- `design/HISTORY.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
 - `design/adr/0148-sync-http-transport-and-peer-management.md`
 - `design/adr/0149-scoped-sync-v1.md`

@@ -428,22 +428,9 @@ def validate(root: Path) -> int:
             "benchmark version stamp",
             issues,
         )
-        expect_regex(
-            root,
-            "design/FUTURE_WINS.md",
-            r"public release in this repository is `([^`]+)`",
-            version,
-            "current public release marker",
-            issues,
-        )
-        expect_regex(
-            root,
-            "design/FUTURE_WINS.md",
-            r"bucket after `([^`]+)` only when scope is explicitly accepted",
-            version,
-            "vNext base release marker",
-            issues,
-        )
+
+    if not (root / "design/HISTORY.md").exists():
+        issues.append("design/HISTORY.md is missing")
 
     changelog = root / "docs/about/changelog.md"
     changelog_text = read_text(changelog, issues)

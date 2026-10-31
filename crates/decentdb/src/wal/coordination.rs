@@ -1,7 +1,6 @@
 //! Cross-process WAL coordination sidecar.
 //!
-//! Implements the first native-file slice of
-//! `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`.
+//! Implements the first native-file slice; see DDB-51 and `design/HISTORY.md`.
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::collections::HashMap;

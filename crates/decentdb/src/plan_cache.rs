@@ -1,8 +1,7 @@
 //! Connection-local plan cache for parsed SQL statements and reusable
 //! prepared plan objects.
 //!
-//! This module is governed by ADRs 0190-0193 and the parent spec
-//! `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`. It implements
+//! This module is governed by ADRs 0190-0193 and DDB-46. It implements
 //! the Phase 1A slice: a generalized parsed-statement cache keyed by
 //! `(sql_text, parameter_shape, persistent_schema_cookie, temp_schema_cookie,
 //! policy_mask_generation)` with size-bounded LRU eviction, oversized-entry

@@ -194,8 +194,8 @@ safe enough to inspect without exposing application values.
 
 ### References
 
-- `design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0163-operational-sys-metrics.md`
 - `design/adr/0174-local-data-security-tde-policies-masking-audit-context.md`
 - `design/adr/0184-default-fast-planner-and-runtime-contract.md`

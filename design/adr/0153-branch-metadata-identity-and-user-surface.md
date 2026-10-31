@@ -116,5 +116,5 @@ B through ADR F.
 
 ## References
 
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
 - `design/adr/0147-local-sync-journal-foundation.md`

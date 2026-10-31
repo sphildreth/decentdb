@@ -1584,7 +1584,7 @@ Phase 8 is complete when:
 
 ### Phase 8 Completion Notes
 
-- Reviewed `design/FUTURE_WINS.md` and `design/VERSIONING_GUIDE.md`.
+- Reviewed `design/HISTORY.md` and `design/VERSIONING_GUIDE.md`.
   No release version bump was performed because this branch does not change the
   canonical `VERSION`; user-facing notes were added under
   `docs/about/changelog.md` `[Unreleased]` as required by the versioning guide.

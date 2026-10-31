@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-13
 **Status:** Accepted
-**Related spec:** [`../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
+**Related spec:** [`../HISTORY.md`](../HISTORY.md)
 **Companion ADRs:** [0190](./0190-query-plan-cache-scope-key-and-lifecycle.md), [0191](./0191-query-plan-cache-memory-accounting-and-eviction.md), [0193](./0193-query-plan-cache-c-abi-surface-and-binding-contract.md)
 
 ## Decision
@@ -249,7 +249,7 @@ promising something the engine does not promise.
 
 ## References
 
-- `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` §5.7,
+- `design/HISTORY.md` §5.7,
   §8.3, §10
 - `design/adr/0190-query-plan-cache-scope-key-and-lifecycle.md`
   (`PlanCacheInvalidator` trait)

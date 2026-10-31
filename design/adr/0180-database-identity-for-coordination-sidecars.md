@@ -76,7 +76,7 @@ format bump and migration parser rule from ADR 0131 therefore apply.
 
 ### References
 
-- `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
+- `design/HISTORY.md`
 - `design/adr/0016-database-header-checksum.md`
 - `design/adr/0131-legacy-format-migrations.md`
 - `design/adr/0177-cross-process-coordination-sidecar-and-locking.md`

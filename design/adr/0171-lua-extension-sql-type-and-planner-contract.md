@@ -264,6 +264,6 @@ Implementation is not complete until tests cover:
 
 ## References
 
-- `design/FUTURE_WINS.md`
-- `design/_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `design/adr/0111-table-valued-functions.md`

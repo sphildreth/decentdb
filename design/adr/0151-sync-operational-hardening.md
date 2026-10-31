@@ -53,8 +53,8 @@ integrity with retention and operational context.
 
 ## References
 
-- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
+- `design/HISTORY.md`
 - `crates/decentdb/src/sync.rs`
 - `crates/decentdb/src/db.rs`
 - `crates/decentdb-cli/src/commands/mod.rs`

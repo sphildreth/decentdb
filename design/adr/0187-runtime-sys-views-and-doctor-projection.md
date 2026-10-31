@@ -179,7 +179,7 @@ value is historical evidence about specific operations.
 
 ### References
 
-- `design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md`
+- `design/HISTORY.md`
 - `design/adr/0163-operational-sys-metrics.md`
 - `design/adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`
 - `design/adr/0185-rich-structured-error-diagnostics-contract.md`

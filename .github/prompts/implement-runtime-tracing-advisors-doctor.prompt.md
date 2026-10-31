@@ -1,15 +1,13 @@
 ---
 agent: agent
 name: Implement Runtime Tracing Advisors And Doctor Integration
-description: "Use when fully implementing design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md, including runtime tracing, sys.* views, advisors, Doctor integration, fix plans, tests, docs, and binding-facing surfaces."
+description: "Use when fully implementing DDB-44 (runtime tracing, advisors, and Doctor integration), including runtime tracing, sys.* views, advisors, Doctor integration, fix plans, tests, docs, and binding-facing surfaces."
 argument-hint: "Optionally name the phase, subsystem, or validation scope to start with"
 ---
 
 # Implement Runtime Tracing, Advisors, And Doctor Integration
 
-Fully implement
-[design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md](../../design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md)
-in DecentDB.
+Fully implement DDB-44 in the Hamstik DDB project. The full design is attached to that work item.
 
 This is architecture-sensitive engine work. Before editing, read the repository
 instructions and the accepted ADRs that govern this feature:

@@ -192,7 +192,7 @@ set of actions that Doctor applies automatically.
 
 ### References
 
-- `design/WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md`
+- `design/HISTORY.md`
 - `design/adr/0163-operational-sys-metrics.md`
 - `design/adr/0185-rich-structured-error-diagnostics-contract.md`
 - `docs/user-guide/doctor.md`

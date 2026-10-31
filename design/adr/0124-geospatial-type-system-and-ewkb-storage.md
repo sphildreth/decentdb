@@ -208,7 +208,7 @@ wrong persistent and ABI boundary.
 
 ## References
 
-- `design/FUTURE_WINS.md`
+- `design/HISTORY.md`
 - `design/adr/0072-new-data-types-decimal-uuid.md`
 - PostGIS geometry vs geography FAQ:
   `https://postgis.net/documentation/faq/geometry-or-geography/`
