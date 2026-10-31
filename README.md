@@ -289,6 +289,7 @@ Common commands:
 - [Releases](https://decentdb.org/development/releases/) - GitHub release workflow, asset naming, and Linux arm64 / Raspberry Pi packages
 - [Rust API](https://docs.rs/decentdb) - Embedded API documentation
 - [Architecture](https://decentdb.org/architecture/overview/) - Design and implementation details
+- [Project Management](https://decentdb.org/development/project-management/) - Hamstik ALM, roadmap, and backlog
 - [Contributing](https://decentdb.org/development/contributing/) - Development guidelines
 
 ## Architecture
@@ -303,6 +304,12 @@ DecentDB is organized into focused modules:
 - **Catalog** - Schema metadata management
 - **SQL/Planner/Exec** - Query parsing, planning, and execution
 - **Search** - Trigram substring search and native full-text search
+
+## Project Management
+
+Roadmap, backlog, issue tracking, and acceptance criteria for DecentDB are managed in the **[Hamstik project DDB](https://hamstik.com/t/sph/projects/DDB)**.
+
+Use Hamstik as the source of truth for planned work. Retired roadmap and design documents are indexed in [`design/HISTORY.md`](design/HISTORY.md).
 
 ## Development
 

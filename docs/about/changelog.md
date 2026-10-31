@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Retired the `WIN_*` and `FUTURE_WINS.md` design documents. Remaining goals,
-  design detail, and acceptance criteria now live on the Hamstik DDB work items;
-  the full retired text is attached to those items and indexed in
+- Retired the legacy roadmap and WIN design documents. Remaining goals, design
+  detail, and acceptance criteria now live on the Hamstik DDB work items; the
+  full retired text is attached to those items and indexed in
   `design/HISTORY.md`.
+- Documented Hamstik (DDB) as the project ALM, roadmap, and backlog source, with
+  links from the README, contributor guide, docs index, and design history.
 
 ## [3.0.0] - [2026-10-16]
 

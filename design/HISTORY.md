@@ -10,7 +10,7 @@ and acceptance criteria now live on Hamstik DDB work items. Full document text
 is attached to the work items listed below, and the last committed revision is
 recoverable from git history with the recorded SHA.
 
-Active roadmap and backlog: Hamstik project `DDB`.
+Active roadmap and backlog: [Hamstik project DDB](https://hamstik.com/t/sph/projects/DDB).
 
 ## Retired documents
 

@@ -7,9 +7,10 @@
 This directory holds design notes, prompts, and planning documents that are no
 longer the active source of truth but still explain useful project context.
 
-Active roadmap and backlog live in Hamstik project `DDB`. Retired
-roadmap and spec documents are indexed in `../HISTORY.md` and attached to their
-DDB work items.
+Active roadmap and backlog live in the
+[Hamstik project DDB](https://hamstik.com/t/sph/projects/DDB). Retired roadmap
+and spec documents are indexed in `../HISTORY.md` and attached to their DDB
+work items.
 
 ## Contents
 

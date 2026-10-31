@@ -19,6 +19,14 @@ DecentDB is a Rust-native embedded relational database. The goal is a world-clas
 - **The Rust borrow checker is your QA engineer.**
 - Favor boring, explicit, durable implementations over clever ones.
 
+### Backlog and ALM
+
+All planned work, bugs, and acceptance criteria live in the Hamstik project **DDB**: https://hamstik.com/t/sph/projects/DDB.
+
+- Read and update the relevant DDB work item before starting substantial work.
+- Create a DDB work item for new work instead of adding a new roadmap or WIN-style spec document.
+- `design/adr/` holds architecture decisions; `design/HISTORY.md` is only the historical index of retired roadmap/spec documents.
+
 ## 2. Monorepo boundaries
 
 | Directory | Owner |

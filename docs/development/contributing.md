@@ -15,6 +15,16 @@ If you plan to work on the CLI directly, the binary lives in
 `crates/decentdb-cli/`. If you plan to work on bindings, the shared library is
 built by `cargo build -p decentdb`.
 
+## Project management and backlog
+
+Roadmap, backlog, and issue tracking live in Hamstik:
+
+- **[Hamstik project DDB](https://hamstik.com/t/sph/projects/DDB)**
+
+Check the relevant DDB work item and its acceptance criteria before starting.
+Create or update an item for new work rather than adding a new roadmap document.
+See [Project Management](project-management.md) for details.
+
 ## Typical workflow
 
 1. Create a branch for your change.

@@ -244,6 +244,7 @@ See [Release process](development/releases.md) and
 
 ## Project Links
 
+- [Hamstik project — ALM, roadmap, and backlog](https://hamstik.com/t/sph/projects/DDB)
 - [GitHub repository](https://github.com/sphildreth/decentdb)
-- [Issue tracker](https://github.com/sphildreth/decentdb/issues)
+- [GitHub issues](https://github.com/sphildreth/decentdb/issues) — community/legacy; planned work lives in Hamstik
 - [License](about/license.md)

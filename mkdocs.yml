@@ -77,6 +77,7 @@ nav:
     - B+Tree: architecture/btree.md
     - Query Execution: architecture/query-execution.md
   - Development:
+    - Project Management: development/project-management.md
     - Building from Source: development/building.md
     - Testing: development/testing.md
     - Release process: development/releases.md
